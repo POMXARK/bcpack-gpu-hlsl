@@ -9,6 +9,7 @@ fn main() {
     let enable_debug = args.iter().any(|a| a == "--debug");
     let start_rt_enabled = !args.iter().any(|a| a == "--no-rt");
     let start_world_stream = args.iter().any(|a| a == "--world-stream");
+    let start_mesh_shaders = !args.iter().any(|a| a == "--no-mesh-shaders");
     let mut vram_cap_mb = 32usize;
     let mut measure_frames: Option<u32> = None;
     let mut assets_dir = PathBuf::from("assets");
@@ -47,6 +48,7 @@ fn main() {
             enable_debug,
             start_rt_enabled,
             start_world_stream,
+            start_mesh_shaders,
             vram_cap_mb,
             screenshot_path: None,
             screenshot_frames: 20,

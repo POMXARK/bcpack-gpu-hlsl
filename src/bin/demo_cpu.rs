@@ -49,6 +49,7 @@ fn main() {
             enable_debug: false,
             start_rt_enabled: false,
             start_world_stream,
+            start_mesh_shaders: false,
             vram_cap_mb,
             screenshot_path: None,
             screenshot_frames: 20,

@@ -6,6 +6,10 @@ use crate::gpu_decoder::{
     cmd_barriers, create_committed_buffer, drop_barriers, heap_props, pack_batch,
     transition_barrier, upload_slice, BcpackGpuDecoder, GpuContext,
 };
+use crate::meshlets::{
+    build_city_meshlet_library, build_highpoly_city_instances, extract_frustum_planes, MeshFrameCB,
+    MeshletPipeline,
+};
 use crate::meshes::{build_all_meshes, MeshRange, Vertex};
 use crate::raytracing::{tex_reflection_color, RayTracingScene, RtInstanceInput, MAX_RT_INSTANCES};
 use crate::world_streaming::WorldStreamManager;
@@ -26,7 +30,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_A, VK_C, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F, VK_LEFT, VK_M, VK_Q,
+    GetAsyncKeyState, VK_A, VK_C, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F, VK_LEFT, VK_M, VK_N, VK_Q,
     VK_R, VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -197,6 +201,7 @@ pub struct DemoConfig {
     pub enable_debug: bool,
     pub start_rt_enabled: bool,
     pub start_world_stream: bool,
+    pub start_mesh_shaders: bool,
     pub vram_cap_mb: usize,
     pub screenshot_path: Option<PathBuf>,
     pub screenshot_frames: u32,
@@ -211,6 +216,7 @@ struct WindowState {
     multi_core_cpu: bool,
     sfs_enabled: bool,
     rt_enabled: bool,
+    mesh_shaders_enabled: bool,
     tiles_per_frame: usize,
     cam_mode: u8, // 0 = Chase, 1 = Free Drive, 2 = Helicopter
     should_quit: bool,
@@ -244,6 +250,8 @@ unsafe extern "system" fn wnd_proc(
                     st.sfs_enabled = !st.sfs_enabled;
                 } else if vk == VK_R.0 {
                     st.rt_enabled = !st.rt_enabled;
+                } else if vk == VK_N.0 {
+                    st.mesh_shaders_enabled = !st.mesh_shaders_enabled;
                 } else if vk == VK_M.0 && (st.mode == DemoMode::CpuOnly || !st.use_gpu) {
                     st.multi_core_cpu = !st.multi_core_cpu;
                 } else if vk == VK_C.0 {
@@ -287,8 +295,13 @@ fn wrap_z(base_z: f32, hero_z: f32, span: f32) -> f32 {
     hero_z + rel
 }
 
-fn build_highway_frame(meshes: &crate::meshes::SceneMeshes, t_sec: f32, hero_z: f32) -> (Vec<DrawObj>, [[f32; 4]; 4], [[f32; 4]; 4]) {
-    let mut objs = Vec::with_capacity(180);
+fn build_highway_frame(
+    meshes: &crate::meshes::SceneMeshes,
+    t_sec: f32,
+    hero_z: f32,
+    ground_only: bool,
+) -> (Vec<DrawObj>, [[f32; 4]; 4], [[f32; 4]; 4]) {
+    let mut objs = Vec::with_capacity(if ground_only { 48 } else { 180 });
     let span = 160.0f32;
 
     // 1. Road, boardwalk, golden beach, animated ocean (tiled along Z moving with hero_z)
@@ -301,60 +314,22 @@ fn build_highway_frame(meshes: &crate::meshes::SceneMeshes, t_sec: f32, hero_z: 
         // Left & right promenade sidewalks
         objs.push(DrawObj { mesh: meshes.unit_box, pos: [-9.5, -0.04, cz], rot_y: 0.0, scale: [5.0, 0.32, tile_len], tex: 3, emissive: 0.03, uv_scale: 3.0, spec_power: 12.0 });
         objs.push(DrawObj { mesh: meshes.unit_box, pos: [9.5, -0.04, cz], rot_y: 0.0, scale: [5.0, 0.32, tile_len], tex: 3, emissive: 0.03, uv_scale: 3.0, spec_power: 12.0 });
-        // Left city ground pad
-        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-26.0, -0.14, cz], rot_y: 0.0, scale: [28.0, 0.2, tile_len], tex: 11, emissive: 0.02, uv_scale: 4.0, spec_power: 8.0 });
+        // Left wide city ground pad (supports 6 skyline avenues)
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-68.0, -0.14, cz], rot_y: 0.0, scale: [112.0, 0.2, tile_len], tex: 11, emissive: 0.02, uv_scale: 8.0, spec_power: 8.0 });
         // Golden beach sand + wide ocean bay on the right
         objs.push(DrawObj { mesh: meshes.unit_box, pos: [17.0, -0.22, cz], rot_y: 0.0, scale: [10.0, 0.2, tile_len], tex: 7, emissive: 0.02, uv_scale: 4.0, spec_power: 8.0 });
         objs.push(DrawObj { mesh: meshes.unit_box, pos: [52.0, -0.45, cz], rot_y: 0.0, scale: [60.0, 0.2, tile_len], tex: 4, emissive: 0.14, uv_scale: 6.0, spec_power: 72.0 });
     }
 
-    // 2. Multi-tier Art-Deco Ocean Drive skyline on the left + boutique beach pavilions
-    let left_slots = [
-        (0.0f32, 11.0, 26.0, 14.0, 1u32, 0.36),
-        (20.0, 10.0, 16.0, 13.0, 2, 0.24),
-        (40.0, 12.0, 34.0, 15.0, 1, 0.42),
-        (60.0, 9.5, 13.0, 12.0, 2, 0.22),
-        (80.0, 11.5, 29.0, 14.0, 1, 0.38),
-        (100.0, 10.0, 19.0, 13.0, 2, 0.25),
-        (120.0, 12.0, 38.0, 16.0, 1, 0.44),
-        (140.0, 10.0, 15.0, 13.0, 2, 0.22),
-    ];
-    for &(bz, w, h, d, tex, em) in &left_slots {
-        let z = wrap_z(bz, hero_z, span);
-        // Ground-floor neon cafe/storefront podium
-        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-17.5, 2.2, z], rot_y: 0.0, scale: [w + 1.2, 4.4, d + 0.8], tex: 10, emissive: 0.32, uv_scale: 1.5, spec_power: 24.0 });
-        // Main upper tower
-        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-18.2, 4.4 + h * 0.5, z], rot_y: 0.0, scale: [w, h, d], tex, emissive: em, uv_scale: 2.0, spec_power: 32.0 });
-        // Rooftop penthouse
-        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-18.2, 4.4 + h + 1.1, z], rot_y: 0.0, scale: [w * 0.58, 2.2, d * 0.58], tex: 11, emissive: 0.12, uv_scale: 1.0, spec_power: 16.0 });
-    }
-
-    // Two oceanfront boutique hotels on the right boardwalk (leaving gaps to see the ocean!)
-    for &(bz, h, tex) in &[(28.0f32, 11.0, 2u32), (108.0, 14.0, 1u32)] {
-        let z = wrap_z(bz, hero_z, span);
-        objs.push(DrawObj { mesh: meshes.unit_box, pos: [14.5, 1.8, z], rot_y: 0.0, scale: [6.0, 3.6, 11.0], tex: 10, emissive: 0.28, uv_scale: 1.5, spec_power: 24.0 });
-        objs.push(DrawObj { mesh: meshes.unit_box, pos: [14.8, 3.6 + h * 0.5, z], rot_y: 0.0, scale: [5.2, h, 9.5], tex, emissive: 0.28, uv_scale: 1.6, spec_power: 28.0 });
-    }
-
-    // 3. Curved 3D Palm Trees along both promenades (swaying gently in the ocean breeze)
-    for k in 0..8 {
-        let z = wrap_z(k as f32 * 20.0 + 6.0, hero_z, span);
-        let sway = (t_sec * 1.6 + k as f32 * 0.9).sin() * 0.06;
-        // Left palm (curving slightly over street)
-        objs.push(DrawObj { mesh: meshes.palm_trunk, pos: [-8.2, 0.0, z], rot_y: 0.15 + sway, scale: [1.0, 1.0, 1.0], tex: 3, emissive: 0.0, uv_scale: 2.0, spec_power: 8.0 });
-        objs.push(DrawObj { mesh: meshes.palm_canopy, pos: [-8.2 + 0.84, 5.55, z + 0.12], rot_y: k as f32 * 0.7 + sway, scale: [1.15, 1.15, 1.15], tex: 5, emissive: 0.10, uv_scale: 1.0, spec_power: 18.0 });
-        // Right palm (curving toward ocean/road)
-        objs.push(DrawObj { mesh: meshes.palm_trunk, pos: [8.4, 0.0, z + 10.0], rot_y: std::f32::consts::PI - 0.1 + sway, scale: [1.05, 1.05, 1.05], tex: 3, emissive: 0.0, uv_scale: 2.0, spec_power: 8.0 });
-        objs.push(DrawObj { mesh: meshes.palm_canopy, pos: [8.4 - 0.88, 5.80, z + 10.0], rot_y: k as f32 * 1.1 - sway, scale: [1.2, 1.2, 1.2], tex: 5, emissive: 0.10, uv_scale: 1.0, spec_power: 18.0 });
-    }
-
-    // 4. Boulevard Streetlamps + Nearest 2 Lamps for Dynamic Point Lights
+    // 4. Boulevard Streetlamps positions for Dynamic Point Lights
     let mut lamp_positions: Vec<f32> = Vec::with_capacity(8);
     for k in 0..4 {
         let z = wrap_z(k as f32 * 40.0 + 16.0, hero_z, span);
         lamp_positions.push(z);
-        objs.push(DrawObj { mesh: meshes.street_lamp, pos: [-7.4, 0.0, z], rot_y: 0.0, scale: [1.0, 1.0, 1.0], tex: 11, emissive: 0.35, uv_scale: 1.0, spec_power: 32.0 });
-        objs.push(DrawObj { mesh: meshes.street_lamp, pos: [7.4, 0.0, z], rot_y: std::f32::consts::PI, scale: [1.0, 1.0, 1.0], tex: 11, emissive: 0.35, uv_scale: 1.0, spec_power: 32.0 });
+        if !ground_only {
+            objs.push(DrawObj { mesh: meshes.street_lamp, pos: [-7.4, 0.0, z], rot_y: 0.0, scale: [1.0, 1.0, 1.0], tex: 11, emissive: 0.35, uv_scale: 1.0, spec_power: 32.0 });
+            objs.push(DrawObj { mesh: meshes.street_lamp, pos: [7.4, 0.0, z], rot_y: std::f32::consts::PI, scale: [1.0, 1.0, 1.0], tex: 11, emissive: 0.35, uv_scale: 1.0, spec_power: 32.0 });
+        }
     }
     lamp_positions.sort_by(|a, b| (a - hero_z).abs().partial_cmp(&(b - hero_z).abs()).unwrap());
 
@@ -364,45 +339,81 @@ fn build_highway_frame(meshes: &crate::meshes::SceneMeshes, t_sec: f32, hero_z: 
     objs.push(DrawObj { mesh: meshes.unit_box, pos: [7.3, 4.4, arch_z], rot_y: 0.0, scale: [0.5, 8.8, 0.5], tex: 1, emissive: 0.25, uv_scale: 1.0, spec_power: 24.0 });
     objs.push(DrawObj { mesh: meshes.unit_box, pos: [0.0, 8.8, arch_z], rot_y: 0.0, scale: [15.4, 4.6, 0.5], tex: 6, emissive: 0.65, uv_scale: 1.0, spec_power: 16.0 });
 
-    // 6. Hero Sports Car (right lane, cruising forward +Z with subtle steering weave)
     let hero_x = 2.4 + (t_sec * 0.7).sin() * 0.45;
-    let hero_yaw = (t_sec * 0.7).cos() * 0.04;
-    objs.push(DrawObj {
-        mesh: meshes.car_body,
-        pos: [hero_x, 0.0, hero_z],
-        rot_y: hero_yaw,
-        scale: [1.05, 1.05, 1.05],
-        tex: 8,
-        emissive: 0.14,
-        uv_scale: 1.0,
-        spec_power: 96.0,
-    });
+    if !ground_only {
+        // 2. Multi-tier Art-Deco Ocean Drive skyline on the left + boutique beach pavilions
+        let left_slots = [
+            (0.0f32, 11.0, 26.0, 14.0, 1u32, 0.36),
+            (20.0, 10.0, 16.0, 13.0, 2, 0.24),
+            (40.0, 12.0, 34.0, 15.0, 1, 0.42),
+            (60.0, 9.5, 13.0, 12.0, 2, 0.22),
+            (80.0, 11.5, 29.0, 14.0, 1, 0.38),
+            (100.0, 10.0, 19.0, 13.0, 2, 0.25),
+            (120.0, 12.0, 38.0, 16.0, 1, 0.44),
+            (140.0, 10.0, 15.0, 13.0, 2, 0.22),
+        ];
+        for &(bz, w, h, d, tex, em) in &left_slots {
+            let z = wrap_z(bz, hero_z, span);
+            objs.push(DrawObj { mesh: meshes.unit_box, pos: [-17.5, 2.2, z], rot_y: 0.0, scale: [w + 1.2, 4.4, d + 0.8], tex: 10, emissive: 0.32, uv_scale: 1.5, spec_power: 24.0 });
+            objs.push(DrawObj { mesh: meshes.unit_box, pos: [-18.2, 4.4 + h * 0.5, z], rot_y: 0.0, scale: [w, h, d], tex, emissive: em, uv_scale: 2.0, spec_power: 32.0 });
+            objs.push(DrawObj { mesh: meshes.unit_box, pos: [-18.2, 4.4 + h + 1.1, z], rot_y: 0.0, scale: [w * 0.58, 2.2, d * 0.58], tex: 11, emissive: 0.12, uv_scale: 1.0, spec_power: 16.0 });
+        }
 
-    // 7. 10 Animated Traffic Cars across all 4 lanes
-    let traffic = [
-        (5.2f32, 26.0f32, 13.5f32, 0.0f32, 9u32),
-        (2.4, 62.0, 14.5, 0.0, 9),
-        (5.2, 105.0, 15.0, 0.0, 8),
-        (2.4, 140.0, 13.0, 0.0, 9),
-        (-2.4, 12.0, -14.0, std::f32::consts::PI, 9),
-        (-5.2, 42.0, -16.0, std::f32::consts::PI, 8),
-        (-2.4, 78.0, -15.0, std::f32::consts::PI, 9),
-        (-5.2, 114.0, -17.0, std::f32::consts::PI, 8),
-        (-2.4, 138.0, -14.0, std::f32::consts::PI, 9),
-        (5.2, 150.0, 14.0, 0.0, 8),
-    ];
-    for &(lx, z0, spd, yaw, tex) in &traffic {
-        let tz = wrap_z(z0 + t_sec * spd, hero_z, span);
+        for &(bz, h, tex) in &[(28.0f32, 11.0, 2u32), (108.0, 14.0, 1u32)] {
+            let z = wrap_z(bz, hero_z, span);
+            objs.push(DrawObj { mesh: meshes.unit_box, pos: [14.5, 1.8, z], rot_y: 0.0, scale: [6.0, 3.6, 11.0], tex: 10, emissive: 0.28, uv_scale: 1.5, spec_power: 24.0 });
+            objs.push(DrawObj { mesh: meshes.unit_box, pos: [14.8, 3.6 + h * 0.5, z], rot_y: 0.0, scale: [5.2, h, 9.5], tex, emissive: 0.28, uv_scale: 1.6, spec_power: 28.0 });
+        }
+
+        // 3. Curved 3D Palm Trees along both promenades (swaying gently in the ocean breeze)
+        for k in 0..8 {
+            let z = wrap_z(k as f32 * 20.0 + 6.0, hero_z, span);
+            let sway = (t_sec * 1.6 + k as f32 * 0.9).sin() * 0.06;
+            objs.push(DrawObj { mesh: meshes.palm_trunk, pos: [-8.2, 0.0, z], rot_y: 0.15 + sway, scale: [1.0, 1.0, 1.0], tex: 3, emissive: 0.0, uv_scale: 2.0, spec_power: 8.0 });
+            objs.push(DrawObj { mesh: meshes.palm_canopy, pos: [-8.2 + 0.84, 5.55, z + 0.12], rot_y: k as f32 * 0.7 + sway, scale: [1.15, 1.15, 1.15], tex: 5, emissive: 0.10, uv_scale: 1.0, spec_power: 18.0 });
+            objs.push(DrawObj { mesh: meshes.palm_trunk, pos: [8.4, 0.0, z + 10.0], rot_y: std::f32::consts::PI - 0.1 + sway, scale: [1.05, 1.05, 1.05], tex: 3, emissive: 0.0, uv_scale: 2.0, spec_power: 8.0 });
+            objs.push(DrawObj { mesh: meshes.palm_canopy, pos: [8.4 - 0.88, 5.80, z + 10.0], rot_y: k as f32 * 1.1 - sway, scale: [1.2, 1.2, 1.2], tex: 5, emissive: 0.10, uv_scale: 1.0, spec_power: 18.0 });
+        }
+
+        // 6. Hero Sports Car
+        let hero_yaw = (t_sec * 0.7).cos() * 0.04;
         objs.push(DrawObj {
             mesh: meshes.car_body,
-            pos: [lx, 0.0, tz],
-            rot_y: yaw,
-            scale: [1.0, 1.0, 1.0],
-            tex,
-            emissive: 0.12,
+            pos: [hero_x, 0.0, hero_z],
+            rot_y: hero_yaw,
+            scale: [1.05, 1.05, 1.05],
+            tex: 8,
+            emissive: 0.14,
             uv_scale: 1.0,
-            spec_power: 88.0,
+            spec_power: 96.0,
         });
+
+        // 7. 10 Animated Traffic Cars
+        let traffic = [
+            (5.2f32, 26.0f32, 13.5f32, 0.0f32, 9u32),
+            (2.4, 62.0, 14.5, 0.0, 9),
+            (5.2, 105.0, 15.0, 0.0, 8),
+            (2.4, 140.0, 13.0, 0.0, 9),
+            (-2.4, 12.0, -14.0, std::f32::consts::PI, 9),
+            (-5.2, 42.0, -16.0, std::f32::consts::PI, 8),
+            (-2.4, 78.0, -15.0, std::f32::consts::PI, 9),
+            (-5.2, 114.0, -17.0, std::f32::consts::PI, 8),
+            (-2.4, 138.0, -14.0, std::f32::consts::PI, 9),
+            (5.2, 150.0, 14.0, 0.0, 8),
+        ];
+        for &(lx, z0, spd, yaw, tex) in &traffic {
+            let tz = wrap_z(z0 + t_sec * spd, hero_z, span);
+            objs.push(DrawObj {
+                mesh: meshes.car_body,
+                pos: [lx, 0.0, tz],
+                rot_y: yaw,
+                scale: [1.0, 1.0, 1.0],
+                tex,
+                emissive: 0.12,
+                uv_scale: 1.0,
+                spec_power: 88.0,
+            });
+        }
     }
 
     // 4 Dynamic Point Lights: Hero Headlights, Hero Taillights, 2 Nearest Streetlamps
@@ -507,6 +518,7 @@ pub fn run_demo(
             multi_core_cpu: cfg.multi_core_cpu,
             sfs_enabled: cfg.start_world_stream,
             rt_enabled: false,
+            mesh_shaders_enabled: false,
             tiles_per_frame: init_tiles,
             cam_mode: 0,
             should_quit: false,
@@ -965,6 +977,20 @@ pub fn run_demo(
         let rt_scene = RayTracingScene::new(&mut ctx, &vb_buf, &ib_buf, &meshes);
         wstate.rt_enabled = cfg.start_rt_enabled && rt_scene.is_some();
 
+        // Build Hardware DX12 Ultimate Mesh Shader City Pipeline (as_6_5 / ms_6_5, 4.5M+ triangles)
+        let meshlet_lib = build_city_meshlet_library();
+        let (init_city_insts, city_work_items, city_total_tris) =
+            build_highpoly_city_instances(&meshlet_lib, 0.0, 0.0);
+        let meshlet_pipe = MeshletPipeline::new(
+            &mut ctx,
+            &meshlet_lib,
+            &init_city_insts,
+            &city_work_items,
+            city_total_tris,
+        );
+        wstate.mesh_shaders_enabled = cfg.start_mesh_shaders && meshlet_pipe.is_some();
+        let mut last_cull_stats = (0u32, 0u32, 0u32);
+
         let frame_allocs: [ID3D12CommandAllocator; 2] = [
             ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(),
             ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(),
@@ -1011,7 +1037,8 @@ pub fn run_demo(
         if cfg.mode != DemoMode::GpuOnly {
             println!("  [M]       Toggle CPU 1-Core <-> CPU Multi-Core");
         }
-        println!("  [F]       Toggle Sampler Feedback Streaming (SFS) distance LOD budgeting");
+        println!("  [F]       Toggle Sampler Feedback Streaming (SFS) / 32x32 World Grid LRU");
+        println!("  [N]       Toggle DX12 Mesh Shaders (4.5M+ Tris) <-> Classic VS Pipeline");
         println!("  [R]       Toggle DXR 1.1 Hardware Inline Ray Tracing (Shadows + Reflections)");
         println!("  [C]       Camera Mode: Chase Car / Free Drive (WASD+QE) / Heli Orbit");
         println!("  [UP/DOWN] Streamed 4K-tiles/frame (48..1024 = 1.5..32 MiB BC1/frame)");
@@ -1136,9 +1163,14 @@ pub fn run_demo(
 
             // Wait only for 2-frames-old Direct work on cur_slot (0 CPU wait in steady state!)
             ctx.wait_direct_cpu(frame_fences[cur_slot]);
-            if last_gpu_decode_ms == 0.0 || pending_compute_fences[cur_slot].is_some() {
-                if frame_count >= 2 && wstate.use_gpu {
+            if frame_count >= 2 {
+                if wstate.use_gpu && (last_gpu_decode_ms == 0.0 || pending_compute_fences[cur_slot].is_some()) {
                     last_gpu_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, cur_slot);
+                }
+                if wstate.mesh_shaders_enabled {
+                    if let Some(ref mp) = meshlet_pipe {
+                        last_cull_stats = mp.read_cull_stats(cur_slot);
+                    }
                 }
             }
 
@@ -1318,10 +1350,19 @@ pub fn run_demo(
             cmd_barriers(cmd_list, to_srv);
 
             // 1. Rebuild Hardware DXR 1.1 TLAS BEFORE binding RenderTarget / starting Render Pass
-            let (objs, point_lights, light_colors) = build_highway_frame(&meshes, t_sec, hero_z);
+            let use_meshlets = meshlet_pipe.is_some() && wstate.mesh_shaders_enabled;
+            let (objs, point_lights, light_colors) = build_highway_frame(&meshes, t_sec, hero_z, use_meshlets);
+            let city_instances = if use_meshlets {
+                Some(build_highpoly_city_instances(&meshlet_lib, t_sec, hero_z).0)
+            } else {
+                None
+            };
             if let Some(ref rt) = rt_scene {
-                let mut rt_inputs = Vec::with_capacity(objs.len().min(MAX_RT_INSTANCES));
-                for obj in objs.iter().take(MAX_RT_INSTANCES) {
+                let mut rt_inputs = Vec::with_capacity(MAX_RT_INSTANCES);
+                for obj in &objs {
+                    if rt_inputs.len() >= MAX_RT_INSTANCES {
+                        break;
+                    }
                     let mesh_idx = if obj.mesh.index_offset == meshes.unit_box.index_offset {
                         0
                     } else if obj.mesh.index_offset == meshes.car_body.index_offset {
@@ -1344,6 +1385,44 @@ pub fn run_demo(
                         transform_3x4,
                         color_emissive: tex_reflection_color(obj.tex, obj.emissive),
                     });
+                }
+                if let Some(ref cinsts) = city_instances {
+                    // Add nearest high-poly city instances (cars, Ocean Drive hotels/towers, palms) into DXR TLAS
+                    let mut near: Vec<(f32, &crate::meshlets::MeshletInstance)> = cinsts
+                        .iter()
+                        .filter_map(|ci| {
+                            let dz = (ci.pos[2] - hero_z).abs();
+                            let dx = ci.pos[0].abs();
+                            if dz <= 125.0 && dx <= 45.0 {
+                                Some((dz * dz + dx * dx, ci))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    for (_, ci) in near {
+                        if rt_inputs.len() >= MAX_RT_INSTANCES {
+                            break;
+                        }
+                        let mesh_idx = match ci.tex_index {
+                            8 | 9 => 1,
+                            5 => 3,
+                            11 => 4,
+                            _ => 0,
+                        };
+                        let m = Mat4::trs(ci.pos, ci.rot_y, ci.scale).0;
+                        let transform_3x4 = [
+                            m[0], m[4], m[8], m[12],
+                            m[1], m[5], m[9], m[13],
+                            m[2], m[6], m[10], m[14],
+                        ];
+                        rt_inputs.push(RtInstanceInput {
+                            mesh_idx,
+                            transform_3x4,
+                            color_emissive: tex_reflection_color(ci.tex_index, ci.emissive),
+                        });
+                    }
                 }
                 rt.update_and_record_tlas(cmd_list, cur_slot, &rt_inputs);
             }
@@ -1433,6 +1512,39 @@ pub fn run_demo(
                 );
                 cmd_list.SetGraphicsRootConstantBufferView(0, cb_gpu_va + cb_off as u64);
                 cmd_list.DrawIndexedInstanced(obj.mesh.index_count, 1, obj.mesh.index_offset, 0, 0);
+            }
+
+            // 4. Hardware DX12 Ultimate Mesh Shader City Pass (as_6_5 / ms_6_5 + Wave32 Frustum Culling, 4.5M+ tris)
+            if use_meshlets {
+                if let (Some(ref mp), Some(ref cinsts)) = (meshlet_pipe.as_ref(), city_instances.as_ref()) {
+                    let mut m_lights = light_colors;
+                    m_lights[0][3] = 32.0;
+                    let mcb = MeshFrameCB {
+                        view_proj: vp_mat.0,
+                        frustum_planes: extract_frustum_planes(&vp_mat.0),
+                        camera_pos: [eye[0], eye[1], eye[2], rt_flag],
+                        point_lights,
+                        light_colors: m_lights,
+                        total_work_items: mp.total_work_items,
+                        time: t_sec,
+                        max_cull_dist: 245.0,
+                        pad: 0,
+                    };
+                    let (tlas_va, colors_va) = if let Some(ref rt) = rt_scene {
+                        (rt.tlas_gpu_va(cur_slot), rt.inst_colors_gpu_va(cur_slot))
+                    } else {
+                        (0u64, 0u64)
+                    };
+                    mp.record_dispatch(
+                        cmd_list,
+                        cur_slot,
+                        cinsts,
+                        &mcb,
+                        srv_heap.GetGPUDescriptorHandleForHeapStart(),
+                        tlas_va,
+                        colors_va,
+                    );
+                }
             }
 
             let take_shot = cfg.screenshot_path.is_some() && frame_count + 1 >= cfg.screenshot_frames;
@@ -1552,11 +1664,38 @@ pub fn run_demo(
                         } else {
                             "OLD_CPU_1CORE"
                         };
-                        if wstate.sfs_enabled {
+                        if wstate.use_gpu && take_shot {
+                            // Read fresh cull stats on screenshot frame (already waited via signal_and_wait)
+                            if use_meshlets {
+                                if let Some(ref mp) = meshlet_pipe {
+                                    last_cull_stats = mp.read_cull_stats(cur_slot);
+                                }
+                            }
+                        }
+                        if wstate.sfs_enabled || use_meshlets {
+                            let ms_total_m = meshlet_pipe.as_ref().map(|m| m.total_tris as f64 / 1e6).unwrap_or(0.0);
+                            let ms_vis_m = last_cull_stats.1 as f64 / 1e6;
+                            let ms_cull_pct = if last_cull_stats.0 + last_cull_stats.2 > 0 {
+                                (last_cull_stats.2 as f64 / (last_cull_stats.0 + last_cull_stats.2) as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            let mut extra = String::new();
+                            if wstate.sfs_enabled {
+                                extra.push_str(&format!(
+                                    " Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Frag:{:.0}% Peak:{:.0}MB/s",
+                                    last_world_res_mb, last_world_cap_mb, last_world_evict, last_world_frag, last_world_peak_mbs
+                                ));
+                            }
+                            if use_meshlets {
+                                extra.push_str(&format!(
+                                    " MS[N]:ON Tris:{:.2}M/{:.2}M (Cull:{:.0}%)",
+                                    ms_vis_m, ms_total_m, ms_cull_pct
+                                ));
+                            }
                             println!(
-                                "[fps] mode={} tiles={} ({:.1} MiB/frame) frames={} avg_fps={:.2} avg_decode_ms={:.3} Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Frag:{:.0}% Peak:{:.0}MB/s",
-                                mode_tag, cur_tiles, streamed_mb, measured, avg_fps, avg_dec,
-                                last_world_res_mb, last_world_cap_mb, last_world_evict, last_world_frag, last_world_peak_mbs
+                                "[fps] mode={} tiles={} ({:.1} MiB/frame) frames={} avg_fps={:.2} avg_decode_ms={:.3}{}",
+                                mode_tag, cur_tiles, streamed_mb, measured, avg_fps, avg_dec, extra
                             );
                         } else {
                             println!(
@@ -1591,10 +1730,23 @@ pub fn run_demo(
                 };
                 let sfs_str = if wstate.sfs_enabled { "ON" } else { "OFF" };
                 let rt_str = if rt_scene.is_some() && wstate.rt_enabled { "ON" } else { "OFF" };
+                let ms_str = if use_meshlets { "ON" } else { "OFF" };
+                let ms_total_m = meshlet_pipe.as_ref().map(|m| m.total_tris as f64 / 1e6).unwrap_or(0.0);
+                let ms_vis_m = last_cull_stats.1 as f64 / 1e6;
+                let ms_cull_pct = if last_cull_stats.0 + last_cull_stats.2 > 0 {
+                    (last_cull_stats.2 as f64 / (last_cull_stats.0 + last_cull_stats.2) as f64) * 100.0
+                } else {
+                    0.0
+                };
                 let title = if wstate.sfs_enabled {
                     format!(
-                        "{} | {:.1} FPS | Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Frag:{:.0}% Peak:{:.0}MB/s | RT[R]:{} SFS[F]:{} Cam[C]:{}",
-                        mode_str, fps, last_world_res_mb, last_world_cap_mb, last_world_evict, last_world_frag, last_world_peak_mbs, rt_str, sfs_str, cam_str
+                        "{} | {:.1} FPS | Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Peak:{:.0}MB/s | MS[N]:{} ({:.2}M/{:.2}M Cull:{:.0}%) | RT[R]:{} Cam[C]:{}",
+                        mode_str, fps, last_world_res_mb, last_world_cap_mb, last_world_evict, last_world_peak_mbs, ms_str, ms_vis_m, ms_total_m, ms_cull_pct, rt_str, cam_str
+                    )
+                } else if use_meshlets {
+                    format!(
+                        "{} | {:.1} FPS | {:.1} MB/f | MS[N]:ON Tris:{:.2}M/{:.2}M (Cull:{:.0}%) | Dec:{:.2}ms ({:.0} MB/s) | RT[R]:{} SFS[F]:{} Cam[C]:{}",
+                        mode_str, fps, streamed_mb, ms_vis_m, ms_total_m, ms_cull_pct, decomp_ms, throughput, rt_str, sfs_str, cam_str
                     )
                 } else {
                     format!(
