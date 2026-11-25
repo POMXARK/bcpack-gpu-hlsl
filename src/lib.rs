@@ -1,4 +1,5 @@
 pub mod aaa_scene;
+pub mod aaa_world;
 pub mod assets;
 pub mod crowd_skinning;
 pub mod demo_scene;

@@ -40,6 +40,11 @@ echo Using DXC: "%DXC%"
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_autoexp.dxil" "%~dp0aaa_autoexp.hlsl" || exit /b 1
 "%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0aaa_comp_vs.dxil" "%~dp0aaa_composite.hlsl" || exit /b 1
 "%DXC%" -T ps_6_0 -E PSMain -O3 -Fo "%~dp0aaa_comp_ps.dxil" "%~dp0aaa_composite.hlsl" || exit /b 1
+"%DXC%" -T as_6_5 -E ASMain -HV 2021 -O3 -Fo "%~dp0aaa_meshlet_as.dxil" "%~dp0aaa_meshlet_as.hlsl" || exit /b 1
+"%DXC%" -T ms_6_5 -E MSMain -HV 2021 -O3 -Fo "%~dp0aaa_meshlet_ms.dxil" "%~dp0aaa_meshlet_ms.hlsl" || exit /b 1
+"%DXC%" -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo "%~dp0aaa_meshlet_ps.dxil" "%~dp0aaa_meshlet_ps.hlsl" || exit /b 1
+"%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0aaa_crowd_vs.dxil" "%~dp0aaa_crowd.hlsl" || exit /b 1
+"%DXC%" -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo "%~dp0aaa_crowd_ps.dxil" "%~dp0aaa_crowd.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0bindless_paging.dxil" "%~dp0bindless_paging.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0hiz_build.dxil" "%~dp0hiz_build.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0hiz_cull.dxil" "%~dp0hiz_cull.hlsl" || exit /b 1

@@ -1,33 +1,32 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
 [![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1-2f80ed)](shaders/bcpack_decode.hlsl)
-[![v0.7.0](https://img.shields.io/badge/v0.7.0-AAA%202K%20PBR%20%7C%2012M%20Hi--Z%20%7C%201.25M%20Descs-ff4081)](#v040--v060-performance-leap--benchmarks-rtx-5080)
+[![v0.8.0](https://img.shields.io/badge/v0.8.0-4K%20BC7%2FBC5%20%7C%2012.41M%20City%20%7C%20SFS%20%7C%20150.6%20FPS-ff4081)](#v040--v060-performance-leap--benchmarks-rtx-5080)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
 
-**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor, Open AAA 2K PBR Showcase, & RAGE-Scale Streaming Stress Suite in DX12 HLSL SM 6.6 (Wave32) + Mesh Shaders (`as_6_5`/`ms_6_5`) + DXR 1.1 Inline Ray Tracing & RTGI — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1), 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 314.68 FPS @ 1080p HDR in the Open AAA 2K PBR Showroom (`CarConcept.glb` + Poly Haven 2K PBR + Sunset HDRI), 12.04M-tri Two-Pass Hi-Z Occlusion Culling (`0.016 ms`), `1.25M` Virtual `ResourceDescriptorHeap[]` Paging (`0.061 ms`), `64×64` (`256 km²`) `--jet-flight` streaming (`960 MB/s`), and `500` GPU-skinned NPCs (`512k` verts in `0.075 ms`) — 17/17 bit-exact PASS on an NVIDIA RTX 5080.**
+**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor, `v0.8.0` Cinematic Open AAA 4K PBR Benchmark, & RAGE-Scale Streaming Stress Suite in DX12 HLSL SM 6.6 (Wave32) + Mesh Shaders (`as_6_5`/`ms_6_5`) + Hi-Z + DXR 1.1 Inline Ray Tracing & RTGI — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1), 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), `150.61 FPS` avg (60s `--benchmark-run`) @ 1080p HDR in the Open AAA 4K BC7/BC5 City (`12.41M` pre-cull tris, `500` GPU-skinned NPCs, active SFS saving `118.5 MiB` VRAM), `1.25M` Virtual `ResourceDescriptorHeap[]` Paging (`0.061 ms`), `64×64` (`256 km²`) `--jet-flight` streaming (`960 MB/s`) — 17/17 bit-exact PASS on an NVIDIA RTX 5080.**
 
 > Clean-room implementation using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. Built on the format specification and CPU oracle from [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) and Microsoft's MIT-licensed [`microsoft/silicon-rans`](https://github.com/microsoft/silicon-rans).
 
 ---
 
-## Open AAA Showcase (`v0.7.0` — Real glTF PBR + 2K Poly Haven + HDRI IBL + DXR 1.1)
+## Open AAA Benchmark (`v0.8.0` — 4K BC7/BC5 + Active SFS + 12.41M Mesh-Shader City + 500 NPCs + DXR 1.1 + TAA)
 
-![v0.7.0 Open AAA Showcase: CarConcept glTF + 2K Poly Haven PBR + Sunset HDRI IBL + DXR 1.1](media/aaa_showcase_v7.png)
+![v0.8.0 Cinematic AAA Benchmark: 4K BC7/BC5 + Modular Mesh-Shader City + 500 GPU-Skinned NPCs + DXR 1.1 + AgX + TAA](media/aaa_showcase_v8.png)
 
-![v0.7.0 Live BCPack X-Ray Streaming Wave: Clay Wireframe -> Cyan Active Wavefront -> Green Resident Tiles](media/aaa_xray_v7.png)
+![v0.8.0 Live SFS + Meshlet City X-Ray Heatmap: 4K Mip-0 Resident (Green/Cyan) vs SFS Budget Saved Mip 1+ (Amber)](media/aaa_xray_v8.png)
 
-A dedicated photorealistic showroom binary (**`bcpack-aaa-demo.exe`** / [`src/aaa_scene.rs`](src/aaa_scene.rs)) replacing synthetic textures with open-source CC-BY 4.0 & CC0 2K PBR assets converted directly into `.bcpack` 4K-block tiles:
-- **Real Open AAA Assets ([`tools/fetch_aaa_assets.py`](tools/fetch_aaa_assets.py)):** Khronos [`CarConcept.glb`](https://github.com/KhronosGroup/glTF-Sample-Assets) (`162,766` verts, `213,347` tris, `109` submeshes including `5` smoked glass parts, `14` PBR textures) + **9× Poly Haven CC0 2K PBR maps** (`asphalt_pit_lane`, `brick_pavement`, `concrete_wall_008` Albedo / DirectX Normal / ARM) + **`2048×1024` FP16 Sunset HDRI** (`belfast_sunset_puresky`) — totaling **`23` live BC1 textures / `728` 4K-tiles (`22.75 MiB BC1` ← `14.52 MiB BCPack`, `1.57x` ratio)**.
-- **Full PBR + Console Mipmap + DXR 1.1 + HDR Post Pipeline:** Console-native full mipmap chains (`Mip 0..64` + Packed Mip Tail `32..4`, `10` mip levels verified bit-exact on GPU in `4.347 ms`), Cook-Torrance GGX BRDF ([`shaders/aaa_pbr.hlsl`](shaders/aaa_pbr.hlsl)) with Kaplanyan/Toksvig geometric Specular AA, tangent-space normal mapping, wet asphalt puddle specular mask, equirectangular HDRI IBL ([`shaders/aaa_sky.hlsl`](shaders/aaa_sky.hlsl)), hardware DXR 1.1 Inline `RayQuery` shadows/reflections/2-spp static-IGN diffuse RTGI, 4-pass A-Trous bilateral denoiser (`step = 1, 2, 4, 8`), 3-dispatch half-res HDR Bloom ([`shaders/aaa_bloom.hlsl`](shaders/aaa_bloom.hlsl)), and 5-tap FXAA + ACES Filmic composite ([`shaders/aaa_composite.hlsl`](shaders/aaa_composite.hlsl)).
-- **Interactive Streaming Controls:**
-  - **`[T]` Flush VRAM Wave:** Flushes all `728` tiles back to matte clay fallback geometry and re-streams the entire `22.75 MiB` 2K PBR texture set into VRAM in real time.
-  - **`[V]` X-Ray Tile Heatmap:** Overlays live 4K BCPack strip residency directly onto world UVs (**Magenta wireframe** = unstreamed clay, **Electric Cyan** = active decompressing wavefront, **Emerald Green** = resident tiles).
-  - **`[L]` VSync (Monitor Hz)**, **`[SPACE]` GPU Async vs 1T CPU**, **`[R]` DXR 1.1**, **`[G]` RTGI**, **`[C]` Camera Mode** (`Showroom 3/4 Orbit` / `Chase` / `FreeCam`).
-- **Measured on NVIDIA RTX 5080:**
-  - **`--flush-bench` (Full `22.75 MiB` / `728` 4K-tiles Flush → Residency):** GPU Async Compute (`3` batches) **`14.492 ms` kernel (`1.65 GB/s`) / `28.804 ms` wall (`0.83 GB/s`)** vs 1-Core CPU **`629.270 ms` (`37.9 MB/s`)** → **`43.4×` kernel speedup (`21.8×` wall speedup)**.
-  - **Live Showcase FPS (`1920×1080` native, DXR 1.1 + 2-spp RTGI + 4-pass A-Trous + Bloom + FXAA + ACES):** **`314.68 FPS`** (`--measure-frames 60 --debug`, DX12 Debug Layer clean, `0` errors).
+A photorealistic GPU-streaming benchmark (**`bcpack-aaa-demo.exe`** / [`src/aaa_scene.rs`](src/aaa_scene.rs) + [`src/aaa_world.rs`](src/aaa_world.rs)) converting open-source CC-BY 4.0 & CC0 4K PBR assets directly into `.bcpack` 64 KiB tiles:
+- **Stage 1 — Lighting, DXR, Shadows & TAA:** Textured DXR 1.1 `RayQuery` reflections & shadows (`g_InstMeta`/`g_SceneVB`/`g_SceneIB`), GPU histogram Auto-Exposure + AgX Filmic tone mapping + HDR Bloom (`threshold=1.45`), 8-step Screen-Space Contact Shadows, and 4-MRT Motion Vectors + Halton(2,3) Jitter + YCoCg Variance-Clipped TAA + 5-tap CAS ([`shaders/aaa_taa.hlsl`](shaders/aaa_taa.hlsl), [`shaders/aaa_autoexp.hlsl`](shaders/aaa_autoexp.hlsl)).
+- **Stage 2 — 4K BC7 / BC5 Streaming & Active GPU SFS:** Khronos [`CarConcept.glb`](https://github.com/KhronosGroup/glTF-Sample-Assets) (`162,766` verts, `213,347` tris, `109` submeshes + `6` parked + `5` traffic cars, `14` BC7/BC5 textures) + **9× Poly Haven CC0 4K (`4096×4096`) PBR maps** (`asphalt_pit_lane`, `brick_pavement`, `concrete_wall_008` in **BC7 Mode 6** / **BC5**, `11` mip levels + Packed Mip Tail, `204.67 MiB` full VRAM pool), decompressed via ping-pong Async Compute [`Bc16GpuStreamer`](src/gpu_decoder.rs) ([`shaders/bc16_pack.hlsl`](shaders/bc16_pack.hlsl)) with live pixel-shader Sampler Feedback (`g_SfsFeedback : u0`) and LRU `ResourceMinLODClamp` budget control (`--vram-budget-mb 128`, `[F]` toggle).
+- **Stage 3 — Modular 12.41M-Tri Mesh-Shader City, Hi-Z & 500 GPU-Skinned NPCs:** Hardware `as_6_5`/`ms_6_5`/`ps_6_6` pipeline ([`shaders/aaa_meshlet_ps.hlsl`](shaders/aaa_meshlet_ps.hlsl)) rendering `851` instances / `219,774` meshlets (**`12.41M` pre-cull tris**) across modular glass-curtain skyscrapers, Art-Deco hotels, palms, streetlamps, seawall balustrade, road lane markings, and far bayfront skyline HLOD with a live 6-mip conservative Hi-Z pyramid (`hiz_build.dxil`), plus **`500` GPU-skinned walking pedestrians** (`154,000` verts/frame via `crowd_skin.dxil` + [`shaders/aaa_crowd.hlsl`](shaders/aaa_crowd.hlsl)).
+- **Interactive Controls & 60s Benchmark Mode (`--benchmark-run`):**
+  - **VSync ON by default** (`--no-vsync` / `[L]` to uncap), `[T]` Flush VRAM Wave, `[V]` X-Ray SFS Heatmap, `[F]` SFS Budget ON/OFF, `[SPACE]` GPU Async vs 1T CPU, `[R]` DXR 1.1, `[G]` RTGI, `[C]` Camera (`Showroom` / `Chase` / `FreeCam`), `--benchmark-run` (60s 3-act automated flythrough).
+- **Measured on NVIDIA RTX 5080 (`1920×1080` native HDR):**
+  - **60s `--benchmark-run` (`9,026` frames):** **`150.61 FPS` Avg** (`6.64 ms`) | **`87.07 FPS` 1% Low** | **`43.37 FPS` 0.1% Low** | Active SFS **`86.2 / 204.7 MiB`** (**`118.5 MiB` VRAM saved**) | Mesh Shaders + Hi-Z **`12.41M` pre-cull → `0.99M` avg visible** (`0.18M` Hi-Z occluded) | **`500` GPU-Skinned NPCs** | DX12 Debug Layer clean (`0` errors).
+  - **`--flush-bench` (`153.50 MiB` Mip0 BC7/BC5, `2,456` 64K-tiles):** GPU Async Compute **`217.011 ms`** vs 1-Core CPU **`5,487.356 ms`** (**`25.3×` kernel speedup**, `0.74 GB/s` full 16-lane BC7/BC5 encode+pack).
 
 ---
 

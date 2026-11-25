@@ -1,3 +1,6 @@
+use crate::aaa_world::{
+    AaaCrowdRenderer, AaaHiZPyramid, AaaMeshletCity, CityCullStats, AAA_SRV_HIZ_BASE, CROWD_NPCS,
+};
 use crate::assets::{decode_bc16_from_bcpack_cpu, TexFormat, TILE_BC16_BYTES, TILE_BLOCKS};
 use crate::gltf_loader::{
     find_aaa_assets_dir, load_glb_as_bcpack, load_hdr_fp16, load_png_as_bcpack, BcpackMipChunk,
@@ -82,6 +85,10 @@ pub struct AaaDemoConfig {
     pub screenshot_path: Option<PathBuf>,
     pub screenshot_frames: u32,
     pub vram_budget_mb: usize,
+    pub benchmark_run: bool,
+    pub benchmark_secs: f32,
+    pub no_city: bool,
+    pub no_crowd: bool,
 }
 
 impl Default for AaaDemoConfig {
@@ -102,6 +109,10 @@ impl Default for AaaDemoConfig {
             screenshot_path: None,
             screenshot_frames: 24,
             vram_budget_mb: 128,
+            benchmark_run: false,
+            benchmark_secs: 60.0,
+            no_city: false,
+            no_crowd: false,
         }
     }
 }
@@ -1910,12 +1921,12 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 NodeMask: 0,
             })
             .unwrap();
-        // 0..36 (table slot 0) + 37..73 (table slot 1) + 74..106 (RTGI / TAA / AutoExp / Bloom / Composite)
+        // 0..36 (table slot 0) + 37..73 (table slot 1) + 74..106 (Post) + 107 (Depth R32) + 108..119 (Hi-Z SRVs/UAVs)
         let main_srv_heap: ID3D12DescriptorHeap = ctx
             .device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 128,
+                NumDescriptors: 160,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1942,7 +1953,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             Height: render_h,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            Format: DXGI_FORMAT_D32_FLOAT,
+            Format: DXGI_FORMAT_R32_TYPELESS,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
@@ -1967,7 +1978,12 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             .unwrap();
         let _depth_tex = depth_tex.unwrap();
         let dsv_handle = dsv_heap.GetCPUDescriptorHandleForHeapStart();
-        ctx.device.CreateDepthStencilView(&_depth_tex, None, dsv_handle);
+        let dsv_desc = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        ctx.device.CreateDepthStencilView(&_depth_tex, Some(&dsv_desc), dsv_handle);
 
         // Unified Geometry Buffer (CarConcept + UnitBox + GroundPlane)
         let mut all_verts = pack.car.vertices.clone();
@@ -2519,21 +2535,58 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             Format: DXGI_FORMAT_R32_UINT,
         };
 
-        // Precompute Coastal Architectural Towers (clean modern towers lining left side + sunset silhouette)
-        let mut towers: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
-        for i in 0..16 {
-            let z = -60.0 + (i as f32) * 18.0;
-            let h = 22.0 + ((i * 37 % 5) as f32) * 10.0;
-            let w = 11.0 + ((i * 13 % 3) as f32) * 2.5;
-            towers.push(([-26.0 - (i % 2) as f32 * 7.0, h * 0.5, z], [w, h, w * 1.1], [0.85, 0.78, 0.72]));
-        }
+        let hiz_pyramid = AaaHiZPyramid::new(&ctx.device, render_w, render_h, &_depth_tex, &main_srv_heap, srv_inc);
+        let meshlet_city = if !cfg.no_city {
+            AaaMeshletCity::new(&mut ctx, SRV_TABLE_STRIDE)
+        } else {
+            None
+        };
+        let mut crowd_renderer = if !cfg.no_crowd {
+            Some(AaaCrowdRenderer::new(&mut ctx, SRV_TABLE_STRIDE))
+        } else {
+            None
+        };
 
-        println!("=== BCPack AAA Showcase v0.8 (Stage 2: 4K BC7/BC5 + Active SFS) ===");
+        // Front-row DXR proxy boxes for city facades (or simple towers if --no-city)
+        let towers: Vec<([f32; 3], [f32; 3], [f32; 3])> = if let Some(ref city) = meshlet_city {
+            city.dxr_tower_boxes.clone()
+        } else {
+            let mut t = Vec::new();
+            for i in 0..16 {
+                let z = -60.0 + (i as f32) * 18.0;
+                let h = 22.0 + ((i * 37 % 5) as f32) * 10.0;
+                let w = 11.0 + ((i * 13 % 3) as f32) * 2.5;
+                t.push(([-26.0 - (i % 2) as f32 * 7.0, h * 0.5, z], [w, h, w * 1.1], [0.85, 0.78, 0.72]));
+            }
+            t
+        };
+
+        let parked_car_mats: Vec<(Mat4, [f32; 4])> = [
+            (Mat4::translation(9.8, 0.0, 14.0).mul(&Mat4::rotate_y(0.04)), [0.88, 0.88, 0.90, 0.0]),
+            (Mat4::translation(9.8, 0.0, 29.0).mul(&Mat4::rotate_y(-0.03)), [0.18, 0.48, 0.82, 0.0]),
+            (Mat4::translation(9.8, 0.0, 52.0).mul(&Mat4::rotate_y(0.02)), [0.90, 0.62, 0.16, 0.0]),
+            (Mat4::translation(-9.8, 0.0, 22.0).mul(&Mat4::rotate_y(std::f32::consts::PI - 0.03)), [0.16, 0.72, 0.50, 0.0]),
+            (Mat4::translation(-9.8, 0.0, 44.0).mul(&Mat4::rotate_y(std::f32::consts::PI + 0.02)), [0.24, 0.26, 0.30, 0.0]),
+            (Mat4::translation(-9.8, 0.0, 74.0).mul(&Mat4::rotate_y(std::f32::consts::PI)), [0.82, 0.18, 0.22, 0.0]),
+        ]
+        .to_vec();
+
+        println!("=== BCPack AAA Showcase v0.8.0 ===");
         println!(
-            "  Assets: CarConcept.glb ({} tris, {} submeshes) + 9x Poly Haven 4K PBR (BC7/BC5) + 2K Sunset HDRI",
+            "  Assets: CarConcept.glb ({} tris, {} submeshes + 6 parked) + 9x Poly Haven 4K PBR (BC7/BC5) + 2K Sunset HDRI",
             pack.car.indices.len() / 3,
             pack.car.submeshes.len()
         );
+        if let Some(ref city) = meshlet_city {
+            println!(
+                "  Mesh-Shader City + Hi-Z: {} inst, {} meshlets ({:.2}M tris pre-cull) | Crowd: {} GPU-skinned NPCs ({} verts)",
+                city.instance_count,
+                city.total_work_items,
+                city.total_tris as f64 / 1e6,
+                if crowd_renderer.is_some() { CROWD_NPCS } else { 0 },
+                crowd_renderer.as_ref().map(|c| c.verts_total()).unwrap_or(0)
+            );
+        }
         println!(
             "  BCPack Stream: {} textures, {} 64K-tiles ({:.2} MiB Mip0 / {:.2} MiB Full MipChain <- {:.2} MiB BCPack, SFS Budget={} MiB)",
             pack.textures.len(),
@@ -2556,6 +2609,12 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let mut last_decode_ms = 0.0f64;
         let mut prev_vp_unjittered: Option<Mat4> = None;
         let mut prev_traffic_mats: Option<Vec<Mat4>> = None;
+        let mut last_cull_stats = CityCullStats::default();
+        let mut bench_frame_ms: Vec<f64> = Vec::with_capacity(16384);
+        let mut bench_peak_gbps = 0.0f64;
+        let mut bench_sum_vis_tris = 0u64;
+        let mut bench_sum_hiz_tris = 0u64;
+        let mut bench_flushed = false;
 
         'main_loop: loop {
             let mut msg = MSG::default();
@@ -2572,11 +2631,19 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             }
 
             let now = Instant::now();
-            let dt = (now - last_frame).as_secs_f32().min(0.05);
+            let raw_dt_ms = (now - last_frame).as_secs_f64() * 1000.0;
+            let dt = ((raw_dt_ms * 0.001) as f32).min(0.05);
             last_frame = now;
             let t_sec = (now - start_time).as_secs_f32();
             residency.tick_timers(dt);
 
+            if cfg.benchmark_run && frame_count > 4 {
+                bench_frame_ms.push(raw_dt_ms);
+            }
+            if cfg.benchmark_run && !bench_flushed && t_sec >= cfg.benchmark_secs * 0.75 {
+                wstate.flush_requested = true;
+                bench_flushed = true;
+            }
             if cfg.flush_at_frame == Some(frame_count) {
                 wstate.flush_requested = true;
             }
@@ -2651,21 +2718,38 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             }
 
             let hero_model = Mat4::translation(0.0, 0.0, 0.0).mul(&Mat4::rotate_y(2.42));
-            let (cam_pos, cam_target) = match wstate.cam_mode {
-                0 => {
-                    // Showroom Front 3/4 Orbit facing +Z golden sunset, architectural towers & wet asphalt puddles
-                    let orbit_yaw = -1.28 + (t_sec * 0.14).sin() * 0.14;
+            let (cam_pos, cam_target) = if cfg.benchmark_run {
+                let p = (t_sec / cfg.benchmark_secs.max(5.0)).clamp(0.0, 1.0);
+                if p < 0.33 {
+                    let s = p / 0.33;
+                    let orbit_yaw = -1.45 + s * 0.45;
                     let radius = 5.45;
-                    let eye = [orbit_yaw.cos() * radius, 1.32, orbit_yaw.sin() * radius];
-                    (eye, [-0.55, 0.65, 1.50])
+                    ([orbit_yaw.cos() * radius, 1.32 + s * 0.35, orbit_yaw.sin() * radius], [-0.55, 0.75, 2.0])
+                } else if p < 0.67 {
+                    let s = (p - 0.33) / 0.34;
+                    let z = -5.0 + s * 105.0;
+                    ([-1.5 + (s * 4.0).sin() * 2.5, 2.25, z], [-2.5, 4.0, z + 28.0])
+                } else {
+                    let s = (p - 0.67) / 0.33;
+                    ([14.0 - s * 16.0, 10.5 - s * 5.0, 95.0 - s * 80.0], [-4.0, 2.5, 18.0 - s * 15.0])
                 }
-                1 => {
-                    // Low dynamic chase angle
-                    ([-0.4, 1.28, -5.8], [0.2, 0.68, 8.0])
-                }
-                _ => {
-                    let tgt = [free_pos[0] + free_yaw.sin() * 8.0, free_pos[1] - 0.8, free_pos[2] + free_yaw.cos() * 8.0];
-                    (free_pos, tgt)
+            } else {
+                match wstate.cam_mode {
+                    0 => {
+                        // Showroom Front 3/4 Orbit facing +Z golden sunset, modular towers & wet asphalt puddles
+                        let orbit_yaw = -1.28 + (t_sec * 0.14).sin() * 0.14;
+                        let radius = 5.45;
+                        let eye = [orbit_yaw.cos() * radius, 1.32, orbit_yaw.sin() * radius];
+                        (eye, [-0.55, 0.65, 1.50])
+                    }
+                    1 => {
+                        // Low dynamic chase angle
+                        ([-0.4, 1.28, -5.8], [0.2, 0.68, 8.0])
+                    }
+                    _ => {
+                        let tgt = [free_pos[0] + free_yaw.sin() * 8.0, free_pos[1] - 0.8, free_pos[2] + free_yaw.cos() * 8.0];
+                        (free_pos, tgt)
+                    }
                 }
             };
 
@@ -2844,6 +2928,17 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                         uv_params: [1.0, 0.0, 0.0, 0.0],
                     },
                 ));
+                for (m, col) in &parked_car_mats {
+                    rt_insts.push((
+                        0usize,
+                        m.to_3x4(),
+                        RtInstMeta {
+                            base_color: *col,
+                            geom: [0, 0, u32::MAX, 0],
+                            uv_params: [1.0, 0.0, 0.0, 0.0],
+                        },
+                    ));
+                }
                 for (m, col) in &traffic_mats {
                     rt_insts.push((
                         0usize,
@@ -2904,6 +2999,11 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     ));
                 }
                 rt.build_tlas(&mut ctx, slot, &rt_insts);
+            }
+
+            // Skin 500 promenade pedestrians on GPU Compute before G-Buffer pass
+            if let Some(ref mut crowd) = crowd_renderer {
+                crowd.update_and_skin(cmd, slot, t_sec);
             }
 
             // Clear GPU SFS feedback buffer & transition to UAV before PBR pass
@@ -2973,8 +3073,11 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 }
             };
 
-            // Hero Car + 5 animated CarConcept traffic cars
+            // Hero Car + 6 parked cars + 5 animated CarConcept traffic cars
             draw_car(&hero_model, &hero_model);
+            for (pm, _) in &parked_car_mats {
+                draw_car(pm, pm);
+            }
             for (idx, (tm, _)) in traffic_mats.iter().enumerate() {
                 draw_car(tm, &prev_t_xfs[idx]);
             }
@@ -3020,20 +3123,6 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 &residency,
                 &pack.textures,
             );
-            // Concrete Seawall Curb
-            draw_static_mesh(
-                cmd,
-                &seawall_model,
-                box_base_vert,
-                box_idx_offset,
-                36,
-                t_sec,
-                [0.92, 0.88, 0.84, 1.0],
-                [0.0, 0.88, 12.0, 2.0],
-                pack.concrete_tex,
-                &residency,
-                &pack.textures,
-            );
             // Glossy Sunset Ocean Plane
             draw_static_mesh(
                 cmd,
@@ -3048,23 +3137,86 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 &residency,
                 &pack.textures,
             );
-            // Coastal Architectural Towers
-            for (pos, scale, col) in &towers {
-                let tm = Mat4::translation(pos[0], pos[1], pos[2]).mul(&Mat4::scale(scale[0], scale[1], scale[2]));
+
+            // Stage 3: 12M+ Modular Mesh-Shader City (Recessed Glass Towers, Balconies, Palms, Streetlamps, Road Markings, Seawall, HLOD Skyline)
+            if let Some(ref city) = meshlet_city {
+                let hiz_table_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: gpu_base.ptr + (AAA_SRV_HIZ_BASE * srv_inc as usize) as u64,
+                };
+                let concrete_states = [
+                    residency.state_for_tex(pack.concrete_tex[0]),
+                    residency.state_for_tex(pack.concrete_tex[1]),
+                    pack.textures[pack.concrete_tex[0] as usize].width as f32,
+                ];
+                city.draw(
+                    cmd,
+                    slot,
+                    &vp_jit.0,
+                    &vp_unjit.0,
+                    &prev_vp.0,
+                    cam_pos,
+                    flags_bits,
+                    sun_dir,
+                    t_sec,
+                    frame_count > 1,
+                    hiz_pyramid.width,
+                    hiz_pyramid.height,
+                    concrete_states,
+                    pack.concrete_tex,
+                    table_gpu,
+                    hiz_table_gpu,
+                    sfs_feedback_default.GetGPUVirtualAddress(),
+                );
+            } else {
                 draw_static_mesh(
                     cmd,
-                    &tm,
+                    &seawall_model,
                     box_base_vert,
                     box_idx_offset,
                     36,
                     t_sec,
-                    [col[0], col[1], col[2], 1.0],
-                    [0.05, 0.72, 4.0, 2.0],
+                    [0.92, 0.88, 0.84, 1.0],
+                    [0.0, 0.88, 12.0, 2.0],
                     pack.concrete_tex,
                     &residency,
                     &pack.textures,
                 );
+                for (pos, scale, col) in &towers {
+                    let tm = Mat4::translation(pos[0], pos[1], pos[2]).mul(&Mat4::scale(scale[0], scale[1], scale[2]));
+                    draw_static_mesh(
+                        cmd,
+                        &tm,
+                        box_base_vert,
+                        box_idx_offset,
+                        36,
+                        t_sec,
+                        [col[0], col[1], col[2], 1.0],
+                        [0.05, 0.72, 4.0, 2.0],
+                        pack.concrete_tex,
+                        &residency,
+                        &pack.textures,
+                    );
+                }
             }
+
+            // Stage 3: 500 GPU-Skinned Pedestrians walking along coastal promenades
+            if let Some(ref crowd) = crowd_renderer {
+                crowd.draw(
+                    cmd,
+                    slot,
+                    &vp_jit.0,
+                    &vp_unjit.0,
+                    &prev_vp.0,
+                    cam_pos,
+                    flags_bits,
+                    sun_dir,
+                    t_sec,
+                    table_gpu,
+                );
+            }
+
+            // Build 6-Mip Conservative Hi-Z Depth Pyramid for next frame's Mesh-Shader occlusion culling
+            hiz_pyramid.build(cmd, &_depth_tex, &main_srv_heap);
 
             // Resolve GPU SFS feedback buffer -> readback[slot]
             cmd_barriers(
@@ -3152,6 +3304,15 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             frame_fences[slot] = 0;
             if wstate.use_gpu && !taken.is_empty() {
                 last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
+                if last_decode_ms > 1e-4 {
+                    let gbps = ((taken.len() * TILE_BC16_BYTES) as f64 / 1e9) / (last_decode_ms / 1000.0);
+                    bench_peak_gbps = bench_peak_gbps.max(gbps);
+                }
+            }
+            if let Some(ref city) = meshlet_city {
+                last_cull_stats = city.read_cull_stats(slot);
+                bench_sum_vis_tris += last_cull_stats.vis_tris as u64;
+                bench_sum_hiz_tris += last_cull_stats.hiz_occluded_tris as u64;
             }
 
             frame_count += 1;
@@ -3214,17 +3375,26 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
                 let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
                 let saved_mib = (tot_mib - cur_mib).max(0.0);
+                let city_str = if let Some(ref city) = meshlet_city {
+                    format!(
+                        "HiZ:{:.2}M/{:.1}M tris (-{:.2}M occ) | ",
+                        last_cull_stats.vis_tris as f64 / 1e6,
+                        city.total_tris as f64 / 1e6,
+                        last_cull_stats.hiz_occluded_tris as f64 / 1e6
+                    )
+                } else {
+                    String::new()
+                };
                 let title = format!(
-                    "BCPack AAA v0.8 4K BC7/BC5 | {} | {:.1} FPS | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB, ev:{}) | Mip0 {}/{} | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} VSync[L]:{} | {}",
+                    "BCPack AAA v0.8.0 | {} | {:.1} FPS | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} VSync[L]:{} | {}",
                     mode_str,
                     fps_val,
+                    city_str,
+                    if crowd_renderer.is_some() { CROWD_NPCS } else { 0 },
                     if wstate.sfs_enabled { "ON" } else { "OFF" },
                     cur_mib,
                     tot_mib,
                     saved_mib,
-                    residency.total_evictions,
-                    residency.num_mip0_full(),
-                    pack.textures.len(),
                     last_decode_ms,
                     streamed_mb,
                     if wstate.rt_enabled { "ON" } else { "OFF" },
@@ -3235,6 +3405,31 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 );
                 let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+            }
+
+            if cfg.benchmark_run && t_sec >= cfg.benchmark_secs {
+                let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
+                let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
+                let saved_mib = (tot_mib - cur_mib).max(0.0);
+                let n = bench_frame_ms.len().max(1);
+                bench_frame_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let avg_ms: f64 = bench_frame_ms.iter().sum::<f64>() / (n as f64);
+                let p99_ms = bench_frame_ms[((n as f64 * 0.99) as usize).min(n - 1)];
+                let p999_ms = bench_frame_ms[((n as f64 * 0.999) as usize).min(n - 1)];
+                let pre_tris = meshlet_city.as_ref().map(|c| c.total_tris).unwrap_or(0);
+                let fc = frame_count.max(1) as f64;
+                println!("=== BCPack AAA Benchmark v0.8.0 Summary ({:.1}s, {}x{}) ===", t_sec, render_w, render_h);
+                println!("  Frames: {} | Average FPS: {:.2} ({:.2} ms) | 1% Low: {:.2} FPS ({:.2} ms) | 0.1% Low: {:.2} FPS ({:.2} ms)",
+                    frame_count, 1000.0 / avg_ms.max(0.01), avg_ms, 1000.0 / p99_ms.max(0.01), p99_ms, 1000.0 / p999_ms.max(0.01), p999_ms);
+                println!("  GPU BCPack Peak Throughput (Live 64K BC7/BC5 Tiles): {:.2} GB/s", bench_peak_gbps);
+                println!("  SFS VRAM Residency: {:.1}/{:.1} MiB (Saved {:.1} MiB, Evictions={}, FullMip0={}/{})",
+                    cur_mib, tot_mib, saved_mib, residency.total_evictions, residency.num_mip0_full(), pack.textures.len());
+                println!("  Mesh Shaders + Hi-Z: Pre-Cull {:.2}M tris | Avg Visible {:.2}M tris | Avg Hi-Z Occluded {:.2}M tris",
+                    pre_tris as f64 / 1e6, (bench_sum_vis_tris as f64 / fc) / 1e6, (bench_sum_hiz_tris as f64 / fc) / 1e6);
+                println!("  Live Crowd: {} GPU-Skinned NPCs ({} verts/frame in Compute + DXR/RTGI/TAA/AgX)",
+                    if crowd_renderer.is_some() { CROWD_NPCS } else { 0 },
+                    crowd_renderer.as_ref().map(|c| c.verts_total()).unwrap_or(0));
+                break;
             }
 
             if let Some(target_n) = cfg.measure_frames {

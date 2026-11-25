@@ -44,6 +44,16 @@ fn main() {
                 cfg.vram_budget_mb = args[i + 1].parse().unwrap_or(128);
                 i += 1;
             }
+            "--benchmark-run" => {
+                cfg.benchmark_run = true;
+                cfg.vsync = false;
+            }
+            "--benchmark-secs" if i + 1 < args.len() => {
+                cfg.benchmark_secs = args[i + 1].parse().unwrap_or(60.0);
+                i += 1;
+            }
+            "--no-city" => cfg.no_city = true,
+            "--no-crowd" => cfg.no_crowd = true,
             other => {
                 eprintln!("Unknown flag '{other}'");
                 std::process::exit(2);

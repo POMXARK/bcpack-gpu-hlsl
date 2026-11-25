@@ -1,4 +1,28 @@
-# bcpack-gpu-hlsl v0.6.0 — Стресс-стенд Xbox Series X: 4M Mesh Shaders + 1536-TLAS RTGI + 32×32 LRU + 11.33 GB/s
+# bcpack-gpu-hlsl v0.8.0 — Кинематографичный AAA-бенчмарк: 4K BC7/BC5 + SFS + 12.41M Mesh Shaders + 500 NPC + DXR 1.1
+
+![Скриншот v0.8.0: 4K BC7/BC5 + модульные фасады Mesh Shaders (12.41M трис) + 500 NPC + DXR 1.1 + TAA + AgX](media/aaa_showcase_v8.png)
+
+![Режим X-Ray v0.8.0: живой SFS-стриминг 4K Mip 0 (зелёный) и экономия VRAM в Mip 1+ (янтарный)](media/aaa_xray_v8.png)
+
+---
+
+## Что нового в v0.8.0 (Cinematic AAA Benchmark)
+
+1. **Этап 1 — Свет, текстурированный DXR 1.1, Auto-Exposure + AgX Filmic и TAA + CAS:**
+   - Полноэкранный гистограммный авто-экспозиционер ([`shaders/aaa_autoexp.hlsl`](shaders/aaa_autoexp.hlsl)), тонемаппинг **AgX Filmic**, HDR Bloom (`threshold=1.45`), Contact Shadows (8 шагов), **4-MRT векторы движения**, Halton(2,3) джиттер, YCoCg Variance-Clipped **TAA + 5-tap CAS** ([`shaders/aaa_taa.hlsl`](shaders/aaa_taa.hlsl)) и текстурированные попадания лучей DXR (`g_InstMeta` / `g_SceneVB` / `g_SceneIB`).
+   - Исправлен редкий артефакт кэша RT-ядер на драйвере NVIDIA `621.24` (`tlas_cmd` + `uav_barrier_all()` + `VSync ON` по умолчанию).
+2. **Этап 2 — 4K BC7 / BC5 текстуры и активный GPU Sampler Feedback Streaming (SFS):**
+   - Реальные `4096×4096` карты Poly Haven + `CarConcept.glb` сжаты в **BC7 Mode 6** и **BC5** (11 мип-уровней + Packed Mip Tail, `204.67 MiB` на GPU) и распаковываются асинхронно через `Bc16GpuStreamer` ([`shaders/bc16_pack.hlsl`](shaders/bc16_pack.hlsl)).
+   - Пиксельный шейдер записывает реальный `desiredMip` в `RWByteAddressBuffer g_SfsFeedback`, а менеджер резидентности динамически управляет `ResourceMinLODClamp` у SRV в рамках `--vram-budget-mb 128` (переключатель **`[F]`**).
+3. **Этап 3 — Модульный мегаполис 12.41M треугольников (Mesh Shaders + Hi-Z), пропсы и 500 GPU-скиновых NPC:**
+   - Модульные небоскрёбы с углублёнными отражающими окнами, балконами, витринами и неоном, пальмы, фонари, дорожная разметка, набережная и дальний горизонт Skyline HLOD (`851` инстанс / `219 774` мешлета = **12.41M трис до отсечения**) + живая 6-миповая пирамида Hi-Z (`hiz_build.dxil`).
+   - **500 пешеходов на тротуарах** (`154 000` вершин/кадр, скиннинг в Compute `crowd_skin.dxil`) + 6 припаркованных спорткаров + 60-секундный прогон `--benchmark-run`.
+4. **Замеры на NVIDIA GeForce RTX 5080 (1920×1080 HDR, DX12 Debug Layer чист — 0 ошибок):**
+   - **`--benchmark-run` (60.0s, 9 026 кадров):** **150.61 FPS** ср. (`6.64 мс`) | **1% Low: 87.07 FPS** | **0.1% Low: 43.37 FPS** | SFS VRAM: **86.2 / 204.7 MiB** (экономия **118.5 MiB**) | Mesh Shaders + Hi-Z: **12.41M → 0.99M** ср. видимых | **500 NPC** | `--verify`: **17/17 PASS**.
+
+---
+
+## Архив релизов: v0.6.0 (4M Mesh Shaders + 1536-TLAS RTGI + 32×32 LRU + 11.33 GB/s)
 
 ![Скриншот v0.6.0: мегаполис на 4.01M полигонов (Mesh Shaders) + 1536 инстансов TLAS + 1-spp Diffuse RTGI + двусторонний денойзер](media/city_rtgi_v6.png)
 
