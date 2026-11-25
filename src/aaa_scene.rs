@@ -1,15 +1,15 @@
-use crate::assets::{TILE_BC1_BYTES, TILE_BLOCKS};
+use crate::assets::{decode_bc16_from_bcpack_cpu, TexFormat, TILE_BC16_BYTES, TILE_BLOCKS};
 use crate::gltf_loader::{
     find_aaa_assets_dir, load_glb_as_bcpack, load_hdr_fp16, load_png_as_bcpack, BcpackMipChunk,
     BcpackTexture2D, LoadedGlbModel, PbrSubmesh, PbrVertex,
 };
 use crate::gpu_decoder::{
     cmd_barriers, create_committed_buffer, dump_d3d12_info_queue, heap_props, pack_batch,
-    transition_barrier, uav_barrier, uav_barrier_all, upload_slice, BcpackGpuDecoder, GpuContext,
+    transition_barrier, uav_barrier, uav_barrier_all, upload_slice, Bc16GpuStreamer, GpuContext,
 };
 use crate::raytracing::{supports_dxr_1_1, MAX_RT_INSTANCES};
 use crate::rtgi::RTGI_DENOISE_CS_DXIL;
-use bcpack::bc1::{self, QuadTable, Window};
+use bcpack::bc1::{QuadTable, Window};
 use png;
 use std::ffi::c_void;
 use std::fs::File;
@@ -54,7 +54,16 @@ const SWAP_W: u32 = 1920;
 const SWAP_H: u32 = 1080;
 const TEX_SLOT_CAP: usize = 32;
 const SRV_TABLE_STRIDE: usize = 37; // t0..t31 textures, t32 envHdr, t33 tlas, t34 instMeta, t35 sceneVB, t36 sceneIB
-const MAX_BATCH_TILES: usize = 256;
+const MAX_BATCH_TILES: usize = 128; // 128 x 64 KiB BC16 tiles = 8.0 MiB/batch
+
+#[inline]
+fn dxgi_format_for(fmt: TexFormat) -> DXGI_FORMAT {
+    match fmt {
+        TexFormat::Bc1 => DXGI_FORMAT_BC1_UNORM,
+        TexFormat::Bc5 => DXGI_FORMAT_BC5_UNORM,
+        TexFormat::Bc7 => DXGI_FORMAT_BC7_UNORM,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AaaDemoConfig {
@@ -72,6 +81,7 @@ pub struct AaaDemoConfig {
     pub flush_at_frame: Option<u32>,
     pub screenshot_path: Option<PathBuf>,
     pub screenshot_frames: u32,
+    pub vram_budget_mb: usize,
 }
 
 impl Default for AaaDemoConfig {
@@ -86,11 +96,12 @@ impl Default for AaaDemoConfig {
             vsync: true,
             no_rt: false,
             no_rtgi: false,
-            tiles_per_frame: 256,
+            tiles_per_frame: 128,
             measure_frames: None,
             flush_at_frame: None,
             screenshot_path: None,
             screenshot_frames: 24,
+            vram_budget_mb: 128,
         }
     }
 }
@@ -133,6 +144,7 @@ struct WindowState {
     rtgi_enabled: bool,
     xray_enabled: bool,
     vsync_enabled: bool,
+    sfs_enabled: bool,
     cam_mode: u32, // 0=Showroom 3/4 Orbit, 1=Chase Drive, 2=Free Cam
     flush_requested: bool,
     should_quit: bool,
@@ -314,6 +326,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             x if x == b'T' as u32 => st.flush_requested = true,
             x if x == b'V' as u32 => st.xray_enabled = !st.xray_enabled,
             x if x == b'L' as u32 => st.vsync_enabled = !st.vsync_enabled,
+            x if x == b'F' as u32 => st.sfs_enabled = !st.sfs_enabled,
             x if x == b'R' as u32 => st.rt_enabled = !st.rt_enabled,
             x if x == b'G' as u32 => st.rtgi_enabled = !st.rtgi_enabled,
             x if x == b'C' as u32 => st.cam_mode = (st.cam_mode + 1) % 3,
@@ -370,7 +383,7 @@ fn build_plane_pbr() -> (Vec<PbrVertex>, Vec<u32>) {
 
 struct AaaAssetPack {
     car: LoadedGlbModel,
-    textures: Vec<BcpackTexture2D>, // 0..13 car + 14..22 PolyHaven 2K
+    textures: Vec<BcpackTexture2D>, // 0..13 car (BC7/BC5) + 14..22 PolyHaven 4K (BC7/BC5)
     asphalt_tex: [u32; 3],
     promenade_tex: [u32; 3],
     concrete_tex: [u32; 3],
@@ -379,7 +392,8 @@ struct AaaAssetPack {
     hdri_fp16: Vec<u16>,
     total_tiles: usize,
     total_bcpack_bytes: usize,
-    total_bc1_bytes: usize,
+    total_mip0_bytes: usize,
+    total_vram_bytes: usize,
 }
 
 fn load_aaa_asset_pack(aaa_dir: &Path, window: &Window, quads: &QuadTable) -> AaaAssetPack {
@@ -389,26 +403,28 @@ fn load_aaa_asset_pack(aaa_dir: &Path, window: &Window, quads: &QuadTable) -> Aa
     let mut car = load_glb_as_bcpack(&aaa_dir.join("CarConcept.glb"), &cache_dir, window, quads);
     let mut textures = std::mem::take(&mut car.textures);
 
-    let mut push_2k = |file: &str, name: &str| -> u32 {
+    let mut push_4k = |file_4k: &str, file_2k: &str, name: &str, fmt: TexFormat| -> u32 {
         let idx = textures.len() as u32;
-        textures.push(load_png_as_bcpack(&aaa_dir.join(file), name, 2048, &cache_dir, window, quads));
+        let path_4k = aaa_dir.join(file_4k);
+        let src_path = if path_4k.exists() { path_4k } else { aaa_dir.join(file_2k) };
+        textures.push(load_png_as_bcpack(&src_path, name, 4096, fmt, &cache_dir, window, quads));
         idx
     };
 
     let asphalt_tex = [
-        push_2k("asphalt_albedo.png", "asphalt_albedo_2048"),
-        push_2k("asphalt_normal.png", "asphalt_normal_2048"),
-        push_2k("asphalt_arm.png", "asphalt_arm_2048"),
+        push_4k("asphalt_albedo_4k.png", "asphalt_albedo.png", "asphalt_albedo_4k", TexFormat::Bc7),
+        push_4k("asphalt_normal_4k.png", "asphalt_normal.png", "asphalt_normal_4k", TexFormat::Bc5),
+        push_4k("asphalt_arm_4k.png", "asphalt_arm.png", "asphalt_arm_4k", TexFormat::Bc7),
     ];
     let promenade_tex = [
-        push_2k("promenade_albedo.png", "promenade_albedo_2048"),
-        push_2k("promenade_normal.png", "promenade_normal_2048"),
-        push_2k("promenade_arm.png", "promenade_arm_2048"),
+        push_4k("promenade_albedo_4k.png", "promenade_albedo.png", "promenade_albedo_4k", TexFormat::Bc7),
+        push_4k("promenade_normal_4k.png", "promenade_normal.png", "promenade_normal_4k", TexFormat::Bc5),
+        push_4k("promenade_arm_4k.png", "promenade_arm.png", "promenade_arm_4k", TexFormat::Bc7),
     ];
     let concrete_tex = [
-        push_2k("concrete_albedo.png", "concrete_albedo_2048"),
-        push_2k("concrete_normal.png", "concrete_normal_2048"),
-        push_2k("concrete_arm.png", "concrete_arm_2048"),
+        push_4k("concrete_albedo_4k.png", "concrete_albedo.png", "concrete_albedo_4k", TexFormat::Bc7),
+        push_4k("concrete_normal_4k.png", "concrete_normal.png", "concrete_normal_4k", TexFormat::Bc5),
+        push_4k("concrete_arm_4k.png", "concrete_arm.png", "concrete_arm_4k", TexFormat::Bc7),
     ];
 
     assert!(
@@ -422,7 +438,12 @@ fn load_aaa_asset_pack(aaa_dir: &Path, window: &Window, quads: &QuadTable) -> Aa
 
     let total_tiles: usize = textures.iter().map(|t| t.num_strips).sum();
     let total_bcpack_bytes: usize = textures.iter().flat_map(|t| t.bcpack_tiles.iter()).map(|b| b.len()).sum();
-    let total_bc1_bytes = total_tiles * TILE_BC1_BYTES;
+    let total_mip0_bytes: usize = textures.iter().map(|t| t.expected_blocks.len()).sum();
+    let total_lower_bytes: usize = textures
+        .iter()
+        .map(|t| t.lower_mips.iter().map(|m| m.expected_blocks.len()).sum::<usize>())
+        .sum();
+    let total_vram_bytes = total_mip0_bytes + total_lower_bytes;
 
     AaaAssetPack {
         car,
@@ -435,7 +456,8 @@ fn load_aaa_asset_pack(aaa_dir: &Path, window: &Window, quads: &QuadTable) -> Aa
         hdri_fp16,
         total_tiles,
         total_bcpack_bytes,
-        total_bc1_bytes,
+        total_mip0_bytes,
+        total_vram_bytes,
     }
 }
 
@@ -444,84 +466,278 @@ struct TileRef {
     strip_idx: usize,
 }
 
-struct TextureResidency {
-    resident_strips: Vec<usize>,
-    num_strips: Vec<usize>,
-    fresh_timer: Vec<f32>, // >0 shortly after decompression for [V] X-Ray wave
-    pending: Vec<TileRef>,
-    pending_cursor: usize,
+struct SfsTexState {
+    num_strips: usize,
+    mip0_resident_strips: usize,
+    mip0_bytes: usize,
+    queued: bool,
+    clamped_lod: f32, // 0.0 = Mip-0 resident, 1.0 = SFS clamped to Mip 1+
+    srv_dirty: bool,
+    desired_mip: f32,
+    pixel_hits: u32,
+    last_hot_frame: u64,
+    fresh_timer: f32,
+    clay_timer: f32,
 }
 
-impl TextureResidency {
-    fn new(textures: &[BcpackTexture2D]) -> Self {
-        let mut num_strips = Vec::with_capacity(textures.len());
-        let mut pending = Vec::new();
-        for (ti, tex) in textures.iter().enumerate() {
-            num_strips.push(tex.num_strips);
-            for s in 0..tex.num_strips {
-                pending.push(TileRef { tex_idx: ti, strip_idx: s });
-            }
+struct SfsResidencyManager {
+    tex: Vec<SfsTexState>,
+    pending: std::collections::VecDeque<TileRef>,
+    budget_bytes: usize,
+    total_evictions: u64,
+    total_vram_bytes: usize,
+    lower_vram_bytes: usize,
+}
+
+impl SfsResidencyManager {
+    fn new(textures: &[BcpackTexture2D], budget_bytes: usize) -> Self {
+        let mut tex = Vec::with_capacity(textures.len());
+        let mut lower_vram_bytes = 0usize;
+        let mut total_vram_bytes = 0usize;
+        for t in textures {
+            let mip0_bytes = t.expected_blocks.len();
+            let lower_mip_bytes: usize = t.lower_mips.iter().map(|m| m.expected_blocks.len()).sum();
+            lower_vram_bytes += lower_mip_bytes;
+            total_vram_bytes += mip0_bytes + lower_mip_bytes;
+            tex.push(SfsTexState {
+                num_strips: t.num_strips,
+                mip0_resident_strips: 0,
+                mip0_bytes,
+                queued: false,
+                clamped_lod: 1.0,
+                srv_dirty: false,
+                desired_mip: 4.0,
+                pixel_hits: 0,
+                last_hot_frame: 0,
+                fresh_timer: 0.0,
+                clay_timer: 0.0,
+            });
         }
         Self {
-            resident_strips: vec![0; textures.len()],
-            num_strips,
-            fresh_timer: vec![0.0; textures.len()],
-            pending,
-            pending_cursor: 0,
+            tex,
+            pending: std::collections::VecDeque::new(),
+            budget_bytes,
+            total_evictions: 0,
+            total_vram_bytes,
+            lower_vram_bytes,
         }
     }
 
     fn flush_to_clay(&mut self) {
-        self.resident_strips.fill(0);
-        self.fresh_timer.fill(0.0);
-        self.pending_cursor = 0;
+        self.pending.clear();
+        for s in &mut self.tex {
+            s.mip0_resident_strips = 0;
+            s.queued = false;
+            if s.clamped_lod < 0.5 {
+                s.clamped_lod = 1.0;
+                s.srv_dirty = true;
+            }
+            s.fresh_timer = 0.0;
+            s.clay_timer = 0.75;
+        }
     }
 
     fn tick_timers(&mut self, dt: f32) {
-        for v in &mut self.fresh_timer {
-            if *v > 0.0 {
-                *v = (*v - dt * 1.4).max(0.0);
+        for s in &mut self.tex {
+            if s.fresh_timer > 0.0 {
+                s.fresh_timer = (s.fresh_timer - dt * 1.4).max(0.0);
+            }
+            if s.clay_timer > 0.0 {
+                s.clay_timer = (s.clay_timer - dt).max(0.0);
             }
         }
     }
 
-    fn take_batch(&mut self, count: usize) -> &[TileRef] {
-        let rem = self.pending.len().saturating_sub(self.pending_cursor);
-        let take = count.min(rem);
-        let start = self.pending_cursor;
-        self.pending_cursor += take;
-        &self.pending[start..start + take]
+    fn current_vram_bytes(&self) -> usize {
+        let mip0: usize = self
+            .tex
+            .iter()
+            .filter(|s| s.mip0_resident_strips > 0)
+            .map(|s| (s.mip0_bytes * s.mip0_resident_strips) / s.num_strips.max(1))
+            .sum();
+        self.lower_vram_bytes + mip0
+    }
+
+    fn planned_vram_bytes(&self) -> usize {
+        let mip0: usize = self
+            .tex
+            .iter()
+            .filter(|s| s.queued || s.mip0_resident_strips > 0)
+            .map(|s| s.mip0_bytes)
+            .sum();
+        self.lower_vram_bytes + mip0
+    }
+
+    fn evict_tex(&mut self, idx: usize) {
+        let s = &mut self.tex[idx];
+        if s.mip0_resident_strips == 0 && !s.queued {
+            return;
+        }
+        s.mip0_resident_strips = 0;
+        s.queued = false;
+        if s.clamped_lod < 0.5 {
+            s.clamped_lod = 1.0;
+            s.srv_dirty = true;
+        }
+        s.fresh_timer = 0.0;
+        self.pending.retain(|r| r.tex_idx != idx);
+        self.total_evictions += 1;
+    }
+
+    fn enqueue_tex(&mut self, idx: usize) {
+        let s = &mut self.tex[idx];
+        if s.queued || s.mip0_resident_strips >= s.num_strips {
+            return;
+        }
+        s.queued = true;
+        s.clay_timer = 0.0;
+        let start = s.mip0_resident_strips;
+        for strip_idx in start..s.num_strips {
+            self.pending.push_back(TileRef { tex_idx: idx, strip_idx });
+        }
+    }
+
+    fn apply_sfs_feedback_and_schedule(&mut self, fb_bytes: &[u8], frame_idx: u64, sfs_enabled: bool) {
+        for (i, s) in self.tex.iter_mut().enumerate() {
+            let off = i * 16;
+            if off + 8 <= fb_bytes.len() {
+                let min_mip_fp8 = u32::from_le_bytes(fb_bytes[off..off + 4].try_into().unwrap());
+                let hits = u32::from_le_bytes(fb_bytes[off + 4..off + 8].try_into().unwrap());
+                s.pixel_hits = hits;
+                if hits > 0 && min_mip_fp8 != u32::MAX {
+                    s.desired_mip = (min_mip_fp8 as f32) / 256.0;
+                    if s.desired_mip < 1.85 {
+                        s.last_hot_frame = frame_idx;
+                    }
+                } else {
+                    s.desired_mip = 11.0;
+                }
+            }
+        }
+
+        if !sfs_enabled || self.budget_bytes == 0 {
+            for i in 0..self.tex.len() {
+                self.enqueue_tex(i);
+            }
+            return;
+        }
+
+        // First evict any unhit / far Mip-0 textures if we are over budget
+        while self.planned_vram_bytes() > self.budget_bytes {
+            let cold = (0..self.tex.len())
+                .filter(|&i| self.tex[i].queued || self.tex[i].mip0_resident_strips > 0)
+                .filter(|&i| self.tex[i].pixel_hits == 0 || self.tex[i].desired_mip >= 1.85)
+                .min_by(|&a, &b| {
+                    self.tex[a]
+                        .last_hot_frame
+                        .cmp(&self.tex[b].last_hot_frame)
+                        .then_with(|| self.tex[b].desired_mip.partial_cmp(&self.tex[a].desired_mip).unwrap_or(std::cmp::Ordering::Equal))
+                });
+            if let Some(ci) = cold {
+                self.evict_tex(ci);
+            } else {
+                break;
+            }
+        }
+
+        // Sort hot Mip-0 candidates by sharp detail demand (lowest desired_mip, most pixels)
+        let mut hot: Vec<usize> = (0..self.tex.len())
+            .filter(|&i| self.tex[i].pixel_hits > 0 && self.tex[i].desired_mip < 1.85)
+            .collect();
+        hot.sort_by(|&a, &b| {
+            self.tex[a]
+                .desired_mip
+                .partial_cmp(&self.tex[b].desired_mip)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| self.tex[b].pixel_hits.cmp(&self.tex[a].pixel_hits))
+        });
+
+        for hi in hot {
+            if self.tex[hi].queued || self.tex[hi].mip0_resident_strips >= self.tex[hi].num_strips {
+                continue;
+            }
+            let need = self.tex[hi].mip0_bytes;
+            while self.planned_vram_bytes() + need > self.budget_bytes {
+                let victim = (0..self.tex.len())
+                    .filter(|&i| i != hi && (self.tex[i].queued || self.tex[i].mip0_resident_strips > 0))
+                    .filter(|&i| {
+                        self.tex[i].pixel_hits == 0
+                            || self.tex[i].last_hot_frame < self.tex[hi].last_hot_frame
+                            || self.tex[i].desired_mip > self.tex[hi].desired_mip + 0.35
+                    })
+                    .min_by(|&a, &b| {
+                        self.tex[a]
+                            .last_hot_frame
+                            .cmp(&self.tex[b].last_hot_frame)
+                            .then_with(|| self.tex[b].desired_mip.partial_cmp(&self.tex[a].desired_mip).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| self.tex[a].pixel_hits.cmp(&self.tex[b].pixel_hits))
+                    });
+                if let Some(vi) = victim {
+                    self.evict_tex(vi);
+                } else {
+                    break;
+                }
+            }
+            if self.planned_vram_bytes() + need <= self.budget_bytes {
+                self.enqueue_tex(hi);
+            }
+        }
+    }
+
+    fn take_batch(&mut self, count: usize) -> Vec<TileRef> {
+        let take = count.min(self.pending.len());
+        let mut out = Vec::with_capacity(take);
+        for _ in 0..take {
+            if let Some(r) = self.pending.pop_front() {
+                out.push(r);
+            }
+        }
+        out
     }
 
     fn mark_resident(&mut self, tiles: &[TileRef]) {
         for t in tiles {
-            self.resident_strips[t.tex_idx] = self.resident_strips[t.tex_idx].max(t.strip_idx + 1);
-            self.fresh_timer[t.tex_idx] = 1.0;
+            let s = &mut self.tex[t.tex_idx];
+            s.mip0_resident_strips = s.mip0_resident_strips.max(t.strip_idx + 1);
+            s.clay_timer = 0.0;
+            s.fresh_timer = 1.0;
+            if s.mip0_resident_strips >= s.num_strips && s.clamped_lod > 0.5 {
+                s.clamped_lod = 0.0;
+                s.srv_dirty = true;
+            }
         }
     }
 
-    fn total_resident(&self) -> usize {
-        self.resident_strips.iter().sum()
+    fn total_mip0_resident(&self) -> usize {
+        self.tex.iter().map(|s| s.mip0_resident_strips).sum()
     }
 
-    fn total_tiles(&self) -> usize {
-        self.pending.len()
+    fn total_mip0_tiles(&self) -> usize {
+        self.tex.iter().map(|s| s.num_strips).sum()
+    }
+
+    fn num_mip0_full(&self) -> usize {
+        self.tex.iter().filter(|s| s.mip0_resident_strips >= s.num_strips && s.clamped_lod < 0.5).count()
     }
 
     fn state_for_tex(&self, idx: u32) -> f32 {
         if idx == u32::MAX {
             return -1.0;
         }
-        let ti = idx as usize;
-        let res = self.resident_strips[ti];
-        let tot = self.num_strips[ti].max(1);
-        if res == 0 {
-            return -1.0;
+        let s = &self.tex[idx as usize];
+        if s.mip0_resident_strips == 0 {
+            if s.clay_timer > 0.0 {
+                return -1.0;
+            }
+            return 2.0 + s.clamped_lod;
         }
-        if res < tot {
-            return (res as f32 / tot as f32).clamp(0.01, 0.99);
+        if s.mip0_resident_strips < s.num_strips {
+            return (s.mip0_resident_strips as f32 / s.num_strips.max(1) as f32).clamp(0.01, 0.99);
         }
-        1.0 + self.fresh_timer[ti]
+        if s.clamped_lod >= 0.5 {
+            return 2.0 + s.clamped_lod;
+        }
+        1.0 + s.fresh_timer
     }
 }
 
@@ -1515,29 +1731,27 @@ impl AaaPostPipeline {
     }
 }
 
-fn run_flush_bench_mode(pack: &AaaAssetPack, window: &Window, quads: &QuadTable, enable_debug: bool) {
+fn run_flush_bench_mode(pack: &AaaAssetPack, enable_debug: bool) {
     let mut ctx = GpuContext::new(enable_debug);
     let max_tiles = MAX_BATCH_TILES;
-    let mut gpu_dec = BcpackGpuDecoder::new(
+    let mut gpu_dec = Bc16GpuStreamer::new(
         &mut ctx,
-        window,
-        quads,
         max_tiles,
-        max_tiles * TILE_BLOCKS,
-        max_tiles * 64 * 1024,
+        max_tiles * TILE_BLOCKS * 2,
+        max_tiles * 96 * 1024,
     );
 
     println!(
-        "[aaa-flush-bench] Adapter: {} | Assets: {} PBR textures (2K PolyHaven + CarConcept glTF), {} tiles ({:.2} MiB BC1 <- {:.2} MiB BCPack, ratio {:.2}x)",
+        "[aaa-flush-bench] Adapter: {} | Assets: {} PBR textures (4K BC7/BC5 + CarConcept glTF), {} tiles ({:.2} MiB Mip0 BC7/BC5 <- {:.2} MiB BCPack, ratio {:.2}x)",
         ctx.adapter_name,
         pack.textures.len(),
         pack.total_tiles,
-        pack.total_bc1_bytes as f64 / (1024.0 * 1024.0),
+        pack.total_mip0_bytes as f64 / (1024.0 * 1024.0),
         pack.total_bcpack_bytes as f64 / (1024.0 * 1024.0),
-        pack.total_bc1_bytes as f64 / pack.total_bcpack_bytes.max(1) as f64,
+        pack.total_mip0_bytes as f64 / pack.total_bcpack_bytes.max(1) as f64,
     );
 
-    // 1) GPU Async Compute full VRAM Flush -> Residency wave (256 tiles/batch)
+    // 1) GPU Async Compute full 4K VRAM Flush -> Residency wave (128 x 64KiB tiles/batch)
     let gpu_start = Instant::now();
     let mut gpu_kernel_ms = 0.0f64;
     let mut gpu_batches = 0usize;
@@ -1551,7 +1765,7 @@ fn run_flush_bench_mode(pack: &AaaAssetPack, window: &Window, quads: &QuadTable,
     for (bi, chunk) in all_refs.chunks(MAX_BATCH_TILES).enumerate() {
         let slot = bi & 1;
         let batch = pack_batch(chunk.iter().map(|t| {
-            (pack.textures[t.tex_idx].bcpack_tiles[t.strip_idx].as_slice(), TILE_BLOCKS)
+            (pack.textures[t.tex_idx].bcpack_tiles[t.strip_idx].as_slice(), TILE_BLOCKS * 2)
         }));
         let fence = gpu_dec.submit_slot_async_compute(&mut ctx, slot, &batch);
         let _ = ctx.wait_compute_cpu(fence, u32::MAX);
@@ -1559,25 +1773,24 @@ fn run_flush_bench_mode(pack: &AaaAssetPack, window: &Window, quads: &QuadTable,
         gpu_batches += 1;
     }
     let gpu_wall_ms = gpu_start.elapsed().as_secs_f64() * 1000.0;
-    let gpu_kernel_gbps = (pack.total_bc1_bytes as f64 / 1e9) / (gpu_kernel_ms / 1000.0);
-    let gpu_eff_gbps = (pack.total_bc1_bytes as f64 / 1e9) / (gpu_wall_ms / 1000.0);
+    let gpu_kernel_gbps = (pack.total_mip0_bytes as f64 / 1e9) / (gpu_kernel_ms / 1000.0);
+    let gpu_eff_gbps = (pack.total_mip0_bytes as f64 / 1e9) / (gpu_wall_ms / 1000.0);
 
-    // 2) CPU 1-Thread Baseline over identical 728 tiles
+    // 2) CPU 1-Thread Baseline over identical 64 KiB BC7/BC5 tiles
     let cpu_start = Instant::now();
     for t in &all_refs {
-        let dec = bc1::decode(&pack.textures[t.tex_idx].bcpack_tiles[t.strip_idx], TILE_BLOCKS, window, quads)
-            .expect("cpu bc1 decode");
-        std::hint::black_box(dec.blocks[0]);
+        let dec = decode_bc16_from_bcpack_cpu(&pack.textures[t.tex_idx].bcpack_tiles[t.strip_idx], TILE_BLOCKS);
+        std::hint::black_box(dec[0]);
     }
     let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1000.0;
-    let cpu_mbps = (pack.total_bc1_bytes as f64 / 1e6) / (cpu_ms / 1000.0);
+    let cpu_mbps = (pack.total_mip0_bytes as f64 / 1e6) / (cpu_ms / 1000.0);
 
     println!(
-        "[aaa-flush-bench] GPU Async Compute: batches={}, kernel={:.3} ms ({:.2} GB/s), wall={:.3} ms ({:.2} GB/s)",
+        "[aaa-flush-bench] GPU Async Compute (BC7/BC5): batches={}, kernel={:.3} ms ({:.2} GB/s), wall={:.3} ms ({:.2} GB/s)",
         gpu_batches, gpu_kernel_ms, gpu_kernel_gbps, gpu_wall_ms, gpu_eff_gbps
     );
     println!(
-        "[aaa-flush-bench] CPU 1-Thread Baseline: {:.3} ms ({:.1} MB/s) -> GPU Kernel Speedup = {:.1}x | GPU Wall Speedup = {:.1}x",
+        "[aaa-flush-bench] CPU 1-Thread Baseline (BC7/BC5): {:.3} ms ({:.1} MB/s) -> GPU Kernel Speedup = {:.1}x | GPU Wall Speedup = {:.1}x",
         cpu_ms,
         cpu_mbps,
         cpu_ms / gpu_kernel_ms.max(1e-4),
@@ -1605,24 +1818,22 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
     let pack = load_aaa_asset_pack(&aaa_dir, &window_tbl, &quads_tbl);
 
     if cfg.flush_bench {
-        run_flush_bench_mode(&pack, &window_tbl, &quads_tbl, cfg.enable_debug);
+        run_flush_bench_mode(&pack, cfg.enable_debug);
         return;
     }
 
     unsafe {
         let mut ctx = GpuContext::new(cfg.enable_debug);
-        let mut gpu_dec = BcpackGpuDecoder::new(
+        let mut gpu_dec = Bc16GpuStreamer::new(
             &mut ctx,
-            &window_tbl,
-            &quads_tbl,
             MAX_BATCH_TILES,
-            MAX_BATCH_TILES * TILE_BLOCKS,
-            MAX_BATCH_TILES * 64 * 1024,
+            MAX_BATCH_TILES * TILE_BLOCKS * 2,
+            MAX_BATCH_TILES * 96 * 1024,
         );
 
         // Win32 Window
         let hinst = GetModuleHandleW(None).expect("GetModuleHandleW");
-        let class_name = w!("BcpackAaaShowcaseWndV7");
+        let class_name = w!("BcpackAaaShowcaseWndV8");
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -1638,7 +1849,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
-            w!("BCPack AAA Showcase v0.7.0 (2K PBR + HDRI IBL + DXR 1.1) - Initializing..."),
+            w!("BCPack AAA Showcase v0.8 (4K BC7/BC5 + Active SFS + DXR 1.1) - Initializing..."),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -1657,6 +1868,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             rtgi_enabled: !cfg.no_rt && !cfg.no_rtgi,
             xray_enabled: cfg.xray_mode,
             vsync_enabled: cfg.vsync,
+            sfs_enabled: cfg.vram_budget_mb > 0,
             cam_mode: 0,
             flush_requested: false,
             should_quit: false,
@@ -1784,7 +1996,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let vb_def = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, vb_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
         let ib_def = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, ib_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-        // Live 23 PBR BC1 Textures with Console-Native Full Mipmap Chains + 1 Dummy Fallback + 1 FP16 HDRI Texture
+        // Live 23 PBR BC7/BC5 Textures (4K PolyHaven + glTF) with Console-Native Full Mipmap Chains + Dummy + HDRI
         let mut pbr_textures = Vec::with_capacity(pack.textures.len());
         for t in &pack.textures {
             let desc = D3D12_RESOURCE_DESC {
@@ -1793,7 +2005,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 Height: t.height,
                 DepthOrArraySize: 1,
                 MipLevels: t.mip_levels as u16,
-                Format: DXGI_FORMAT_BC1_UNORM,
+                Format: dxgi_format_for(t.format),
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
                 Flags: D3D12_RESOURCE_FLAG_NONE,
@@ -1812,6 +2024,17 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 .unwrap();
             pbr_textures.push(res.unwrap());
         }
+
+        // GPU Sampler Feedback (SFS) buffer: 32 textures x 16 bytes (min_mip_fp8, hit_count, 0, 0)
+        let sfs_init_vals: Vec<u32> = (0..TEX_SLOT_CAP).flat_map(|_| [u32::MAX, 0, 0, 0]).collect();
+        let sfs_buf_bytes = (TEX_SLOT_CAP * 16) as u64;
+        let sfs_feedback_init = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, sfs_buf_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        upload_slice(&sfs_feedback_init, &sfs_init_vals);
+        let sfs_feedback_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, sfs_buf_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        let sfs_feedback_readback = [
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, sfs_buf_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST),
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, sfs_buf_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST),
+        ];
 
         // Dummy 1x1 white RGBA8 texture for unused tN slots (<32)
         let dummy_desc = D3D12_RESOURCE_DESC {
@@ -1944,13 +2167,14 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             for i in 0..TEX_SLOT_CAP {
                 if i < pbr_textures.len() {
                     let mut sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: DXGI_FORMAT_BC1_UNORM,
+                        Format: dxgi_format_for(pack.textures[i].format),
                         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
                         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                         ..Default::default()
                     };
                     sd.Anonymous.Texture2D = D3D12_TEX2D_SRV {
                         MipLevels: pack.textures[i].mip_levels,
+                        ResourceMinLODClamp: 1.0, // Start clamped to Mip 1..Tail until Mip 0 finishes streaming
                         ..Default::default()
                     };
                     ctx.device.CreateShaderResourceView(&pbr_textures[i], Some(&sd), cpu_at(base + i));
@@ -2111,7 +2335,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let sky_pso: ID3D12PipelineState = ctx.device.CreateGraphicsPipelineState(&sky_pso_desc).unwrap();
         let _ = ManuallyDrop::take(&mut sky_pso_desc.pRootSignature);
 
-        // AAA PBR PSO (b0 = AaaDrawCB 52 DWORDs, t0..t36 SRV table, b1 = AaaFrameCB root CBV)
+        // AAA PBR PSO (b0 = AaaDrawCB 52 DWORDs, t0..t36 SRV table, b1 = AaaFrameCB root CBV, u0 = g_SfsFeedback root UAV)
         let pbr_srv_rng = D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             NumDescriptors: SRV_TABLE_STRIDE as u32,
@@ -2144,6 +2368,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
             },
         ];
         let pbr_samplers = [
@@ -2243,15 +2474,15 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         cmd_lists[0].Close().unwrap();
         cmd_lists[1].Close().unwrap();
 
-        // CPU fallback upload buffer for MAX_BATCH_TILES
+        // CPU fallback upload buffer for MAX_BATCH_TILES (64 KiB each for BC7/BC5)
         let cpu_upload_buf = create_committed_buffer(
             &ctx.device,
             D3D12_HEAP_TYPE_UPLOAD,
-            (MAX_BATCH_TILES * TILE_BC1_BYTES) as u64,
+            (MAX_BATCH_TILES * TILE_BC16_BYTES) as u64,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_GENERIC_READ,
         );
-        let mut cpu_scratch = vec![0u8; MAX_BATCH_TILES * TILE_BC1_BYTES];
+        let mut cpu_scratch = vec![0u8; MAX_BATCH_TILES * TILE_BC16_BYTES];
 
         // Screenshot readback
         let ss_row_pitch = (SWAP_W * 4).div_ceil(256) * 256;
@@ -2263,7 +2494,19 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
 
-        let mut residency = TextureResidency::new(&pack.textures);
+        let budget_bytes = cfg.vram_budget_mb * 1024 * 1024;
+        let mut residency = SfsResidencyManager::new(&pack.textures, budget_bytes);
+        // Kickstart initial Mip-0 stream with hero car paint & 4K road asphalt before first frame SFS feedback arrives
+        for seed_idx in [
+            pack.asphalt_tex[0] as usize,
+            pack.asphalt_tex[1] as usize,
+            pack.promenade_tex[0] as usize,
+        ] {
+            if seed_idx < pack.textures.len() {
+                residency.tex[seed_idx].last_hot_frame = 1;
+                residency.enqueue_tex(seed_idx);
+            }
+        }
 
         let vb_view = D3D12_VERTEX_BUFFER_VIEW {
             BufferLocation: vb_def.GetGPUVirtualAddress(),
@@ -2285,21 +2528,22 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             towers.push(([-26.0 - (i % 2) as f32 * 7.0, h * 0.5, z], [w, h, w * 1.1], [0.85, 0.78, 0.72]));
         }
 
-        println!("=== BCPack AAA Showcase v0.7.0 ===");
+        println!("=== BCPack AAA Showcase v0.8 (Stage 2: 4K BC7/BC5 + Active SFS) ===");
         println!(
-            "  Assets: CarConcept.glb ({} tris, {} submeshes) + 9x Poly Haven 2K PBR + 2K Sunset HDRI",
+            "  Assets: CarConcept.glb ({} tris, {} submeshes) + 9x Poly Haven 4K PBR (BC7/BC5) + 2K Sunset HDRI",
             pack.car.indices.len() / 3,
             pack.car.submeshes.len()
         );
         println!(
-            "  BCPack Stream: {} textures, {} 4K-tiles ({:.2} MiB BC1 <- {:.2} MiB BCPack, ratio {:.2}x)",
+            "  BCPack Stream: {} textures, {} 64K-tiles ({:.2} MiB Mip0 / {:.2} MiB Full MipChain <- {:.2} MiB BCPack, SFS Budget={} MiB)",
             pack.textures.len(),
             pack.total_tiles,
-            pack.total_bc1_bytes as f64 / (1024.0 * 1024.0),
+            pack.total_mip0_bytes as f64 / (1024.0 * 1024.0),
+            pack.total_vram_bytes as f64 / (1024.0 * 1024.0),
             pack.total_bcpack_bytes as f64 / (1024.0 * 1024.0),
-            pack.total_bc1_bytes as f64 / pack.total_bcpack_bytes.max(1) as f64
+            cfg.vram_budget_mb
         );
-        println!("  Controls: [T] Flush VRAM Wave | [V] X-Ray Heatmap | [L] VSync (Monitor Hz) | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Camera | [ESC] Quit");
+        println!("  Controls: [T] Flush VRAM Wave | [V] X-Ray SFS Heatmap | [F] SFS Budget ON/OFF | [L] VSync | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Camera | [ESC] Quit");
 
         let mut frame_fences = [0u64; 2];
         let mut frame_count: u32 = 0;
@@ -2344,37 +2588,30 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             let slot = (frame_count as usize) & 1;
             ctx.wait_direct_cpu(frame_fences[slot]);
 
-            // Stream pending 4K BCPack tiles via Async Compute (or CPU 1-thread when toggled)
+            // Stream pending 64 KiB (4K BC7/BC5) BCPack tiles via Async Compute (or CPU 1-thread when toggled)
             let batch_tiles_n = cfg.tiles_per_frame.clamp(16, MAX_BATCH_TILES);
-            let taken: Vec<TileRef> = residency
-                .take_batch(batch_tiles_n)
-                .iter()
-                .map(|r| TileRef { tex_idx: r.tex_idx, strip_idx: r.strip_idx })
-                .collect();
+            let taken = residency.take_batch(batch_tiles_n);
 
             let mut compute_fence = 0u64;
             let mut streamed_mb = 0.0f64;
             if !taken.is_empty() {
-                streamed_mb = (taken.len() * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0);
+                streamed_mb = (taken.len() * TILE_BC16_BYTES) as f64 / (1024.0 * 1024.0);
                 if wstate.use_gpu {
                     let batch = pack_batch(taken.iter().map(|r| {
-                        (pack.textures[r.tex_idx].bcpack_tiles[r.strip_idx].as_slice(), TILE_BLOCKS)
+                        (pack.textures[r.tex_idx].bcpack_tiles[r.strip_idx].as_slice(), TILE_BLOCKS * 2)
                     }));
                     compute_fence = gpu_dec.submit_slot_async_compute(&mut ctx, slot, &batch);
                 } else {
                     let t_cpu = Instant::now();
                     for (bi, r) in taken.iter().enumerate() {
-                        let dec = bc1::decode(
+                        let dec = decode_bc16_from_bcpack_cpu(
                             &pack.textures[r.tex_idx].bcpack_tiles[r.strip_idx],
                             TILE_BLOCKS,
-                            &window_tbl,
-                            &quads_tbl,
-                        )
-                        .unwrap();
-                        cpu_scratch[bi * TILE_BC1_BYTES..(bi + 1) * TILE_BC1_BYTES].copy_from_slice(&dec.blocks);
+                        );
+                        cpu_scratch[bi * TILE_BC16_BYTES..(bi + 1) * TILE_BC16_BYTES].copy_from_slice(&dec);
                     }
                     last_decode_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
-                    upload_slice(&cpu_upload_buf, &cpu_scratch[..taken.len() * TILE_BC1_BYTES]);
+                    upload_slice(&cpu_upload_buf, &cpu_scratch[..taken.len() * TILE_BC16_BYTES]);
                 }
             }
 
@@ -2527,7 +2764,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
                 for (bi, r) in taken.iter().enumerate() {
                     let tex_meta = &pack.textures[r.tex_idx];
-                    let row_pitch = (tex_meta.width / 4) * 8;
+                    let row_pitch = (tex_meta.width / 4) * (tex_meta.format.block_bytes() as u32);
                     let mut dst = D3D12_TEXTURE_COPY_LOCATION {
                         pResource: ManuallyDrop::new(Some(pbr_textures[r.tex_idx].clone())),
                         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -2538,9 +2775,9 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                             PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: (bi * TILE_BC1_BYTES) as u64,
+                                Offset: (bi * TILE_BC16_BYTES) as u64,
                                 Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                    Format: DXGI_FORMAT_BC1_UNORM,
+                                    Format: dxgi_format_for(tex_meta.format),
                                     Width: tex_meta.width,
                                     Height: tex_meta.strip_height,
                                     Depth: 1,
@@ -2567,6 +2804,26 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     cmd_barriers(cmd, to_srv);
                 }
                 residency.mark_resident(&taken);
+            }
+
+            // Apply any pending SFS ResourceMinLODClamp SRV updates while GPU is idle (wait_direct_cpu already completed)
+            for (ti, s) in residency.tex.iter_mut().enumerate() {
+                if s.srv_dirty {
+                    let mut sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: dxgi_format_for(pack.textures[ti].format),
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        ..Default::default()
+                    };
+                    sd.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                        MipLevels: pack.textures[ti].mip_levels,
+                        ResourceMinLODClamp: s.clamped_lod,
+                        ..Default::default()
+                    };
+                    ctx.device.CreateShaderResourceView(&pbr_textures[ti], Some(&sd), cpu_at(ti));
+                    ctx.device.CreateShaderResourceView(&pbr_textures[ti], Some(&sd), cpu_at(SRV_TABLE_STRIDE + ti));
+                    s.srv_dirty = false;
+                }
             }
 
             // Build TLAS BEFORE OMSetRenderTargets (with textured surface metadata per instance)
@@ -2649,6 +2906,17 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 rt.build_tlas(&mut ctx, slot, &rt_insts);
             }
 
+            // Clear GPU SFS feedback buffer & transition to UAV before PBR pass
+            cmd.CopyBufferRegion(&sfs_feedback_default, 0, &sfs_feedback_init, 0, sfs_buf_bytes);
+            cmd_barriers(
+                cmd,
+                vec![transition_barrier(
+                    &sfs_feedback_default,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )],
+            );
+
             // Begin 4-MRT G-Buffer pass (DirectHDR + RawRTGI + NormalDepth + MotionVec)
             post.begin_gbuffer(cmd, dsv_handle);
             let gpu_base = main_srv_heap.GetGPUDescriptorHandleForHeapStart();
@@ -2694,6 +2962,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             cmd.SetPipelineState(&pbr_pso);
             cmd.SetGraphicsRootDescriptorTable(1, table_gpu);
             cmd.SetGraphicsRootConstantBufferView(2, frame_cb_upload[slot].GetGPUVirtualAddress());
+            cmd.SetGraphicsRootUnorderedAccessView(3, sfs_feedback_default.GetGPUVirtualAddress());
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cmd.IASetVertexBuffers(0, Some(&[vb_view]));
             cmd.IASetIndexBuffer(Some(&ib_view));
@@ -2797,6 +3066,25 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 );
             }
 
+            // Resolve GPU SFS feedback buffer -> readback[slot]
+            cmd_barriers(
+                cmd,
+                vec![transition_barrier(
+                    &sfs_feedback_default,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )],
+            );
+            cmd.CopyBufferRegion(&sfs_feedback_readback[slot], 0, &sfs_feedback_default, 0, sfs_buf_bytes);
+            cmd_barriers(
+                cmd,
+                vec![transition_barrier(
+                    &sfs_feedback_default,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )],
+            );
+
             // Backbuffer transition -> RT + Run RTGI Denoiser + TAA + AutoExp + Bloom + AgX/CAS Composite
             let bb_idx = swap_chain.GetCurrentBackBufferIndex();
             let bb = &backbuffers[bb_idx as usize];
@@ -2869,6 +3157,16 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             frame_count += 1;
             fps_accum += 1;
 
+            // Readback GPU Sampler Feedback & update active SFS LRU residency/clamping for next frame
+            {
+                let mut fb_ptr: *mut c_void = std::ptr::null_mut();
+                let fb_rng = D3D12_RANGE { Begin: 0, End: sfs_buf_bytes as usize };
+                sfs_feedback_readback[slot].Map(0, Some(&fb_rng), Some(&mut fb_ptr)).unwrap();
+                let fb_bytes = std::slice::from_raw_parts(fb_ptr as *const u8, sfs_buf_bytes as usize);
+                residency.apply_sfs_feedback_and_schedule(fb_bytes, frame_count as u64, wstate.sfs_enabled);
+                sfs_feedback_readback[slot].Unmap(0, None);
+            }
+
             if take_shot {
                 let out_path = cfg.screenshot_path.as_ref().unwrap();
                 let mut ptr: *mut c_void = std::ptr::null_mut();
@@ -2882,13 +3180,21 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let mut writer = enc.write_header().unwrap();
                 writer.write_image_data(raw).unwrap();
                 ss_readback.Unmap(0, None);
+                let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
+                let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
                 println!(
-                    "[aaa-screenshot] Saved {} ({}x{}, resident={}/{} tiles, xray={})",
+                    "[aaa-screenshot] Saved {} ({}x{}, mip0={}/{} tex [{}/{} tiles], VRAM={:.1}/{:.1} MiB, saved={:.1} MiB, evict={}, xray={})",
                     out_path.display(),
                     SWAP_W,
                     SWAP_H,
-                    residency.total_resident(),
-                    residency.total_tiles(),
+                    residency.num_mip0_full(),
+                    pack.textures.len(),
+                    residency.total_mip0_resident(),
+                    residency.total_mip0_tiles(),
+                    cur_mib,
+                    tot_mib,
+                    (tot_mib - cur_mib).max(0.0),
+                    residency.total_evictions,
                     wstate.xray_enabled
                 );
                 break;
@@ -2905,13 +3211,20 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     1 => "Chase",
                     _ => "FreeCam",
                 };
+                let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
+                let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
+                let saved_mib = (tot_mib - cur_mib).max(0.0);
                 let title = format!(
-                    "BCPack AAA v0.7 | {} | {:.1} FPS | VRAM {}/{} tiles ({:.1} MiB) | dec {:.2}ms ({:.2}MiB) | DXR:{} RTGI:{} XRay:{} VSync[L]:{} | {}",
+                    "BCPack AAA v0.8 4K BC7/BC5 | {} | {:.1} FPS | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB, ev:{}) | Mip0 {}/{} | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} VSync[L]:{} | {}",
                     mode_str,
                     fps_val,
-                    residency.total_resident(),
-                    residency.total_tiles(),
-                    (residency.total_resident() * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0),
+                    if wstate.sfs_enabled { "ON" } else { "OFF" },
+                    cur_mib,
+                    tot_mib,
+                    saved_mib,
+                    residency.total_evictions,
+                    residency.num_mip0_full(),
+                    pack.textures.len(),
                     last_decode_ms,
                     streamed_mb,
                     if wstate.rt_enabled { "ON" } else { "OFF" },
@@ -2927,15 +3240,21 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             if let Some(target_n) = cfg.measure_frames {
                 if frame_count >= target_n {
                     let elapsed = start_time.elapsed().as_secs_f64();
+                    let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
+                    let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
                     println!(
-                        "[aaa-measure] {} frames in {:.3}s = {:.2} FPS | res={}x{} | resident={}/{} tiles | last_decode={:.3} ms",
+                        "[aaa-measure] {} frames in {:.3}s = {:.2} FPS | res={}x{} | SFS VRAM={:.1}/{:.1} MiB (saved {:.1} MiB, evict={}) | mip0={}/{} tiles | last_decode={:.3} ms",
                         frame_count,
                         elapsed,
                         frame_count as f64 / elapsed,
                         render_w,
                         render_h,
-                        residency.total_resident(),
-                        residency.total_tiles(),
+                        cur_mib,
+                        tot_mib,
+                        (tot_mib - cur_mib).max(0.0),
+                        residency.total_evictions,
+                        residency.total_mip0_resident(),
+                        residency.total_mip0_tiles(),
                         last_decode_ms
                     );
                     break;
@@ -2958,17 +3277,19 @@ unsafe fn draw_car_submesh(
     prev_model: &Mat4,
     t_sec: f32,
     sm: &PbrSubmesh,
-    residency: &TextureResidency,
+    residency: &SfsResidencyManager,
     textures: &[BcpackTexture2D],
 ) {
     let a_idx = sm.albedo_tex.map(|i| i as u32).unwrap_or(u32::MAX);
     let n_idx = sm.normal_tex.map(|i| i as u32).unwrap_or(u32::MAX);
     let o_idx = sm.orm_tex.map(|i| i as u32).unwrap_or(u32::MAX);
     let e_idx = sm.emissive_tex.map(|i| i as u32).unwrap_or(u32::MAX);
-    let strips = sm
+    let tex_dim = sm
         .albedo_tex
-        .map(|i| (textures[i].height / textures[i].strip_height.max(1)) as f32)
-        .unwrap_or(16.0);
+        .or(sm.normal_tex)
+        .or(sm.orm_tex)
+        .map(|i| textures[i].width as f32)
+        .unwrap_or(1024.0);
 
     let cb = AaaDrawCB {
         model: model.0,
@@ -2986,7 +3307,7 @@ unsafe fn draw_car_submesh(
             residency.state_for_tex(a_idx),
             residency.state_for_tex(n_idx),
             residency.state_for_tex(o_idx),
-            strips,
+            tex_dim,
         ],
     };
     cmd.SetGraphicsRoot32BitConstants(0, (size_of::<AaaDrawCB>() / 4) as u32, &cb as *const AaaDrawCB as *const c_void, 0);
@@ -3004,13 +3325,13 @@ unsafe fn draw_static_mesh(
     base_color: [f32; 4],
     mat_params: [f32; 4],
     tex3: [u32; 3],
-    residency: &TextureResidency,
+    residency: &SfsResidencyManager,
     textures: &[BcpackTexture2D],
 ) {
-    let strips = if tex3[0] != u32::MAX {
-        (textures[tex3[0] as usize].height / textures[tex3[0] as usize].strip_height.max(1)) as f32
+    let tex_dim = if tex3[0] != u32::MAX {
+        textures[tex3[0] as usize].width as f32
     } else {
-        16.0
+        1024.0
     };
     let cb = AaaDrawCB {
         model: model.0,
@@ -3023,7 +3344,7 @@ unsafe fn draw_static_mesh(
             residency.state_for_tex(tex3[0]),
             residency.state_for_tex(tex3[1]),
             residency.state_for_tex(tex3[2]),
-            strips,
+            tex_dim,
         ],
     };
     cmd.SetGraphicsRoot32BitConstants(0, (size_of::<AaaDrawCB>() / 4) as u32, &cb as *const AaaDrawCB as *const c_void, 0);
@@ -3033,6 +3354,7 @@ unsafe fn draw_static_mesh(
 struct StagedMipSlice {
     tex_idx: usize,
     mip_level: u32,
+    format: DXGI_FORMAT,
     width: u32,
     height: u32,
     dst_y: u32,
@@ -3042,7 +3364,7 @@ struct StagedMipSlice {
 
 unsafe fn decode_and_upload_lower_mips(
     ctx: &mut GpuContext,
-    gpu_dec: &mut BcpackGpuDecoder,
+    gpu_dec: &mut Bc16GpuStreamer,
     textures: &[BcpackTexture2D],
     pbr_textures: &[ID3D12Resource],
 ) {
@@ -3056,20 +3378,21 @@ unsafe fn decode_and_upload_lower_mips(
         return;
     }
 
-    let mut staging: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
+    let mut staging: Vec<u8> = Vec::with_capacity(64 * 1024 * 1024);
     let mut slices: Vec<StagedMipSlice> = Vec::with_capacity(items.len() + textures.len() * 4);
 
     let push_slice = |staging: &mut Vec<u8>,
                       slices: &mut Vec<StagedMipSlice>,
                       tex_idx: usize,
                       mip_level: u32,
+                      fmt: TexFormat,
                       w: u32,
                       h: u32,
                       dst_y: u32,
-                      bc1_sub: &[u8]| {
+                      blk_sub: &[u8]| {
         let blocks_x = (w / 4).max(1) as usize;
         let blocks_y = (h / 4).max(1) as usize;
-        let row_bytes = blocks_x * 8;
+        let row_bytes = blocks_x * fmt.block_bytes();
         let aligned_pitch = row_bytes.div_ceil(256) * 256;
         let aligned_off = staging.len().div_ceil(512) * 512;
         staging.resize(aligned_off + aligned_pitch * blocks_y, 0);
@@ -3077,11 +3400,12 @@ unsafe fn decode_and_upload_lower_mips(
             let src_start = row * row_bytes;
             let dst_start = aligned_off + row * aligned_pitch;
             staging[dst_start..dst_start + row_bytes]
-                .copy_from_slice(&bc1_sub[src_start..src_start + row_bytes]);
+                .copy_from_slice(&blk_sub[src_start..src_start + row_bytes]);
         }
         slices.push(StagedMipSlice {
             tex_idx,
             mip_level,
+            format: dxgi_format_for(fmt),
             width: w,
             height: h,
             dst_y,
@@ -3091,17 +3415,19 @@ unsafe fn decode_and_upload_lower_mips(
     };
 
     for chunk in items.chunks(MAX_BATCH_TILES) {
-        let batch = pack_batch(chunk.iter().map(|(_, mc)| (mc.bcpack.as_slice(), mc.blocks)));
+        let batch = pack_batch(chunk.iter().map(|(_, mc)| (mc.bcpack.as_slice(), mc.blocks * 2)));
         let (decoded, statuses, _kms, _tms) = gpu_dec.decode_batch_and_readback(ctx, &batch);
-        let mut block_off = 0usize;
+        let mut row_off = 0usize;
         for (ci, &(tex_idx, mc)) in chunk.iter().enumerate() {
             assert_eq!(
                 statuses[ci].code, 0,
                 "GPU lower-mip decode error tex={tex_idx} mip={}: {:?}",
                 mc.mip_level, statuses[ci]
             );
-            let chunk_bc1 = &decoded[block_off * 8..(block_off + mc.blocks) * 8];
-            block_off += mc.blocks;
+            let fmt = textures[tex_idx].format;
+            let bbytes = fmt.block_bytes();
+            let chunk_bytes = &decoded[row_off * 8..(row_off * 8 + mc.blocks * bbytes)];
+            row_off += mc.blocks * 2;
 
             if !mc.is_packed_tail {
                 push_slice(
@@ -3109,10 +3435,11 @@ unsafe fn decode_and_upload_lower_mips(
                     &mut slices,
                     tex_idx,
                     mc.mip_level,
+                    fmt,
                     mc.dim,
                     mc.strip_h,
                     mc.strip_y,
-                    chunk_bc1,
+                    chunk_bytes,
                 );
             } else {
                 // Expand Packed Mip Tail (32x32 + 16x16 + 8x8 + 4x4) into individual DX12 subresources
@@ -3121,16 +3448,17 @@ unsafe fn decode_and_upload_lower_mips(
                 let mut src_off = 0usize;
                 loop {
                     let blocks_side = (cur_dim / 4).max(1) as usize;
-                    let sub_bytes = blocks_side * blocks_side * 8;
+                    let sub_bytes = blocks_side * blocks_side * bbytes;
                     push_slice(
                         &mut staging,
                         &mut slices,
                         tex_idx,
                         cur_mip,
+                        fmt,
                         cur_dim,
                         cur_dim,
                         0,
-                        &chunk_bc1[src_off..src_off + sub_bytes],
+                        &chunk_bytes[src_off..src_off + sub_bytes],
                     );
                     src_off += sub_bytes;
                     if cur_dim <= 4 {
@@ -3182,7 +3510,7 @@ unsafe fn decode_and_upload_lower_mips(
                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                     Offset: sl.offset,
                     Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: DXGI_FORMAT_BC1_UNORM,
+                        Format: sl.format,
                         Width: sl.width,
                         Height: sl.height,
                         Depth: 1,

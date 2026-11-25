@@ -18,6 +18,7 @@ exit /b 1
 echo Using DXC: "%DXC%"
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0bcpack_decode.dxil" "%~dp0bcpack_decode.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0bcpack_bc7_rans.dxil" "%~dp0bcpack_bc7_rans.hlsl" || exit /b 1
+"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0bc16_pack.dxil" "%~dp0bc16_pack.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0gfx10_detile.dxil" "%~dp0gfx10_detile.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0rt_verify.dxil" "%~dp0rt_verify.hlsl" || exit /b 1
 "%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0scene_vs.dxil" "%~dp0scene.hlsl" || exit /b 1

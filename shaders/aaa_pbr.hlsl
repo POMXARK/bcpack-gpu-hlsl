@@ -32,6 +32,7 @@ RaytracingAccelerationStructure g_SceneTlas    : register(t33);
 StructuredBuffer<RtInstMeta>    g_InstMeta     : register(t34);
 ByteAddressBuffer               g_SceneVB      : register(t35);
 StructuredBuffer<uint>          g_SceneIB      : register(t36);
+RWByteAddressBuffer             g_SfsFeedback  : register(u0);
 
 SamplerState g_LinearWrap : register(s0);
 SamplerState g_EnvSampler : register(s1);
@@ -255,6 +256,14 @@ float3 trace_diffuse_rtgi(float3 worldPos, float3 N, float2 screenXY, float3 sun
     );
 }
 
+void record_sfs_feedback(uint texIdx, uint mipFp8) {
+    if (texIdx < 32u) {
+        uint off = texIdx * 16u;
+        g_SfsFeedback.InterlockedMin(off, mipFp8);
+        g_SfsFeedback.InterlockedAdd(off + 4u, 1u);
+    }
+}
+
 GBufferOut PSMain(PSIn input) {
     float3 geomN = (dot(input.worldN, input.worldN) > 1e-6) ? normalize(input.worldN) : float3(0.0, 1.0, 0.0);
     float3 toCam = g_CameraPos.xyz - input.worldPos;
@@ -271,7 +280,20 @@ GBufferOut PSMain(PSIn input) {
     bool isPolyHaven = (matMode >= 2u);
     bool isWetAsphalt = (matMode == 3u);
 
-    // 1. Sample 2K PBR textures gated by async GPU BCPack streaming residency
+    // Record GPU Sampler Feedback desired mip & pixel hit count (1/16 pixel cadence)
+    float texDim = max(g_TileStates.w, 512.0);
+    float2 uvDx = ddx(input.uv) * texDim;
+    float2 uvDy = ddy(input.uv) * texDim;
+    float rhoMax = max(dot(uvDx, uvDx), dot(uvDy, uvDy));
+    if ((((uint)input.pos.x & 3u) == 0u) && (((uint)input.pos.y & 3u) == 0u)) {
+        uint mipFp8 = (uint)(clamp(0.5 * log2(max(rhoMax, 1.0)), 0.0, 11.0) * 256.0);
+        record_sfs_feedback(g_TexIndices.x, mipFp8);
+        record_sfs_feedback(g_TexIndices.y, mipFp8);
+        record_sfs_feedback(g_TexIndices.z, mipFp8);
+        record_sfs_feedback(g_TexIndices.w, mipFp8);
+    }
+
+    // 1. Sample 4K BC7/BC5 PBR textures gated by async GPU BCPack + SFS streaming residency
     bool hasAlbedoTex = (g_TexIndices.x != NO_TEX);
     bool albedoResident = !hasAlbedoTex || (g_TileStates.x >= 0.0);
 
@@ -452,9 +474,9 @@ GBufferOut PSMain(PSIn input) {
         gi = trace_diffuse_rtgi(input.worldPos, N, input.pos.xy, sunDir) * albedo * (1.0 - metallic * 0.7) * 0.45;
     }
 
-    // 7. [V] X-Ray BCPack 4K-Tile Heatmap Overlay
+    // 7. [V] X-Ray BCPack 4K-Tile & SFS Residency Heatmap Overlay
     if (xrayEnabled) {
-        float strips = max(g_TileStates.w, 16.0);
+        float strips = clamp(texDim / 16.0, 16.0, 128.0);
         float vCoord = frac(input.uv.y);
         float2 tileCoord = float2(frac(input.uv.x) * 8.0, vCoord * strips);
         float2 tileFrac = frac(tileCoord);
@@ -477,6 +499,10 @@ GBufferOut PSMain(PSIn input) {
                 float3 resCol = float3(0.06, 0.65, 0.28);
                 hdr = lerp(hdr * 0.35, resCol, 0.36 + edge * 0.24);
             }
+        } else if (effState >= 2.0) {
+            // SFS Budget Clamped / Mip-0 Evicted (VRAM saved while Mip 1..Tail remains sharp)
+            float3 sfsAmber = float3(1.15, 0.72, 0.10);
+            hdr = lerp(hdr * 0.34, sfsAmber, 0.38 + edge * 0.30);
         } else {
             float fresh = saturate(effState - 1.0);
             float3 resCol = float3(0.06, 0.65, 0.28);

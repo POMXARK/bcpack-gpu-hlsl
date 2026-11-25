@@ -1,14 +1,15 @@
 use crate::assets::{
-    compress_rgba_dims_to_bc1, downsample_rgba_box2, encode_bc1_to_bcpack, TILE_BC1_BYTES,
-    TILE_BLOCKS,
+    compress_rgba_dims_to_bc1, compress_rgba_dims_to_bc5, compress_rgba_dims_to_bc7,
+    downsample_rgba_box2, encode_bc16_to_bcpack, encode_bc1_to_bcpack, TexFormat, TILE_BLOCKS,
 };
-use crate::gpu_decoder::{pack_batch, BcpackGpuDecoder, GpuContext};
+use crate::gpu_decoder::{pack_batch, Bc16GpuStreamer, BcpackGpuDecoder, GpuContext};
 use bcpack::bc1::{QuadTable, Window};
 use gltf::image::Format as GltfImgFmt;
 use gltf::material::AlphaMode;
 use image::imageops::FilterType;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -45,18 +46,19 @@ pub struct BcpackMipChunk {
     pub is_packed_tail: bool,
     pub blocks: usize,
     pub bcpack: Vec<u8>,
-    pub expected_bc1: Vec<u8>,
+    pub expected_blocks: Vec<u8>,
 }
 
 pub struct BcpackTexture2D {
     pub name: String,
+    pub format: TexFormat,
     pub width: u32,
     pub height: u32,
     pub strip_height: u32,
     pub num_strips: usize,
     pub mip_levels: u32,
     pub bcpack_tiles: Vec<Vec<u8>>,
-    pub expected_bc1: Vec<u8>,
+    pub expected_blocks: Vec<u8>,
     pub lower_mips: Vec<BcpackMipChunk>,
 }
 
@@ -205,12 +207,40 @@ fn snap_pow2_dim(w: u32, h: u32) -> u32 {
     }
 }
 
+#[inline]
+fn encode_blocks_for_format(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    fmt: TexFormat,
+    window: &Window,
+    quads: &QuadTable,
+) -> (Vec<u8>, Vec<u8>) {
+    match fmt {
+        TexFormat::Bc1 => {
+            let raw = compress_rgba_dims_to_bc1(rgba, w, h);
+            let comp = encode_bc1_to_bcpack(&raw, window, quads);
+            (raw, comp)
+        }
+        TexFormat::Bc5 => {
+            let raw = compress_rgba_dims_to_bc5(rgba, w, h);
+            let comp = encode_bc16_to_bcpack(&raw);
+            (raw, comp)
+        }
+        TexFormat::Bc7 => {
+            let raw = compress_rgba_dims_to_bc7(rgba, w, h);
+            let comp = encode_bc16_to_bcpack(&raw);
+            (raw, comp)
+        }
+    }
+}
+
 fn try_read_cache(cache_path: &Path, name: &str) -> Option<BcpackTexture2D> {
     let f = File::open(cache_path).ok()?;
     let mut r = BufReader::new(f);
-    let mut hdr = [0u8; 28];
+    let mut hdr = [0u8; 32];
     r.read_exact(&mut hdr).ok()?;
-    if &hdr[0..4] != b"BCPM" {
+    if &hdr[0..4] != b"BCP4" {
         return None;
     }
     let width = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
@@ -219,9 +249,11 @@ fn try_read_cache(cache_path: &Path, name: &str) -> Option<BcpackTexture2D> {
     let num_strips = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
     let mip_levels = u32::from_le_bytes(hdr[20..24].try_into().unwrap());
     let num_lower = u32::from_le_bytes(hdr[24..28].try_into().unwrap()) as usize;
+    let format = TexFormat::from_u32(u32::from_le_bytes(hdr[28..32].try_into().unwrap()))?;
 
-    let mut expected_bc1 = vec![0u8; num_strips * TILE_BC1_BYTES];
-    r.read_exact(&mut expected_bc1).ok()?;
+    let tile_bytes = TILE_BLOCKS * format.block_bytes();
+    let mut expected_blocks = vec![0u8; num_strips * tile_bytes];
+    r.read_exact(&mut expected_blocks).ok()?;
     let mut bcpack_tiles = Vec::with_capacity(num_strips);
     let mut len_buf = [0u8; 4];
     for _ in 0..num_strips {
@@ -256,19 +288,20 @@ fn try_read_cache(cache_path: &Path, name: &str) -> Option<BcpackTexture2D> {
             is_packed_tail,
             blocks,
             bcpack: comp_buf,
-            expected_bc1: exp_buf,
+            expected_blocks: exp_buf,
         });
     }
 
     Some(BcpackTexture2D {
         name: name.to_string(),
+        format,
         width,
         height,
         strip_height,
         num_strips,
         mip_levels,
         bcpack_tiles,
-        expected_bc1,
+        expected_blocks,
         lower_mips,
     })
 }
@@ -279,14 +312,15 @@ fn write_cache(cache_path: &Path, tex: &BcpackTexture2D) {
     }
     if let Ok(f) = File::create(cache_path) {
         let mut w = BufWriter::new(f);
-        let _ = w.write_all(b"BCPM");
+        let _ = w.write_all(b"BCP4");
         let _ = w.write_all(&tex.width.to_le_bytes());
         let _ = w.write_all(&tex.height.to_le_bytes());
         let _ = w.write_all(&tex.strip_height.to_le_bytes());
         let _ = w.write_all(&(tex.num_strips as u32).to_le_bytes());
         let _ = w.write_all(&tex.mip_levels.to_le_bytes());
         let _ = w.write_all(&(tex.lower_mips.len() as u32).to_le_bytes());
-        let _ = w.write_all(&tex.expected_bc1);
+        let _ = w.write_all(&(tex.format as u32).to_le_bytes());
+        let _ = w.write_all(&tex.expected_blocks);
         for t in &tex.bcpack_tiles {
             let _ = w.write_all(&(t.len() as u32).to_le_bytes());
             let _ = w.write_all(t);
@@ -298,9 +332,9 @@ fn write_cache(cache_path: &Path, tex: &BcpackTexture2D) {
             let _ = w.write_all(&mc.strip_h.to_le_bytes());
             let _ = w.write_all(&(if mc.is_packed_tail { 1u32 } else { 0u32 }).to_le_bytes());
             let _ = w.write_all(&(mc.blocks as u32).to_le_bytes());
-            let _ = w.write_all(&(mc.expected_bc1.len() as u32).to_le_bytes());
+            let _ = w.write_all(&(mc.expected_blocks.len() as u32).to_le_bytes());
             let _ = w.write_all(&(mc.bcpack.len() as u32).to_le_bytes());
-            let _ = w.write_all(&mc.expected_bc1);
+            let _ = w.write_all(&mc.expected_blocks);
             let _ = w.write_all(&mc.bcpack);
         }
         let _ = w.flush();
@@ -311,30 +345,35 @@ pub fn encode_rgba_as_bcpack_2d(
     img: &RgbaImage,
     name: &str,
     target_dim: u32,
+    format: TexFormat,
     cache_path: Option<&Path>,
     window: &Window,
     quads: &QuadTable,
 ) -> BcpackTexture2D {
     if let Some(cp) = cache_path {
         if let Some(cached) = try_read_cache(cp, name) {
-            if cached.width == target_dim && cached.height == target_dim {
+            if cached.width == target_dim && cached.height == target_dim && cached.format == format {
                 return cached;
             }
         }
     }
 
     let dim = match target_dim {
+        4096 => 4096u32,
         2048 => 2048u32,
         1024 => 1024u32,
         _ => 512u32,
     };
     let resized = if img.width() != dim || img.height() != dim {
-        image::imageops::resize(img, dim, dim, FilterType::Triangle)
+        image::imageops::resize(img, dim, dim, FilterType::Lanczos3)
     } else {
         img.clone()
     };
 
-    // Each strip = `dim x strip_h` pixels = exact 4,096 BC1 blocks (= 32 KiB)
+    let bbytes = format.block_bytes();
+    let tile_bytes = TILE_BLOCKS * bbytes;
+
+    // Each strip = `dim x strip_h` pixels = exact 4,096 blocks (32 KiB for BC1, 64 KiB for BC7/BC5)
     let strip_h = (TILE_BLOCKS as u32 * 16) / dim;
     let num_strips = (dim / strip_h) as usize;
     let raw = resized.as_raw();
@@ -344,17 +383,23 @@ pub fn encode_rgba_as_bcpack_2d(
         .into_par_iter()
         .map(|s| {
             let strip_rgba = &raw[s * strip_rgba_bytes..(s + 1) * strip_rgba_bytes];
-            let bc1 = compress_rgba_dims_to_bc1(strip_rgba, dim as usize, strip_h as usize);
-            debug_assert_eq!(bc1.len(), TILE_BC1_BYTES);
-            let bcpack = encode_bc1_to_bcpack(&bc1, window, quads);
-            (bc1, bcpack)
+            let (blk, bcpack) = encode_blocks_for_format(
+                strip_rgba,
+                dim as usize,
+                strip_h as usize,
+                format,
+                window,
+                quads,
+            );
+            debug_assert_eq!(blk.len(), tile_bytes);
+            (blk, bcpack)
         })
         .collect();
 
-    let mut expected_bc1 = Vec::with_capacity(num_strips * TILE_BC1_BYTES);
+    let mut expected_blocks = Vec::with_capacity(num_strips * tile_bytes);
     let mut bcpack_tiles = Vec::with_capacity(num_strips);
-    for (bc1, bcpack) in strip_results {
-        expected_bc1.extend_from_slice(&bc1);
+    for (blk, bcpack) in strip_results {
+        expected_blocks.extend_from_slice(&blk);
         bcpack_tiles.push(bcpack);
     }
 
@@ -377,17 +422,23 @@ pub fn encode_rgba_as_bcpack_2d(
             .into_par_iter()
             .map(|s| {
                 let slice = &cur_rgba[s * strip_bytes..(s + 1) * strip_bytes];
-                let bc1 = compress_rgba_dims_to_bc1(slice, cur_dim as usize, m_strip_h as usize);
-                let bcpack = encode_bc1_to_bcpack(&bc1, window, quads);
+                let (blk, bcpack) = encode_blocks_for_format(
+                    slice,
+                    cur_dim as usize,
+                    m_strip_h as usize,
+                    format,
+                    window,
+                    quads,
+                );
                 BcpackMipChunk {
                     mip_level: mip_idx,
                     dim: cur_dim,
                     strip_y: (s as u32) * m_strip_h,
                     strip_h: m_strip_h,
                     is_packed_tail: false,
-                    blocks: bc1.len() / 8,
+                    blocks: blk.len() / bbytes,
                     bcpack,
-                    expected_bc1: bc1,
+                    expected_blocks: blk,
                 }
             })
             .collect();
@@ -401,10 +452,14 @@ pub fn encode_rgba_as_bcpack_2d(
     // Packed Mip Tail: 32x32 + 16x16 + 8x8 + 4x4 = 85 blocks in a single .bcpack chunk
     let tail_base_mip = mip_idx;
     let tail_base_dim = cur_dim;
-    let mut tail_bc1 = Vec::with_capacity(85 * 8);
+    let mut tail_blocks = Vec::with_capacity(85 * bbytes);
     loop {
-        let bc1 = compress_rgba_dims_to_bc1(&cur_rgba, cur_dim as usize, cur_dim as usize);
-        tail_bc1.extend_from_slice(&bc1);
+        let raw_lvl = match format {
+            TexFormat::Bc1 => compress_rgba_dims_to_bc1(&cur_rgba, cur_dim as usize, cur_dim as usize),
+            TexFormat::Bc5 => compress_rgba_dims_to_bc5(&cur_rgba, cur_dim as usize, cur_dim as usize),
+            TexFormat::Bc7 => compress_rgba_dims_to_bc7(&cur_rgba, cur_dim as usize, cur_dim as usize),
+        };
+        tail_blocks.extend_from_slice(&raw_lvl);
         mip_idx += 1;
         if cur_dim <= 4 {
             break;
@@ -412,27 +467,31 @@ pub fn encode_rgba_as_bcpack_2d(
         cur_rgba = downsample_rgba_box2(&cur_rgba, cur_dim as usize, cur_dim as usize);
         cur_dim /= 2;
     }
-    let tail_bcpack = encode_bc1_to_bcpack(&tail_bc1, window, quads);
+    let tail_bcpack = match format {
+        TexFormat::Bc1 => encode_bc1_to_bcpack(&tail_blocks, window, quads),
+        TexFormat::Bc5 | TexFormat::Bc7 => encode_bc16_to_bcpack(&tail_blocks),
+    };
     lower_mips.push(BcpackMipChunk {
         mip_level: tail_base_mip,
         dim: tail_base_dim,
         strip_y: 0,
         strip_h: tail_base_dim,
         is_packed_tail: true,
-        blocks: tail_bc1.len() / 8,
+        blocks: tail_blocks.len() / bbytes,
         bcpack: tail_bcpack,
-        expected_bc1: tail_bc1,
+        expected_blocks: tail_blocks,
     });
 
     let tex = BcpackTexture2D {
         name: name.to_string(),
+        format,
         width: dim,
         height: dim,
         strip_height: strip_h,
         num_strips,
         mip_levels: mip_idx,
         bcpack_tiles,
-        expected_bc1,
+        expected_blocks,
         lower_mips,
     };
     if let Some(cp) = cache_path {
@@ -445,19 +504,20 @@ pub fn load_png_as_bcpack(
     png_path: &Path,
     name: &str,
     target_dim: u32,
+    format: TexFormat,
     cache_dir: &Path,
     window: &Window,
     quads: &QuadTable,
 ) -> BcpackTexture2D {
-    let cache_path = cache_dir.join(format!("{name}_{target_dim}.bcpack_tex"));
+    let cache_path = cache_dir.join(format!("{name}_{target_dim}_{}.bcpack_tex", format.tag()));
     if let Some(cached) = try_read_cache(&cache_path, name) {
-        if cached.width == target_dim && cached.height == target_dim {
+        if cached.width == target_dim && cached.height == target_dim && cached.format == format {
             return cached;
         }
     }
     let dyn_img = image::open(png_path).expect("open PNG texture");
     let rgba = dyn_img.to_rgba8();
-    encode_rgba_as_bcpack_2d(&rgba, name, target_dim, Some(&cache_path), window, quads)
+    encode_rgba_as_bcpack_2d(&rgba, name, target_dim, format, Some(&cache_path), window, quads)
 }
 
 pub fn load_hdr_fp16(path: &Path) -> Option<(u32, u32, Vec<u16>)> {
@@ -568,14 +628,26 @@ pub fn load_glb_as_bcpack(
     let (doc, buffers, images) = gltf::import(glb_path).expect("import GLB");
     let stem = glb_path.file_stem().and_then(|s| s.to_str()).unwrap_or("glb");
 
-    // 1. Convert & BCPack-encode all embedded glTF images (parallel per strip + disk-cached)
+    let mut normal_tex_ids = HashSet::new();
+    for mat in doc.materials() {
+        if let Some(nt) = mat.normal_texture() {
+            normal_tex_ids.insert(nt.texture().source().index());
+        }
+    }
+
+    // 1. Convert & BCPack-encode all embedded glTF images (BC5 normals, BC7 PBR albedo/ORM/emissive)
     let mut textures = Vec::with_capacity(images.len());
     for (ii, img) in images.iter().enumerate() {
         let dim = snap_pow2_dim(img.width, img.height);
+        let fmt = if normal_tex_ids.contains(&ii) {
+            TexFormat::Bc5
+        } else {
+            TexFormat::Bc7
+        };
         let tname = format!("{stem}_tex{ii}");
-        let cp = cache_dir.join(format!("{tname}_{dim}.bcpack_tex"));
+        let cp = cache_dir.join(format!("{tname}_{dim}_{}.bcpack_tex", fmt.tag()));
         let rgba = gltf_image_to_rgba8(img);
-        textures.push(encode_rgba_as_bcpack_2d(&rgba, &tname, dim, Some(&cp), window, quads));
+        textures.push(encode_rgba_as_bcpack_2d(&rgba, &tname, dim, fmt, Some(&cp), window, quads));
     }
 
     let mut vertices: Vec<PbrVertex> = Vec::with_capacity(65536);
@@ -778,32 +850,43 @@ pub struct AaaVerifyStats {
 
 fn verify_tex_tiles(
     ctx: &mut GpuContext,
-    gpu_dec: &mut BcpackGpuDecoder,
+    bc1_dec: &mut BcpackGpuDecoder,
+    bc16_dec: &mut Bc16GpuStreamer,
     tex: &BcpackTexture2D,
 ) -> (usize, usize, f64) {
+    let bbytes = tex.format.block_bytes();
+    let tile_bytes = TILE_BLOCKS * bbytes;
+    let is_bc16 = tex.format != TexFormat::Bc1;
+    let batch_cap = if is_bc16 { 128 } else { 256 };
+
     let mut total_comp = 0usize;
     let mut total_ms = 0.0f64;
-    for chunk_start in (0..tex.num_strips).step_by(256) {
-        let chunk_end = (chunk_start + 256).min(tex.num_strips);
+    for chunk_start in (0..tex.num_strips).step_by(batch_cap) {
+        let chunk_end = (chunk_start + batch_cap).min(tex.num_strips);
         let slice = &tex.bcpack_tiles[chunk_start..chunk_end];
         for t in slice {
             total_comp += t.len();
         }
-        let batch = pack_batch(slice.iter().map(|t| (t.as_slice(), TILE_BLOCKS)));
-        let (gpu_out, sts, kms, _) = gpu_dec.decode_batch_and_readback(ctx, &batch);
+        let rows_per_tile = if is_bc16 { TILE_BLOCKS * 2 } else { TILE_BLOCKS };
+        let batch = pack_batch(slice.iter().map(|t| (t.as_slice(), rows_per_tile)));
+        let (gpu_out, sts, kms, _) = if is_bc16 {
+            bc16_dec.decode_batch_and_readback(ctx, &batch)
+        } else {
+            bc1_dec.decode_batch_and_readback(ctx, &batch)
+        };
         total_ms += kms;
         for (i, st) in sts.iter().enumerate() {
             let gi = chunk_start + i;
             assert_eq!(st.code, 0, "GPU decode error on {} strip {gi}: {st:?}", tex.name);
-            let got = &gpu_out[i * TILE_BC1_BYTES..(i + 1) * TILE_BC1_BYTES];
-            let exp = &tex.expected_bc1[gi * TILE_BC1_BYTES..(gi + 1) * TILE_BC1_BYTES];
+            let got = &gpu_out[i * tile_bytes..(i + 1) * tile_bytes];
+            let exp = &tex.expected_blocks[gi * tile_bytes..(gi + 1) * tile_bytes];
             if got != exp {
                 let mm = got.iter().zip(exp.iter()).position(|(a, b)| a != b).unwrap();
-                panic!("FAIL {} strip {gi} mismatch at byte {mm}", tex.name);
+                panic!("FAIL {} ({}) strip {gi} mismatch at byte {mm}", tex.name, tex.format.tag());
             }
         }
     }
-    (total_comp, tex.num_strips * TILE_BC1_BYTES, total_ms)
+    (total_comp, tex.num_strips * tile_bytes, total_ms)
 }
 
 pub fn run_aaa_2k_bcpack_verify(
@@ -813,13 +896,35 @@ pub fn run_aaa_2k_bcpack_verify(
     window: &Window,
     quads: &QuadTable,
 ) -> AaaVerifyStats {
+    let mut bc16_dec = Bc16GpuStreamer::new(ctx, 128, 128 * TILE_BLOCKS * 2, 16 * 1024 * 1024);
+
     if let Some(aaa_dir) = find_aaa_assets_dir(assets_dir) {
         let cache_dir = aaa_dir.join("bcpack_cache");
         let glb = load_glb_as_bcpack(&aaa_dir.join("CarConcept.glb"), &cache_dir, window, quads);
-        let asphalt_2k = load_png_as_bcpack(
-            &aaa_dir.join("asphalt_albedo.png"),
-            "asphalt_albedo",
-            2048,
+        let asphalt_4k_path = if aaa_dir.join("asphalt_albedo_4k.png").exists() {
+            aaa_dir.join("asphalt_albedo_4k.png")
+        } else {
+            aaa_dir.join("asphalt_albedo.png")
+        };
+        let normal_4k_path = if aaa_dir.join("asphalt_normal_4k.png").exists() {
+            aaa_dir.join("asphalt_normal_4k.png")
+        } else {
+            aaa_dir.join("asphalt_normal.png")
+        };
+        let asphalt_4k_bc7 = load_png_as_bcpack(
+            &asphalt_4k_path,
+            "asphalt_albedo_4k",
+            4096,
+            TexFormat::Bc7,
+            &cache_dir,
+            window,
+            quads,
+        );
+        let normal_4k_bc5 = load_png_as_bcpack(
+            &normal_4k_path,
+            "asphalt_normal_4k",
+            4096,
+            TexFormat::Bc5,
             &cache_dir,
             window,
             quads,
@@ -830,38 +935,40 @@ pub fn run_aaa_2k_bcpack_verify(
         let mut raw_bytes = 0usize;
         let mut gpu_ms = 0.0f64;
 
-        let (c, r, ms) = verify_tex_tiles(ctx, gpu_dec, &asphalt_2k);
-        verified_tiles += asphalt_2k.num_strips;
-        comp_bytes += c;
-        raw_bytes += r;
-        gpu_ms += ms;
+        for t in [&asphalt_4k_bc7, &normal_4k_bc5] {
+            let (c, r, ms) = verify_tex_tiles(ctx, gpu_dec, &mut bc16_dec, t);
+            verified_tiles += t.num_strips;
+            comp_bytes += c;
+            raw_bytes += r;
+            gpu_ms += ms;
+        }
 
-        // Also bit-exact verify full console mipmap chain + Packed Mip Tail (1024 -> 32..4)
+        // Also bit-exact verify full console 4K BC7 mipmap chain + Packed Mip Tail (2048 -> 32..4)
         let mip_batch = pack_batch(
-            asphalt_2k
+            asphalt_4k_bc7
                 .lower_mips
                 .iter()
-                .map(|m| (m.bcpack.as_slice(), m.blocks)),
+                .map(|m| (m.bcpack.as_slice(), m.blocks * 2)),
         );
-        let (mip_gpu_out, mip_sts, mip_ms, _) = gpu_dec.decode_batch_and_readback(ctx, &mip_batch);
+        let (mip_gpu_out, mip_sts, mip_ms, _) = bc16_dec.decode_batch_and_readback(ctx, &mip_batch);
         let mut m_off = 0usize;
-        for (mi, chunk) in asphalt_2k.lower_mips.iter().enumerate() {
-            assert_eq!(mip_sts[mi].code, 0, "GPU status error on asphalt mip chunk {mi}");
-            let len = chunk.blocks * 8;
+        for (mi, chunk) in asphalt_4k_bc7.lower_mips.iter().enumerate() {
+            assert_eq!(mip_sts[mi].code, 0, "GPU status error on 4K BC7 mip chunk {mi}");
+            let len = chunk.blocks * 16;
             let got = &mip_gpu_out[m_off..m_off + len];
-            assert_eq!(got, chunk.expected_bc1.as_slice(), "FAIL asphalt mip chunk {mi}");
+            assert_eq!(got, chunk.expected_blocks.as_slice(), "FAIL 4K BC7 mip chunk {mi}");
             m_off += len;
         }
         gpu_ms += mip_ms;
         println!(
-            "  [aaa-mips] Verified {} lower-mip chunks + Packed Mip Tail ({} mip levels, GPU={:.3} ms, 0 mismatches)",
-            asphalt_2k.lower_mips.len(),
-            asphalt_2k.mip_levels,
+            "  [aaa-mips] Verified 4K BC7 ({} lower-mip chunks + Packed Mip Tail, {} mip levels, GPU={:.3} ms, 0 mismatches) + 4K BC5 Normal",
+            asphalt_4k_bc7.lower_mips.len(),
+            asphalt_4k_bc7.mip_levels,
             mip_ms
         );
 
         for t in &glb.textures {
-            let (c, r, ms) = verify_tex_tiles(ctx, gpu_dec, t);
+            let (c, r, ms) = verify_tex_tiles(ctx, gpu_dec, &mut bc16_dec, t);
             verified_tiles += t.num_strips;
             comp_bytes += c;
             raw_bytes += r;
@@ -877,7 +984,7 @@ pub fn run_aaa_2k_bcpack_verify(
             glb.bounds_max[0], glb.bounds_max[1], glb.bounds_max[2],
         );
         for (i, t) in glb.textures.iter().enumerate() {
-            println!("  [glb tex {i}] {} ({}x{}, {} tiles)", t.name, t.width, t.height, t.num_strips);
+            println!("  [glb tex {i}] {} ({}x{}, {}, {} tiles)", t.name, t.width, t.height, t.format.tag(), t.num_strips);
         }
 
         AaaVerifyStats {
@@ -886,21 +993,21 @@ pub fn run_aaa_2k_bcpack_verify(
             tris: glb.indices.len() / 3,
             submeshes: glb.submeshes.len(),
             glass_submeshes,
-            num_textures: glb.textures.len() + 1,
+            num_textures: glb.textures.len() + 2,
             verified_tiles,
             raw_bytes,
             comp_bytes,
             gpu_ms,
         }
     } else {
-        // Fallback: synthetic 2048x2048 (64 x 4K-strip = 2.0 MiB) texture verification
+        // Fallback: synthetic 2048x2048 BC7 (128 x 64KiB strips = 8.0 MiB) texture verification
         let mut synth = RgbaImage::new(2048, 2048);
         for (x, y, px) in synth.enumerate_pixels_mut() {
             let v = (((x ^ y) & 255) as u8).wrapping_add(((x * 3 + y * 5) >> 4) as u8);
             *px = Rgba([v, v.wrapping_mul(2), 255u8.wrapping_sub(v), 255]);
         }
-        let tex = encode_rgba_as_bcpack_2d(&synth, "synth_2k_fallback", 2048, None, window, quads);
-        let (comp_bytes, raw_bytes, gpu_ms) = verify_tex_tiles(ctx, gpu_dec, &tex);
+        let tex = encode_rgba_as_bcpack_2d(&synth, "synth_2k_bc7", 2048, TexFormat::Bc7, None, window, quads);
+        let (comp_bytes, raw_bytes, gpu_ms) = verify_tex_tiles(ctx, gpu_dec, &mut bc16_dec, &tex);
         AaaVerifyStats {
             real_assets: false,
             verts: 0,

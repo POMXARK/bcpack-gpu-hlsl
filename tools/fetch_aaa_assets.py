@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Downloads open-source CC0 / CC-BY 4.0 AAA 3D assets (Khronos CarConcept.glb + Poly Haven 2K PBR & HDRI)
+"""Downloads open-source CC0 / CC-BY 4.0 AAA 3D assets (Khronos CarConcept.glb + Poly Haven 2K/4K PBR & HDRI)
 into aaa_assets/ for the bcpack-gpu-hlsl AAA Showcase."""
 
+import argparse
 import json
 import os
 import struct
@@ -12,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "aaa_assets"
-UA = {"User-Agent": "bcpack-gpu-hlsl-bench/0.7"}
+UA = {"User-Agent": "bcpack-gpu-hlsl-bench/0.8"}
 
 
 def download_file(url: str, dst: Path) -> None:
@@ -21,7 +22,7 @@ def download_file(url: str, dst: Path) -> None:
         return
     print(f"[get ] {url} -> {dst.name}")
     req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with urllib.request.urlopen(req, timeout=90) as r:
         data = r.read()
     dst.write_bytes(data)
     print(f"[done] {dst.name} ({len(data) // 1024} KiB)")
@@ -33,16 +34,16 @@ def fetch_json(url: str) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
-def save_2k_png(src_img: Path, dst_png: Path) -> None:
+def save_png(src_img: Path, dst_png: Path, dim: int) -> None:
     if dst_png.exists() and dst_png.stat().st_size > 0:
-        print(f"[skip] {dst_png.name} (2048x2048 PNG cached)")
+        print(f"[skip] {dst_png.name} ({dim}x{dim} PNG cached)")
         return
     with Image.open(src_img) as im:
         im = im.convert("RGBA")
-        if im.size != (2048, 2048):
-            im = im.resize((2048, 2048), Image.Resampling.LANCZOS)
+        if im.size != (dim, dim):
+            im = im.resize((dim, dim), Image.Resampling.LANCZOS)
         im.save(dst_png, format="PNG", compress_level=3)
-    print(f"[pack] {dst_png.name} (2048x2048 PNG, {dst_png.stat().st_size // 1024} KiB)")
+    print(f"[pack] {dst_png.name} ({dim}x{dim} PNG, {dst_png.stat().st_size // 1024} KiB)")
 
 
 def read_radiance_hdr(hdr_path: Path) -> np.ndarray:
@@ -104,6 +105,10 @@ def read_radiance_hdr(hdr_path: Path) -> np.ndarray:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Fetch open CC0/CC-BY 4.0 AAA benchmark assets")
+    parser.add_argument("--no-4k", action="store_true", help="Skip 4K Poly Haven PNG generation")
+    args = parser.parse_args()
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = OUT_DIR / "_raw"
     tmp_dir.mkdir(exist_ok=True)
@@ -114,7 +119,7 @@ def main() -> None:
         OUT_DIR / "CarConcept.glb",
     )
 
-    # 2) Poly Haven CC0 2K PBR texture sets
+    # 2) Poly Haven CC0 2K + 4K PBR texture sets
     ph_sets = [
         ("asphalt_pit_lane", "asphalt"),
         ("brick_pavement", "promenade"),
@@ -124,11 +129,17 @@ def main() -> None:
         files = fetch_json(f"https://api.polyhaven.com/files/{ph_id}")
         for map_key, out_suffix in [("Diffuse", "albedo"), ("nor_dx", "normal"), ("arm", "arm")]:
             k2 = files[map_key]["2k"]
-            ext = "jpg" if "jpg" in k2 else "png"
-            url = k2[ext]["url"]
-            raw_path = tmp_dir / f"{ph_id}_{map_key}_2k.{ext}"
-            download_file(url, raw_path)
-            save_2k_png(raw_path, OUT_DIR / f"{prefix}_{out_suffix}.png")
+            ext2 = "jpg" if "jpg" in k2 else "png"
+            raw_path2 = tmp_dir / f"{ph_id}_{map_key}_2k.{ext2}"
+            download_file(k2[ext2]["url"], raw_path2)
+            save_png(raw_path2, OUT_DIR / f"{prefix}_{out_suffix}.png", 2048)
+
+            if not args.no_4k and "4k" in files[map_key]:
+                k4 = files[map_key]["4k"]
+                ext4 = "jpg" if "jpg" in k4 else "png"
+                raw_path4 = tmp_dir / f"{ph_id}_{map_key}_4k.{ext4}"
+                download_file(k4[ext4]["url"], raw_path4)
+                save_png(raw_path4, OUT_DIR / f"{prefix}_{out_suffix}_4k.png", 4096)
 
     # 3) Poly Haven CC0 2K Sunset HDRI -> raw 2048x1024 RGBA16F (.fp16)
     hdri_fp16 = OUT_DIR / "sunset_hdri_2k.fp16"

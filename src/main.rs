@@ -334,11 +334,11 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         gb.vertices, gb.raw_bytes / 1024, gb.ratio, gb.gpu_ms
     );
 
-    // 13) Real glTF/GLB + 2K Photographic PBR -> Xbox .bcpack GPU Decode verification
+    // 13) Real glTF/GLB + 4K Photographic PBR (BC7/BC5) -> Xbox .bcpack GPU Decode verification
     let aaa = run_aaa_2k_bcpack_verify(&mut ctx, &mut gpu_dec, assets_dir, &window, &quads);
     let ratio = aaa.raw_bytes as f64 / aaa.comp_bytes.max(1) as f64;
     println!(
-        "[verify] PASS 13/17 AAA glTF+2K PBR BCPack (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 13/17 AAA glTF+4K PBR BCPack BC7/BC5 (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
         aaa.real_assets,
         aaa.verts,
         aaa.tris,

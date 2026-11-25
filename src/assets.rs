@@ -19,6 +19,43 @@ pub const TEX_BC1_BYTES: usize = NUM_BLOCKS * 8; // 131072
 pub const TILE_STRIPS: usize = 4;
 pub const TILE_BLOCKS: usize = NUM_BLOCKS / TILE_STRIPS; // 4096 blocks (512x128 strip)
 pub const TILE_BC1_BYTES: usize = TILE_BLOCKS * 8; // 32768 bytes
+pub const TILE_BC16_BYTES: usize = TILE_BLOCKS * 16; // 65536 bytes (exact 64 KiB Xbox tile)
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TexFormat {
+    Bc1 = 0, // 8 bytes/block, DXGI_FORMAT_BC1_UNORM
+    Bc5 = 1, // 16 bytes/block, DXGI_FORMAT_BC5_UNORM (2-channel normal XY)
+    Bc7 = 2, // 16 bytes/block, DXGI_FORMAT_BC7_UNORM (Mode 6 RGBA)
+}
+
+impl TexFormat {
+    #[inline]
+    pub fn block_bytes(self) -> usize {
+        match self {
+            TexFormat::Bc1 => 8,
+            TexFormat::Bc5 | TexFormat::Bc7 => 16,
+        }
+    }
+
+    #[inline]
+    pub fn tag(self) -> &'static str {
+        match self {
+            TexFormat::Bc1 => "bc1",
+            TexFormat::Bc5 => "bc5",
+            TexFormat::Bc7 => "bc7",
+        }
+    }
+
+    #[inline]
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Bc1),
+            1 => Some(Self::Bc5),
+            2 => Some(Self::Bc7),
+            _ => None,
+        }
+    }
+}
 
 pub const ASSET_NAMES: [&str; 12] = [
     "01_highway_asphalt",
@@ -444,7 +481,14 @@ fn zigzag(r: i32) -> u16 {
 }
 
 fn best_model_for_fragment(ab: u8, syms: &[u16]) -> (u8, u8) {
-    let max_sym = syms.iter().copied().max().unwrap_or(0);
+    let mut hist = [0u32; 512];
+    let mut max_sym = 0u16;
+    for &s in syms {
+        hist[s as usize] += 1;
+        if s > max_sym {
+            max_sym = s;
+        }
+    }
     let min_bits = if max_sym == 0 {
         1u8
     } else {
@@ -465,13 +509,16 @@ fn best_model_for_fragment(ab: u8, syms: &[u16]) -> (u8, u8) {
             let m = rans::model(eab, q);
             let mut valid = true;
             let mut cost = 0.0f64;
-            for &s in syms {
-                let (f, _) = m.forward(s);
+            for (s, &cnt) in hist[..=(max_sym as usize)].iter().enumerate() {
+                if cnt == 0 {
+                    continue;
+                }
+                let (f, _) = m.forward(s as u16);
                 if f == 0 {
                     valid = false;
                     break;
                 }
-                cost -= (f as f64 / 65536.0).log2();
+                cost -= (cnt as f64) * (f as f64 / 65536.0).log2();
             }
             if valid && cost < best_cost {
                 best_cost = cost;
@@ -481,6 +528,331 @@ fn best_model_for_fragment(ab: u8, syms: &[u16]) -> (u8, u8) {
     }
 
     best.expect("valid (z, q) model for fragment")
+}
+
+/// Fast pure-Rust BC7 Mode 6 compressor (7-bit RGBA + shared p-bit pairs + 4-bit weights = 16 B/block).
+pub fn compress_rgba_dims_to_bc7(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    const W4: [i32; 16] = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64];
+    let bx_count = width / 4;
+    let by_count = height / 4;
+    let mut out = vec![0u8; bx_count * by_count * 16];
+
+    for by in 0..by_count {
+        for bx in 0..bx_count {
+            let mut px = [[0u8; 4]; 16];
+            let mut min_c = [255.0f32; 4];
+            let mut max_c = [0.0f32; 4];
+            let mut mean = [0.0f32; 4];
+
+            for py in 0..4 {
+                for px_x in 0..4 {
+                    let off = ((by * 4 + py) * width + (bx * 4 + px_x)) * 4;
+                    let idx = py * 4 + px_x;
+                    for c in 0..4 {
+                        let v = rgba[off + c];
+                        px[idx][c] = v;
+                        let vf = v as f32;
+                        min_c[c] = min_c[c].min(vf);
+                        max_c[c] = max_c[c].max(vf);
+                        mean[c] += vf * (1.0 / 16.0);
+                    }
+                }
+            }
+
+            let mut axis = [
+                max_c[0] - min_c[0],
+                max_c[1] - min_c[1],
+                max_c[2] - min_c[2],
+                max_c[3] - min_c[3],
+            ];
+            let norm0 = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2] + axis[3] * axis[3]).sqrt();
+            if norm0 > 1e-4 {
+                for c in 0..4 {
+                    axis[c] /= norm0;
+                }
+                for _ in 0..2 {
+                    let mut next = [0.0f32; 4];
+                    for p in &px {
+                        let d = [
+                            p[0] as f32 - mean[0],
+                            p[1] as f32 - mean[1],
+                            p[2] as f32 - mean[2],
+                            p[3] as f32 - mean[3],
+                        ];
+                        let proj = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2] + d[3] * axis[3];
+                        for c in 0..4 {
+                            next[c] += d[c] * proj;
+                        }
+                    }
+                    let n2 = next[0] * next[0] + next[1] * next[1] + next[2] * next[2] + next[3] * next[3];
+                    if n2 > 1e-6 {
+                        let inv = 1.0 / n2.sqrt();
+                        for c in 0..4 {
+                            axis[c] = next[c] * inv;
+                        }
+                    }
+                }
+            } else {
+                axis = [1.0, 0.0, 0.0, 0.0];
+            }
+
+            let mut min_t = f32::INFINITY;
+            let mut max_t = f32::NEG_INFINITY;
+            for p in &px {
+                let d0 = p[0] as f32 - mean[0];
+                let d1 = p[1] as f32 - mean[1];
+                let d2 = p[2] as f32 - mean[2];
+                let d3 = p[3] as f32 - mean[3];
+                let t = d0 * axis[0] + d1 * axis[1] + d2 * axis[2] + d3 * axis[3];
+                if t < min_t {
+                    min_t = t;
+                }
+                if t > max_t {
+                    max_t = t;
+                }
+            }
+
+            let mut e0_f = [0i32; 4];
+            let mut e1_f = [0i32; 4];
+            for c in 0..4 {
+                e0_f[c] = (mean[c] + min_t * axis[c]).round().clamp(0.0, 255.0) as i32;
+                e1_f[c] = (mean[c] + max_t * axis[c]).round().clamp(0.0, 255.0) as i32;
+            }
+
+            let mut best_sse = i64::MAX;
+            let mut best_q0 = [0u8; 4];
+            let mut best_q1 = [0u8; 4];
+            let mut best_p0 = 0u8;
+            let mut best_p1 = 0u8;
+            let mut best_idx = [0u8; 16];
+
+            for p0 in 0..=1i32 {
+                for p1 in 0..=1i32 {
+                    let mut q0 = [0u8; 4];
+                    let mut q1 = [0u8; 4];
+                    let mut r0 = [0i32; 4];
+                    let mut r1 = [0i32; 4];
+                    for c in 0..4 {
+                        let a7 = ((e0_f[c] - p0 + 1) >> 1).clamp(0, 127);
+                        let b7 = ((e1_f[c] - p1 + 1) >> 1).clamp(0, 127);
+                        q0[c] = a7 as u8;
+                        q1[c] = b7 as u8;
+                        r0[c] = (a7 << 1) | p0;
+                        r1[c] = (b7 << 1) | p1;
+                    }
+
+                    let mut pal = [[0i32; 4]; 16];
+                    for (k, &w) in W4.iter().enumerate() {
+                        let iw = 64 - w;
+                        for c in 0..4 {
+                            pal[k][c] = (iw * r0[c] + w * r1[c] + 32) >> 6;
+                        }
+                    }
+
+                    let mut sse = 0i64;
+                    let mut idxs = [0u8; 16];
+                    for i in 0..16 {
+                        let p = px[i];
+                        let mut bk = 0u8;
+                        let mut be = i32::MAX;
+                        for (k, col) in pal.iter().enumerate() {
+                            let dr = p[0] as i32 - col[0];
+                            let dg = p[1] as i32 - col[1];
+                            let db = p[2] as i32 - col[2];
+                            let da = p[3] as i32 - col[3];
+                            let e = dr * dr + dg * dg + db * db + da * da;
+                            if e < be {
+                                be = e;
+                                bk = k as u8;
+                            }
+                        }
+                        idxs[i] = bk;
+                        sse += be as i64;
+                    }
+                    if sse < best_sse {
+                        best_sse = sse;
+                        best_q0 = q0;
+                        best_q1 = q1;
+                        best_p0 = p0 as u8;
+                        best_p1 = p1 as u8;
+                        best_idx = idxs;
+                    }
+                }
+            }
+
+            if best_idx[0] >= 8 {
+                std::mem::swap(&mut best_q0, &mut best_q1);
+                std::mem::swap(&mut best_p0, &mut best_p1);
+                for v in &mut best_idx {
+                    *v = 15 - *v;
+                }
+            }
+
+            let mut word: u128 = 1u128 << 6; // Mode 6 prefix 0b1000000
+            word |= (best_q0[0] as u128) << 7;
+            word |= (best_q1[0] as u128) << 14;
+            word |= (best_q0[1] as u128) << 21;
+            word |= (best_q1[1] as u128) << 28;
+            word |= (best_q0[2] as u128) << 35;
+            word |= (best_q1[2] as u128) << 42;
+            word |= (best_q0[3] as u128) << 49;
+            word |= (best_q1[3] as u128) << 56;
+            word |= (best_p0 as u128) << 63;
+            word |= (best_p1 as u128) << 64;
+            word |= ((best_idx[0] & 7) as u128) << 65;
+            for i in 1..16 {
+                word |= ((best_idx[i] & 15) as u128) << (68 + (i - 1) * 4);
+            }
+
+            let bi = (by * bx_count + bx) * 16;
+            out[bi..bi + 16].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+    out
+}
+
+#[inline]
+fn encode_bc4_channel(vals: &[u8; 16]) -> u64 {
+    let mut lo = 255u8;
+    let mut hi = 0u8;
+    for &v in vals {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    if hi == lo {
+        return (hi as u64) | ((lo as u64) << 8);
+    }
+
+    let e0 = hi as i32;
+    let e1 = lo as i32;
+    let mut pal = [0i32; 8];
+    pal[0] = e0;
+    pal[1] = e1;
+    for k in 0..6i32 {
+        pal[2 + k as usize] = ((6 - k) * e0 + (1 + k) * e1 + 3) / 7;
+    }
+
+    let mut word = (hi as u64) | ((lo as u64) << 8);
+    for (i, &v) in vals.iter().enumerate() {
+        let vi = v as i32;
+        let mut bk = 0u64;
+        let mut be = i32::MAX;
+        for (k, &pv) in pal.iter().enumerate() {
+            let e = (vi - pv).abs();
+            if e < be {
+                be = e;
+                bk = k as u64;
+            }
+        }
+        word |= bk << (16 + i * 3);
+    }
+    word
+}
+
+/// Pure-Rust BC5 UNORM compressor (dual BC4 blocks for R & G normal channels = 16 B/block).
+pub fn compress_rgba_dims_to_bc5(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let bx_count = width / 4;
+    let by_count = height / 4;
+    let mut out = vec![0u8; bx_count * by_count * 16];
+    for by in 0..by_count {
+        for bx in 0..bx_count {
+            let mut r_vals = [0u8; 16];
+            let mut g_vals = [0u8; 16];
+            for py in 0..4 {
+                for px in 0..4 {
+                    let off = ((by * 4 + py) * width + (bx * 4 + px)) * 4;
+                    let idx = py * 4 + px;
+                    r_vals[idx] = rgba[off];
+                    g_vals[idx] = rgba[off + 1];
+                }
+            }
+            let r_blk = encode_bc4_channel(&r_vals);
+            let g_blk = encode_bc4_channel(&g_vals);
+            let bi = (by * bx_count + bx) * 16;
+            out[bi..bi + 8].copy_from_slice(&r_blk.to_le_bytes());
+            out[bi + 8..bi + 16].copy_from_slice(&g_blk.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Encodes 16-byte block streams (BC7 / BC5) into 16-lane rANS BCPack streams (2 symbol-rows/block).
+pub fn encode_bc16_to_bcpack(bc16_bytes: &[u8]) -> Vec<u8> {
+    assert_eq!(bc16_bytes.len() % 16, 0);
+    let rows = (bc16_bytes.len() / 16) * 2;
+    let mut lane_syms: [Vec<u16>; 16] = std::array::from_fn(|i| {
+        if matches!(i, 2 | 3 | 4 | 5 | 6 | 9 | 11 | 12 | 13 | 15) {
+            Vec::with_capacity(rows)
+        } else {
+            vec![0u16; rows]
+        }
+    });
+
+    for half in bc16_bytes.chunks_exact(8) {
+        let w0 = u32::from_le_bytes([half[0], half[1], half[2], half[3]]);
+        let w1 = u32::from_le_bytes([half[4], half[5], half[6], half[7]]);
+        lane_syms[2].push((w0 & 0x7F) as u16);
+        lane_syms[3].push(((w0 >> 7) & 0x7F) as u16);
+        lane_syms[4].push(((w0 >> 14) & 0x7F) as u16);
+        lane_syms[5].push(((w0 >> 21) & 0x7F) as u16);
+        lane_syms[9].push(((w0 >> 28) & 0x0F) as u16);
+
+        lane_syms[6].push((w1 & 0x7F) as u16);
+        lane_syms[11].push(((w1 >> 7) & 0x7F) as u16);
+        lane_syms[12].push(((w1 >> 14) & 0x7F) as u16);
+        lane_syms[13].push(((w1 >> 21) & 0x7F) as u16);
+        lane_syms[15].push(((w1 >> 28) & 0x0F) as u16);
+    }
+
+    let mut lanes: Vec<Vec<Fragment>> = Vec::with_capacity(16);
+    for (li, &ab) in BC7_ALPHABET_BITS.iter().enumerate() {
+        let mut frags = Vec::new();
+        for chunk in lane_syms[li].chunks(4096) {
+            let (z, q) = best_model_for_fragment(ab, chunk);
+            frags.push(Fragment {
+                symbols: chunk.to_vec(),
+                q,
+                z,
+            });
+        }
+        lanes.push(frags);
+    }
+
+    encode_lanes(&BC7_ALPHABET_BITS, &lanes).expect("encode_bc16_to_bcpack encode_lanes failed")
+}
+
+/// CPU baseline decoder for 16-byte (BC7 / BC5) 16-lane rANS BCPack streams.
+pub fn decode_bc16_from_bcpack_cpu(stream: &[u8], blocks: usize) -> Vec<u8> {
+    let rows = blocks * 2;
+    let decoded = rans::decode_slice(stream, &BC7_ALPHABET_BITS, rows).expect("cpu bc16 rans decode");
+    let mut out = vec![0u8; blocks * 16];
+    let l2 = decoded.lane(2);
+    let l3 = decoded.lane(3);
+    let l4 = decoded.lane(4);
+    let l5 = decoded.lane(5);
+    let l6 = decoded.lane(6);
+    let l9 = decoded.lane(9);
+    let l11 = decoded.lane(11);
+    let l12 = decoded.lane(12);
+    let l13 = decoded.lane(13);
+    let l15 = decoded.lane(15);
+
+    for r in 0..rows {
+        let w0 = (l2[r] as u32 & 0x7F)
+            | ((l3[r] as u32 & 0x7F) << 7)
+            | ((l4[r] as u32 & 0x7F) << 14)
+            | ((l5[r] as u32 & 0x7F) << 21)
+            | ((l9[r] as u32 & 0x0F) << 28);
+        let w1 = (l6[r] as u32 & 0x7F)
+            | ((l11[r] as u32 & 0x7F) << 7)
+            | ((l12[r] as u32 & 0x7F) << 14)
+            | ((l13[r] as u32 & 0x7F) << 21)
+            | ((l15[r] as u32 & 0x0F) << 28);
+        let off = r * 8;
+        out[off..off + 4].copy_from_slice(&w0.to_le_bytes());
+        out[off + 4..off + 8].copy_from_slice(&w1.to_le_bytes());
+    }
+    out
 }
 
 pub fn encode_bc1_to_bcpack(raw_bc1: &[u8], window: &Window, quads: &QuadTable) -> Vec<u8> {

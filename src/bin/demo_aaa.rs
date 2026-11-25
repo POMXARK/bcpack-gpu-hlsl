@@ -40,6 +40,10 @@ fn main() {
                 cfg.screenshot_frames = args[i + 1].parse().unwrap_or(24);
                 i += 1;
             }
+            "--vram-budget-mb" if i + 1 < args.len() => {
+                cfg.vram_budget_mb = args[i + 1].parse().unwrap_or(128);
+                i += 1;
+            }
             other => {
                 eprintln!("Unknown flag '{other}'");
                 std::process::exit(2);
