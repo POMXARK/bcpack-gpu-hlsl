@@ -1,12 +1,12 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
 [![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1-2f80ed)](shaders/bcpack_decode.hlsl)
-[![v0.6.0](https://img.shields.io/badge/v0.6.0-11.33%20GB%2Fs%20%7C%204M%20Tris%20%2B%20RTGI-ff4081)](#v040--v060-performance-leap--benchmarks-rtx-5080)
+[![v0.7.0](https://img.shields.io/badge/v0.7.0-AAA%202K%20PBR%20%7C%2012M%20Hi--Z%20%7C%201.25M%20Descs-ff4081)](#v040--v060-performance-leap--benchmarks-rtx-5080)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
 
-**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor & Open-World Streaming Stress Suite in DX12 HLSL SM 6.6 (Wave32) + Mesh Shaders (`as_6_5`/`ms_6_5`) + DXR 1.1 Inline Ray Tracing & RTGI — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1) vs 1-core CPU, 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 189.36 FPS live (Ping-Pong), and 128.62 FPS @ 2560×1440 HDR / 139.41 FPS @ 1280×720 HDR with 4.01M-tri Mesh Shaders + 1,536-instance TLAS + 1-spp Diffuse RTGI + 2-Pass Bilateral Denoiser on an NVIDIA RTX 5080.**
+**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor, Open AAA 2K PBR Showcase, & RAGE-Scale Streaming Stress Suite in DX12 HLSL SM 6.6 (Wave32) + Mesh Shaders (`as_6_5`/`ms_6_5`) + DXR 1.1 Inline Ray Tracing & RTGI — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1), 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 278.21 FPS @ 720p / 235.18 FPS @ 1440p HDR in the Open AAA 2K PBR Showroom (`CarConcept.glb` + Poly Haven 2K PBR + Sunset HDRI), 12.04M-tri Two-Pass Hi-Z Occlusion Culling (`0.016 ms`), `1.25M` Virtual `ResourceDescriptorHeap[]` Paging (`0.061 ms`), `64×64` (`256 km²`) `--jet-flight` streaming (`960 MB/s`), and `500` GPU-skinned NPCs (`512k` verts in `0.075 ms`) — 17/17 bit-exact PASS on an NVIDIA RTX 5080.**
 
 > Clean-room implementation using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. Built on the format specification and CPU oracle from [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) and Microsoft's MIT-licensed [`microsoft/silicon-rans`](https://github.com/microsoft/silicon-rans).
 
@@ -88,22 +88,24 @@ flowchart LR
 
 ## Verified Bit-Exactness (`bcpack-gpu-demo --verify`)
 
-Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Queue** enabled (`v0.7.0` — **15/15 PASS**, `0` mismatches):
-1. **PASS 1/15 — BC1 synthetic streams** (`5` chunks, `21,824` blocks, odd chunk count): `0` byte mismatches
-2. **PASS 2/15 — BC1 monolithic 512×512 textures** (`12` textures = `1.50 MiB`): `0` byte mismatches
-3. **PASS 3/15 — BC1 tiled 4K-block strips** (`48` tiles = `1.50 MiB`): `0` byte mismatches
-4. **PASS 4/15 — BC7 16-lane rANS (100% Wave32 32/32)** (`5` chunks, `14,976` symbol-rows across Standard, High-Entropy Normal, and Sharp UI profiles): `0` symbol mismatches
-5. **PASS 5/15 — AMD Gfx10 Swizzle → BCPack → Async GPU Decode → GPU Detile → Linear BC1**: both `SW_64KB_D` (`512×512`) and `SW_4KB_S` (`256×256`) match original BC1 with `0` byte mismatches
-6. **PASS 6/15 — Full Mipmap Chain + Packed Mip Tail** (`512×512 .. 64×64` + `85`-block packed tail `32..4`): `0` byte mismatches
-7. **PASS 7/15 — C-ABI FFI `BcPackDecodeAsync` Smoke Test**: Linear BC1 + Fused Gfx10 `SW_64KB_D` + Non-blocking Async BC7 16-lane: `0` mismatches
-8. **PASS 8/15 — DXR 1.1 Hardware BLAS/TLAS + Inline `RayQuery`** (`4` analytical rays against unit box BVH, `0` mismatches)
-9. **PASS 9/15 — World Grid 32×32 Streaming + LRU VRAM Residency** (`180` frames simulated, `256` tiles GPU-verified, `242` evictions, `320`-tile turn burst, `480 MB/s` peak, `0` mismatches)
-10. **PASS 10/15 — Hardware Mesh Shaders (`as_6_5`/`ms_6_5`) + Frustum Culling** (`4.01M` city tris, `52,949` meshlets, `27,023` visible / `25,926` culled, `2.02M` visible tris, `25,783` lit FP16 pixels, `0` mismatches)
-11. **PASS 11/15 — DXR 1.1 Scale (1,536-Instance TLAS) + Bilateral RTGI Denoiser** (`0.095 ms` TLAS build; noisy FP16 variance `0.0324 -> 0.0000`, `edge_jump = 0.83`, `0` mismatches)
-12. **PASS 12/15 — BCPack 8B Quantized Meshlet Geometry** (`16,384` verts = `128 KiB`, ratio `1.20x`, `0` mismatches)
-13. **PASS 13/15 — AAA `CarConcept.glb` + Poly Haven 2K PBR BCPack** (`162,766` verts, `213,347` tris, `109` submeshes [`5` glass], `15` tex / `216` tiles = `6.75 MiB`, ratio `1.64x`, `0` mismatches)
-14. **PASS 14/15 — Virtual Descriptor Paging (SM 6.6 `ResourceDescriptorHeap[]` Tier 3)** (`1.25M` virtual IDs → `262,144` physical GPU heap slots via `CopyDescriptorsSimple`, `300,000` ops, `37,856` evictions, `65,536` verified pixel samples, `0` mismatches, [`src/descriptor_paging.rs`](src/descriptor_paging.rs) + [`shaders/bindless_paging.hlsl`](shaders/bindless_paging.hlsl))
-15. **PASS 15/15 — Jet-Flight 64×64 Supersonic World Grid Streaming** (`64×64 = 4,096` sectors / `256 km²`, `360` frames Mach 1/2 sweep, `14,500` tiles / `453.1 MiB` streamed, `1,487` LRU evictions, `512`-tile `16.0 MiB` burst, `960 MB/s` peak, `0` mismatches, [`src/world_streaming.rs`](src/world_streaming.rs))
+Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Queue** enabled (`v0.7.0` — **17/17 PASS**, `0` mismatches):
+1. **PASS 1/17 — BC1 synthetic streams** (`5` chunks, `21,824` blocks, odd chunk count): `0` byte mismatches
+2. **PASS 2/17 — BC1 monolithic 512×512 textures** (`12` textures = `1.50 MiB`): `0` byte mismatches
+3. **PASS 3/17 — BC1 tiled 4K-block strips** (`48` tiles = `1.50 MiB`): `0` byte mismatches
+4. **PASS 4/17 — BC7 16-lane rANS (100% Wave32 32/32)** (`5` chunks, `14,976` symbol-rows across Standard, High-Entropy Normal, and Sharp UI profiles): `0` symbol mismatches
+5. **PASS 5/17 — AMD Gfx10 Swizzle → BCPack → Async GPU Decode → GPU Detile → Linear BC1**: both `SW_64KB_D` (`512×512`) and `SW_4KB_S` (`256×256`) match original BC1 with `0` byte mismatches
+6. **PASS 6/17 — Full Mipmap Chain + Packed Mip Tail** (`512×512 .. 64×64` + `85`-block packed tail `32..4`): `0` byte mismatches
+7. **PASS 7/17 — C-ABI FFI `BcPackDecodeAsync` Smoke Test**: Linear BC1 + Fused Gfx10 `SW_64KB_D` + Non-blocking Async BC7 16-lane: `0` mismatches
+8. **PASS 8/17 — DXR 1.1 Hardware BLAS/TLAS + Inline `RayQuery`** (`4` analytical rays against unit box BVH, `0` mismatches)
+9. **PASS 9/17 — World Grid 32×32 Streaming + LRU VRAM Residency** (`180` frames simulated, `256` tiles GPU-verified, `242` evictions, `320`-tile turn burst, `480 MB/s` peak, `0` mismatches)
+10. **PASS 10/17 — Hardware Mesh Shaders (`as_6_5`/`ms_6_5`) + Frustum Culling** (`4.01M` city tris, `52,949` meshlets, `27,023` visible / `25,926` culled, `2.02M` visible tris, `25,783` lit FP16 pixels, `0` mismatches)
+11. **PASS 11/17 — DXR 1.1 Scale (1,536-Instance TLAS) + Bilateral RTGI Denoiser** (`0.096 ms` TLAS build; noisy FP16 variance `0.0324 -> 0.0000`, `edge_jump = 0.83`, `0` mismatches)
+12. **PASS 12/17 — BCPack 8B Quantized Meshlet Geometry** (`16,384` verts = `128 KiB`, ratio `1.20x`, `0` mismatches)
+13. **PASS 13/17 — AAA `CarConcept.glb` + Poly Haven 2K PBR BCPack** (`162,766` verts, `213,347` tris, `109` submeshes [`5` glass], `15` tex / `216` tiles = `6.75 MiB`, ratio `1.64x`, `0` mismatches)
+14. **PASS 14/17 — Virtual Descriptor Paging (SM 6.6 `ResourceDescriptorHeap[]` Tier 3)** (`1.25M` virtual IDs → `262,144` physical GPU heap slots via `CopyDescriptorsSimple`, `300,000` ops, `37,856` evictions, `65,536` verified pixel samples, `0` mismatches, [`src/descriptor_paging.rs`](src/descriptor_paging.rs) + [`shaders/bindless_paging.hlsl`](shaders/bindless_paging.hlsl))
+15. **PASS 15/17 — Jet-Flight 64×64 Supersonic World Grid Streaming** (`64×64 = 4,096` sectors / `256 km²`, `360` frames Mach 1/2 sweep, `14,500` tiles / `453.1 MiB` streamed, `1,487` LRU evictions, `512`-tile `16.0 MiB` burst, `960 MB/s` peak, `0` mismatches, [`src/world_streaming.rs`](src/world_streaming.rs))
+16. **PASS 16/17 — Two-Pass Hi-Z Occlusion Culling over 12.04M-Tri Skyline** (`159,171` meshlets, `45,585` frustum culled, `113,348` Hi-Z occluded = `8.53M` tris, `build=0.010 ms`, `cull=0.006 ms`, `0` mismatches, [`src/hiz_culling.rs`](src/hiz_culling.rs) + [`shaders/hiz_{build,cull}.hlsl`](shaders/hiz_cull.hlsl))
+17. **PASS 17/17 — 500 GPU-Skinned NPC Crowd Compute (4-Bone LBS)** (`500 × 1,024 = 512k` verts, `32,000` bones, `4,096` CPU-oracle samples verified, `max_err=7.63e-6`, `GPU=0.075 ms`, `0` mismatches, [`src/crowd_skinning.rs`](src/crowd_skinning.rs) + [`shaders/crowd_skin.hlsl`](shaders/crowd_skin.hlsl))
 
 ---
 
@@ -167,9 +169,9 @@ git clone https://github.com/POMXARK/bcpack-gpu-hlsl.git
 cd bcpack-gpu-hlsl
 cargo build --release
 
-REM 1. Run all 15 bit-exact verifications (incl. 1.25M Descriptor Paging & 64x64 Jet-Flight) + benchmark suite
+REM 1. Run all 17 bit-exact verifications (incl. 1.25M Paging, 64x64 Jet-Flight, 12M Hi-Z, 500 NPCs) + benchmark suite
 target\release\bcpack-gpu-demo.exe --verify --bench
-target\release\bcpack-gpu-demo.exe --jet-flight
+target\release\bcpack-gpu-demo.exe --rage-stress
 
 REM 2. OLD CPU baseline (5 FPS) vs NEW Ping-Pong + DXR 1.1 GPU demo (153-189 FPS)
 target\release\bcpack-demo-cpu.exe
@@ -195,7 +197,7 @@ BcPackDecodeAsync(ctx, stream, stream_len, num_blocks,
 BcPackWaitFence(ctx, fence, UINT32_MAX);
 ```
 
-To recompile all 22 HLSL shader outputs yourself (requires Windows 10/11 SDK `dxc.exe`):
+To recompile all 25 HLSL shader outputs yourself (requires Windows 10/11 SDK `dxc.exe`):
 ```bat
 shaders\compile_shaders.bat
 ```
