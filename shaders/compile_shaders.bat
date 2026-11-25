@@ -1,5 +1,7 @@
 @echo off
 setlocal
+call "%~dp0..\sdk\shaders\compile_dxil.bat" || exit /b 1
+
 set "DXC="
 for /f "delims=" %%F in ('where dxc.exe 2^>nul') do (
     set "DXC=%%F"
@@ -15,11 +17,7 @@ echo ERROR: dxc.exe not found in PATH or Windows 10 SDK.
 exit /b 1
 
 :found
-echo Using DXC: "%DXC%"
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0bcpack_decode.dxil" "%~dp0bcpack_decode.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0bcpack_bc7_rans.dxil" "%~dp0bcpack_bc7_rans.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0bc16_pack.dxil" "%~dp0bc16_pack.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0gfx10_detile.dxil" "%~dp0gfx10_detile.hlsl" || exit /b 1
+echo Using DXC for showcase shaders: "%DXC%"
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0rt_verify.dxil" "%~dp0rt_verify.hlsl" || exit /b 1
 "%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0scene_vs.dxil" "%~dp0scene.hlsl" || exit /b 1
 "%DXC%" -T ps_6_5 -E PSMain -HV 2021 -O3 -Fo "%~dp0scene_ps.dxil" "%~dp0scene.hlsl" || exit /b 1
@@ -37,8 +35,6 @@ echo Using DXC: "%DXC%"
 "%DXC%" -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo "%~dp0aaa_pbr_ps.dxil" "%~dp0aaa_pbr.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_bloom.dxil" "%~dp0aaa_bloom.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_taa.dxil" "%~dp0aaa_taa.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_vrs.dxil" "%~dp0aaa_vrs.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_rtgi_cs.dxil" "%~dp0aaa_rtgi_cs.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_autoexp.dxil" "%~dp0aaa_autoexp.hlsl" || exit /b 1
 "%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0aaa_comp_vs.dxil" "%~dp0aaa_composite.hlsl" || exit /b 1
 "%DXC%" -T ps_6_0 -E PSMain -O3 -Fo "%~dp0aaa_comp_ps.dxil" "%~dp0aaa_composite.hlsl" || exit /b 1
@@ -47,8 +43,4 @@ echo Using DXC: "%DXC%"
 "%DXC%" -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo "%~dp0aaa_meshlet_ps.dxil" "%~dp0aaa_meshlet_ps.hlsl" || exit /b 1
 "%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0aaa_crowd_vs.dxil" "%~dp0aaa_crowd.hlsl" || exit /b 1
 "%DXC%" -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo "%~dp0aaa_crowd_ps.dxil" "%~dp0aaa_crowd.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0bindless_paging.dxil" "%~dp0bindless_paging.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0hiz_build.dxil" "%~dp0hiz_build.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0hiz_cull.dxil" "%~dp0hiz_cull.hlsl" || exit /b 1
-"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0crowd_skin.dxil" "%~dp0crowd_skin.hlsl" || exit /b 1
-echo Shaders compiled successfully.
+echo Demo shaders compiled successfully.

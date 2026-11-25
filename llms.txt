@@ -1,6 +1,15 @@
-# bcpack-gpu-hlsl — AI Agent & Code-Search Entrypoint (`v0.10.0`)
+# bcpack-gpu-hlsl — AI Agent & Code-Search Entrypoint (`v0.11.0`)
 
-> Clean-room Xbox Series X|S BCPack (MDU rANS) GPU Compute Decompressor, AMD Gfx10 Detiler, SM 6.6 Virtual Descriptor Heap Pager, Zero-Copy DirectX 12 C-ABI DLL, Vulkan 1.3 SPIR-V Kernels, & Open 4K AAA Streaming Benchmark (`MIT OR Apache-2.0`).
+> Open 4K AAA Streaming Benchmark, 12.41M Mesh-Shader Showcase, & 19-Test Verification Suite (`MIT OR Apache-2.0`), powered by the standalone hardware SDK [`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk) mounted as a Git submodule at `sdk/`.
+
+## Standalone Hardware SDK (`sdk/` -> `https://github.com/POMXARK/bcpack-gpu-sdk`)
+- C/C++ Zero-Copy Integration API: `sdk/include/bcpack_gpu.h`, `sdk/src/ffi.rs`, `sdk/examples/directstorage_hook.cpp`
+- Wave32 GPU BCPack Kernels: `sdk/shaders/bcpack_decode.hlsl`, `sdk/shaders/bcpack_bc7_rans.hlsl`, `sdk/shaders/bc16_pack.hlsl`
+- Gfx10 Swizzle -> Linear Detile: `sdk/shaders/gfx10_detile.hlsl`
+- Vulkan 1.3 SPIR-V Outputs & Build Script: `sdk/shaders/compile_spirv.sh`, `sdk/shaders/spirv/*.spv`
+- Virtual Descriptor Pager: `sdk/src/descriptor_paging.rs`, `sdk/shaders/bindless_paging.hlsl`
+- GPU Crowd Skinning, Hi-Z, VRS Tier 2 & Compute RayQuery RTGI: `sdk/src/crowd_skinning.rs`, `sdk/shaders/{crowd_skin,hiz_build,hiz_cull,aaa_vrs,aaa_rtgi_cs}.hlsl`
+- SDK AI Docs: `sdk/llms.txt`, `sdk/docs/AI_ARCHITECTURE.md`, `sdk/docs/INTEGRATION_GUIDE.md`
 
 ## Search Keywords / Problems Solved
 - Xbox Series X|S `BCPack` / `IDStorageQueueX` / `dstorage` CPU decompression bottleneck (~40 MB/s -> 5 FPS)

@@ -1,35 +1,35 @@
 use bcpack::bc1::{self, QuadTable, Window};
 use bcpack::encode::synthetic_bc1;
 use bcpack::rans;
-use bcpack_gpu::assets::{
+use bcpack_demo::assets::{
     encode_bc1_to_bcpack, generate_bc7_16lane_stream, generate_high_entropy_bc1_normal_map,
     generate_mip_chain_bc1, generate_sharp_ui_bc1, load_or_generate_assets, swizzle_gfx10_cpu,
     Bc7EntropyProfile, BC7_ALPHABET_BITS, NUM_BLOCKS, TEX_BC1_BYTES, TILE_BC1_BYTES, TILE_BLOCKS,
     TILE_STRIPS,
 };
-use bcpack_gpu::crowd_skinning::run_crowd_skinning_verify;
-use bcpack_gpu::demo_scene::{run_demo, DemoConfig, DemoMode};
-use bcpack_gpu::descriptor_paging::run_descriptor_paging_verify;
-use bcpack_gpu::ffi::{
+use bcpack_demo::crowd_skinning::run_crowd_skinning_verify;
+use bcpack_demo::demo_scene::{run_demo, DemoConfig, DemoMode};
+use bcpack_demo::descriptor_paging::run_descriptor_paging_verify;
+use bcpack_demo::ffi::{
     bcpack_gpu_create, bcpack_gpu_create_from_device, bcpack_gpu_destroy, BcPackDecodeAsync,
     BcPackDecodeToBuffer, BcPackDecodeToTexture2D, BcPackGetComputeFence, BcPackGetDirectFence,
     BcPackGetLastTimingMs, BcPackWaitDirectFence, BcPackWaitFence, BCPACK_FORMAT_BC1,
     BCPACK_FORMAT_BC7_RANS, BCPACK_SWIZZLE_GFX10_4KB_S, BCPACK_SWIZZLE_GFX10_64KB_D,
     BCPACK_SWIZZLE_LINEAR,
 };
-use bcpack_gpu::gltf_loader::run_aaa_2k_bcpack_verify;
-use bcpack_gpu::gpu_decoder::{
+use bcpack_demo::gltf_loader::run_aaa_2k_bcpack_verify;
+use bcpack_demo::gpu_decoder::{
     cmd_barriers, create_committed_buffer, pack_batch, transition_barrier, Bc7RansGpuDecoder,
     BcpackGpuDecoder, Gfx10DetileGpu, GpuContext,
 };
-use bcpack_gpu::hiz_culling::run_hiz_12m_verify;
-use bcpack_gpu::meshlets::{
+use bcpack_demo::hiz_culling::run_hiz_12m_verify;
+use bcpack_demo::meshlets::{
     build_city_meshlet_library, pack_quantized_meshlet_vertices, run_geom_bcpack_verify,
     run_mesh_shader_verify,
 };
-use bcpack_gpu::raytracing::run_rt_verify;
-use bcpack_gpu::rtgi::run_rtgi_verify;
-use bcpack_gpu::world_streaming::{run_jet_flight_verify, run_world_stream_verify};
+use bcpack_demo::raytracing::run_rt_verify;
+use bcpack_demo::rtgi::run_rtgi_verify;
+use bcpack_demo::world_streaming::{run_jet_flight_verify, run_world_stream_verify};
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

@@ -13,8 +13,8 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-pub const HIZ_BUILD_CS_DXIL: &[u8] = include_bytes!("../shaders/hiz_build.dxil");
-pub const HIZ_CULL_CS_DXIL: &[u8] = include_bytes!("../shaders/hiz_cull.dxil");
+pub const HIZ_BUILD_CS_DXIL: &[u8] = include_bytes!("../sdk/shaders/hiz_build.dxil");
+pub const HIZ_CULL_CS_DXIL: &[u8] = include_bytes!("../sdk/shaders/hiz_cull.dxil");
 
 #[repr(C)]
 #[derive(Clone, Copy)]

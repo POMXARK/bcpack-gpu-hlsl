@@ -50,8 +50,8 @@ pub const AAA_PBR_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_pbr_ps.dxil");
 pub const AAA_BLOOM_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_bloom.dxil");
 pub const AAA_TAA_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_taa.dxil");
 pub const AAA_AUTOEXP_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_autoexp.dxil");
-pub const AAA_VRS_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_vrs.dxil");
-pub const AAA_RTGI_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_rtgi_cs.dxil");
+pub const AAA_VRS_CS_DXIL: &[u8] = include_bytes!("../sdk/shaders/aaa_vrs.dxil");
+pub const AAA_RTGI_CS_DXIL: &[u8] = include_bytes!("../sdk/shaders/aaa_rtgi_cs.dxil");
 pub const AAA_COMP_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_vs.dxil");
 pub const AAA_COMP_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_ps.dxil");
 

@@ -1,6 +1,6 @@
 use bcpack::bc1::{QuadTable, Window};
-use bcpack_gpu::assets::load_or_generate_assets;
-use bcpack_gpu::demo_scene::{run_demo, DemoConfig, DemoMode};
+use bcpack_demo::assets::load_or_generate_assets;
+use bcpack_demo::demo_scene::{run_demo, DemoConfig, DemoMode};
 use std::path::PathBuf;
 
 fn main() {

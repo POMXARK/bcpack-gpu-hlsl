@@ -1,4 +1,4 @@
-use bcpack_gpu::aaa_scene::{run_aaa_demo, AaaDemoConfig};
+use bcpack_demo::aaa_scene::{run_aaa_demo, AaaDemoConfig};
 use std::path::PathBuf;
 
 fn main() {

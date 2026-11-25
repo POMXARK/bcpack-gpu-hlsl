@@ -1,4 +1,6 @@
-# bcpack-gpu-hlsl v0.11.0 — Оптимизация под 8 ГБ GPU (TAAU + VRS Tier 2), Zero-Copy C-ABI и SPIR-V (19/19 PASS)
+# bcpack-gpu-hlsl v0.11.0 — Оптимизация под 8 ГБ GPU (TAAU + VRS Tier 2) и модульный SDK `bcpack-gpu-sdk` (19/19 PASS)
+
+> **Отдельный аппаратный SDK без демо-сцен:** [`bcpack_gpu.dll`](https://github.com/POMXARK/bcpack-gpu-sdk), [`bcpack_gpu.h`](sdk/include/bcpack_gpu.h), базовые Compute HLSL/DXIL-ядра и прекомпилированный **Vulkan 1.3 SPIR-V** вынесены в чистый репозиторий **[`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk)** и подключены сюда через Git-субмодуль [`sdk/`](sdk) (`git clone --recursive`).
 
 ![Живой 4-режимный прогон AAA-бенчмарка (60 / 120 / 240 / Unlimited MAX > 450 FPS на RTX 5080)](media/aaa_benchmark_4modes.gif)
 - **Full HD (`1920×1080`) видео:** [`60 FPS MP4`](media/aaa_benchmark_60fps.mp4) | [`120 FPS MP4`](media/aaa_benchmark_120fps.mp4) | [`240 FPS MP4`](media/aaa_benchmark_240fps.mp4) | [`Без лимита (MAX) MP4`](media/aaa_benchmark_unlimited.mp4) | [`Обзор 3 актов`](media/aaa_showcase_v8.gif)

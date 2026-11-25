@@ -1,17 +1,19 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
-[![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1%20%2B%20VRS%20Tier2-2f80ed)](shaders/bcpack_decode.hlsl)
+[![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1%20%2B%20VRS%20Tier2-2f80ed)](sdk/shaders/bcpack_decode.hlsl)
 [![v0.11.0](https://img.shields.io/badge/v0.11.0-VRS%20Tier2%20%2B%20TAAU%20%7C%2019%2F19%20PASS-ff4081)](#whats-new-in-v0110--low-vram-scaling-taau-upscaler--hardware-vrs-tier-2)
-[![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](shaders/bcpack_bc7_rans.hlsl)
-[![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
+[![Standalone SDK](https://img.shields.io/badge/Hardware%20SDK-POMXARK%2Fbcpack--gpu--sdk-orange)](https://github.com/POMXARK/bcpack-gpu-sdk)
+[![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](sdk/shaders/bcpack_bc7_rans.hlsl)
+[![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](sdk/include/bcpack_gpu.h)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
 
 ![v0.10.0 4-Mode AAA Benchmark Showcase (60 / 120 / 240 / Unlimited MAX > 450 FPS on RTX 5080)](media/aaa_benchmark_4modes.gif)
 - **Full HD (`1920×1080`) Captures:** [`60 FPS MP4`](media/aaa_benchmark_60fps.mp4) | [`120 FPS MP4`](media/aaa_benchmark_120fps.mp4) | [`240 FPS MP4`](media/aaa_benchmark_240fps.mp4) | [`Unlimited (MAX) MP4`](media/aaa_benchmark_unlimited.mp4) | [`3-Act 8s Overview GIF`](media/aaa_showcase_v8.gif)
 
-**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor, Zero-Copy DirectX 12 C-ABI (`bcpack_gpu.dll`), precompiled Vulkan 1.3 SPIR-V compute kernels (`dxc -spirv`, incl. `VK_KHR_ray_query`), `1.25M` Virtual `ResourceDescriptorHeap[]` Paging (`0.064 ms`), Xbox/RDNA2-style Compute `RayQuery` RTGI + Hardware VRS Tier 2 + TAAU (`551.5 FPS` Low / `394.2 FPS` Medium / `258.9 FPS` Ultra+VRS), & Open AAA 4K PBR Benchmark — verified 19/19 bit-exact PASS (DX12 Debug Layer clean, 0 errors) on an NVIDIA RTX 5080.**
+**Full 4K AAA GPU-streaming showcase, 12.41M Mesh-Shader demo, and 19-test verification harness built on top of the standalone clean-room SDK [`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk) (linked via Git submodule at [`sdk/`](sdk)).**
 
-> Clean-room implementation (`MIT OR Apache-2.0`) using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. Built on the format specification and CPU oracle from [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) and Microsoft's MIT-licensed [`microsoft/silicon-rans`](https://github.com/microsoft/silicon-rans). AI/LLM full technical spec: [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md) & [`llms.txt`](llms.txt).
+> Want only the lightweight, zero-bloat C-ABI DLL (`bcpack_gpu.dll`), `bcpack_gpu.h`, HLSL/DXIL compute kernels, and **Vulkan 1.3 SPIR-V (`.spv`)** binaries? Use **[`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk)** directly!
+> Clean-room implementation (`MIT OR Apache-2.0`) using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. AI/LLM spec: [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md) & [`llms.txt`](llms.txt).
 
 ---
 
@@ -238,12 +240,12 @@ Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Qu
 
 ## Quick Start & C-ABI Usage (`bcpack_gpu.dll`)
 
-Pre-compiled `.dxil` shaders are included in [`shaders/`](shaders/) — only **Rust (MSVC toolchain)** is required:
+Pre-compiled `.dxil` shaders are included in [`sdk/shaders/`](sdk/shaders/) and [`shaders/`](shaders/) — only **Rust (MSVC toolchain)** is required:
 
 ```bat
-git clone https://github.com/POMXARK/bcpack-gpu-hlsl.git
+git clone --recursive https://github.com/POMXARK/bcpack-gpu-hlsl.git
 cd bcpack-gpu-hlsl
-cargo build --release
+cargo build --release --workspace
 
 REM 1. Run all 17 bit-exact verifications (incl. 1.25M Paging, 64x64 Jet-Flight, 12M Hi-Z, 500 NPCs) + benchmark suite
 target\release\bcpack-gpu-demo.exe --verify --bench
@@ -262,7 +264,7 @@ target\release\bcpack-aaa-demo.exe --aaa-dir aaa_assets
 target\release\bcpack-aaa-demo.exe --aaa-dir aaa_assets --flush-bench
 ```
 
-Precompiled `bcpack_gpu.dll`, `bcpack_gpu.dll.lib`, [`include/bcpack_gpu.h`](include/bcpack_gpu.h), `.dxil`, and **Vulkan 1.3 SPIR-V ([`shaders/spirv/*.spv`](shaders/compile_spirv.sh))** are built in `target\release\` (and attached to GitHub Release `v0.10.0`) for zero-copy C/C++ integration into `IDStorageQueueX` / `OpenScarlett` wrappers:
+Precompiled `bcpack_gpu.dll`, `bcpack_gpu.dll.lib`, [`sdk/include/bcpack_gpu.h`](sdk/include/bcpack_gpu.h), `.dxil`, and **Vulkan 1.3 SPIR-V ([`sdk/shaders/spirv/*.spv`](sdk/shaders/compile_spirv.sh))** are built cleanly by [`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk) in `target\release\` (and attached to SDK Release `v0.11.0`) for zero-copy C/C++ integration into `IDStorageQueueX` / `OpenScarlett` wrappers:
 ```c
 #include "bcpack_gpu.h"
 // Zero-copy shared-device Texture2D mode (zero CPU readback):

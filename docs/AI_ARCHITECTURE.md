@@ -1,5 +1,6 @@
-# `bcpack-gpu-hlsl` — AI/LLM Machine-Readable Architecture & Optimization Reference (`v0.10.0`)
+# `bcpack-gpu-hlsl` — AI/LLM Machine-Readable Architecture & Optimization Reference (`v0.11.0`)
 
+> **Repository split note (`v0.11.0`):** Reusable hardware kernels, C-ABI (`bcpack_gpu.dll` / `include/bcpack_gpu.h`), Rust SDK crate (`bcpack-gpu-sdk`), and Vulkan 1.3 SPIR-V (`.spv`) binaries live in standalone repo **`POMXARK/bcpack-gpu-sdk`**, mounted here at [`sdk/`](../sdk).
 > **Target audience:** Coding agents, automated integration planners, and GPU systems engineers working on Xbox Series X|S compatibility layers (`xcl-dev/xcl`, `OpenScarlett`, `ScarlettX`, `AnyXboxX`, `rebox`) or clean-room BCPack / DirectStorage / RAGE9 pipelines (`bcpack-rs`, `rage-texture`, `bcpack-decoder`).
 > **License & Provenance:** `MIT OR Apache-2.0`. 100% clean-room implementation derived from public specs (`Ahmet-Dedeler/bcpack-rs`, `microsoft/silicon-rans`) and CC0/CC-BY 4.0 open assets. Zero proprietary/copyrighted game assets or SDK binaries.
 
