@@ -145,14 +145,14 @@ git clone https://github.com/POMXARK/bcpack-gpu-hlsl.git
 cd bcpack-gpu-hlsl
 cargo build --release
 
-REM 1. Run all 8 bit-exact verifications (incl. DXR 1.1) + full RTX benchmark suite
+REM 1. Run all 13 bit-exact verifications (incl. DXR 1.1, Mesh Shaders, RTGI, 2K GLB PBR) + full RTX benchmark suite
 target\release\bcpack-gpu-demo.exe --verify --bench
 
-REM 2. OLD CPU baseline (5 FPS) vs NEW Ping-Pong + DXR 1.1 GPU demo (171-189 FPS)
+REM 2. OLD CPU baseline (5 FPS) vs NEW Ping-Pong + DXR 1.1 GPU demo (153-189 FPS)
 target\release\bcpack-demo-cpu.exe
 target\release\bcpack-demo-gpu.exe
 
-REM 3. Unified toggleable demo ([SPACE] GPU <-> CPU, [R] DXR 1.1, [F] SFS, [C] Camera)
+REM 3. Unified toggleable demo ([SPACE] GPU <-> CPU, [R] DXR 1.1, [G] RTGI, [N] MeshShaders, [F] WorldStream, [C] Camera)
 target\release\bcpack-gpu-demo.exe --demo
 ```
 
@@ -167,7 +167,7 @@ BcPackDecodeAsync(ctx, stream, stream_len, num_blocks,
 BcPackWaitFence(ctx, fence, UINT32_MAX);
 ```
 
-To recompile all 8 HLSL shaders yourself (requires Windows 10/11 SDK `dxc.exe`):
+To recompile all 14 HLSL shaders yourself (requires Windows 10/11 SDK `dxc.exe`):
 ```bat
 shaders\compile_shaders.bat
 ```

@@ -325,7 +325,7 @@ fn expand_565(c: u16) -> [i32; 3] {
     ]
 }
 
-fn compress_rgba_dims_to_bc1(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+pub fn compress_rgba_dims_to_bc1(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let bx_count = width / 4;
     let by_count = height / 4;
     let mut out = vec![0u8; bx_count * by_count * 8];

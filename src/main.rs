@@ -13,6 +13,7 @@ use bcpack_gpu::ffi::{
     BcPackWaitFence, BCPACK_FORMAT_BC1, BCPACK_FORMAT_BC7_RANS, BCPACK_SWIZZLE_GFX10_4KB_S,
     BCPACK_SWIZZLE_GFX10_64KB_D, BCPACK_SWIZZLE_LINEAR,
 };
+use bcpack_gpu::gltf_loader::run_aaa_2k_bcpack_verify;
 use bcpack_gpu::gpu_decoder::{
     pack_batch, Bc7RansGpuDecoder, BcpackGpuDecoder, Gfx10DetileGpu, GpuContext,
 };
@@ -84,7 +85,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         offset += byte_len;
     }
     println!(
-        "[verify] PASS 1/12 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 1/13 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
         cases.len(),
         cases.iter().map(|c| c.1).sum::<usize>(),
         gpu_ms
@@ -104,7 +105,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 2/12 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 2/13 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         assets.len(),
         tex_gpu_ms
     );
@@ -129,7 +130,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 3/12 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 3/13 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         total_tiles,
         tile_gpu_ms
     );
@@ -173,7 +174,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         row_off += *rows;
     }
     println!(
-        "[verify] PASS 4/12 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
+        "[verify] PASS 4/13 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
         bc7_cases.len(),
         total_sym_rows,
         bc7_gpu_ms
@@ -196,7 +197,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         let (detiled, det_ms) = detile.detile_and_readback(&mut ctx, &gpu_swizzled_out, w_blk as u32, h_blk as u32, tile_mode, 8);
         assert_eq!(detiled.as_slice(), linear_bc1.as_slice(), "FAIL Gfx10 detile mismatch on {name}");
         println!(
-            "[verify] PASS 5/12 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
+            "[verify] PASS 5/13 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
         );
     }
 
@@ -216,7 +217,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         m_off += byte_len;
     }
     println!(
-        "[verify] PASS 6/12 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 6/13 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
         mip_chain.len(),
         mip_ms
     );
@@ -287,27 +288,27 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         assert_eq!(BcPackGetLastTimingMs(ffi_ctx, &mut kms), 0);
         bcpack_gpu_destroy(ffi_ctx);
         println!(
-            "[verify] PASS 7/12 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
+            "[verify] PASS 7/13 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
         );
     }
 
     // 8) DXR 1.1 Hardware BVH + Inline RayQuery verification on RT Cores
     let rt_ms = run_rt_verify(&mut ctx);
     println!(
-        "[verify] PASS 8/12 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
+        "[verify] PASS 8/13 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
     );
 
     // 9) World Grid 32x32 Streaming + LRU VRAM Residency Manager verification
     let ws = run_world_stream_verify(&mut ctx, &mut gpu_dec, &assets);
     println!(
-        "[verify] PASS 9/12 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 9/13 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
         ws.frames, ws.verified_tiles, ws.total_evictions, ws.turn_burst_tiles, ws.peak_mbs, ws.gpu_ms
     );
 
     // 10) DX12 Ultimate Mesh Shaders (as_6_5 / ms_6_5) + GPU Frustum Culling + 4M+ Tris City verification
     let ms = run_mesh_shader_verify(&mut ctx);
     println!(
-        "[verify] PASS 10/12 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
+        "[verify] PASS 10/13 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
         ms.total_tris as f64 / 1e6,
         ms.total_work_items,
         ms.visible_meshlets,
@@ -319,15 +320,32 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 11) DXR 1.1 Scale (1,536-Instance TLAS) + 2-Pass A-Trous Bilateral RTGI Denoiser verification
     let gi = run_rtgi_verify(&mut ctx);
     println!(
-        "[verify] PASS 11/12 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
+        "[verify] PASS 11/13 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
         gi.tlas_instances, gi.tlas_ms, gi.raw_var, gi.denoised_var, gi.edge_jump
     );
 
     // 12) BCPack 8B Quantized Meshlet Geometry Vertex Compression -> GPU Async Decode verification
     let gb = run_geom_bcpack_verify(&mut ctx, &mut gpu_dec, &window, &quads);
     println!(
-        "[verify] PASS 12/12 BCPack 8B Meshlet Geometry ({} verts = {} KiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 12/13 BCPack 8B Meshlet Geometry ({} verts = {} KiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
         gb.vertices, gb.raw_bytes / 1024, gb.ratio, gb.gpu_ms
+    );
+
+    // 13) Real glTF/GLB + 2K Photographic PBR -> Xbox .bcpack GPU Decode verification
+    let aaa = run_aaa_2k_bcpack_verify(&mut ctx, &mut gpu_dec, assets_dir, &window, &quads);
+    let ratio = aaa.raw_bytes as f64 / aaa.comp_bytes.max(1) as f64;
+    println!(
+        "[verify] PASS 13/13 AAA glTF+2K PBR BCPack (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        aaa.real_assets,
+        aaa.verts,
+        aaa.tris,
+        aaa.submeshes,
+        aaa.glass_submeshes,
+        aaa.num_textures,
+        aaa.verified_tiles,
+        aaa.raw_bytes as f64 / (1024.0 * 1024.0),
+        ratio,
+        aaa.gpu_ms
     );
     let _ = (BCPACK_SWIZZLE_GFX10_4KB_S,);
 }

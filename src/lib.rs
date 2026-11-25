@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod demo_scene;
 pub mod ffi;
+pub mod gltf_loader;
 pub mod gpu_decoder;
 pub mod meshlets;
 pub mod meshes;

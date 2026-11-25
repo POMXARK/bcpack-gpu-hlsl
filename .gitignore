@@ -1,5 +1,6 @@
 /target/
 /assets/
+/aaa_assets/
 *.log
 *.done
 *.pdb

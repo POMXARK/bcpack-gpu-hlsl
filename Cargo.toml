@@ -25,6 +25,8 @@ path = "src/bin/demo_gpu.rs"
 
 [dependencies]
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "b1c3099a3402de8b76c9263a828791bd8bc0c930", default-features = false }
+gltf = "1.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rayon = "1.10"
 png = "0.18"
 
