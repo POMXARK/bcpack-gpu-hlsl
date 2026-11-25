@@ -94,6 +94,7 @@ pub struct AaaDemoConfig {
     pub record_dir: Option<PathBuf>,
     pub record_frames: u32,
     pub record_fps: f32,
+    pub record_fullres: bool,
     pub fps_cap: u32,
     pub sim_speed: f32,
     pub show_hud: Option<bool>,
@@ -124,6 +125,7 @@ impl Default for AaaDemoConfig {
             record_dir: None,
             record_frames: 120,
             record_fps: 15.0,
+            record_fullres: false,
             fps_cap: 0,
             sim_speed: 1.0,
             show_hud: None,
@@ -2765,6 +2767,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let mut last_title = start_time;
         let mut fps_accum = 0u32;
         let mut live_fps = if wstate.vsync_enabled { 60.0f32 } else { 120.0f32 };
+        let mut ema_render_fps: f32 = 120.0;
         let mut sim_time = 0.0f32;
         let mut last_decode_ms = 0.0f64;
         let mut prev_vp_unjittered: Option<Mat4> = None;
@@ -2795,13 +2798,11 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             }
 
             let now = Instant::now();
+            let render_start = now;
             let raw_dt_ms = (now - last_frame).as_secs_f64() * 1000.0;
             const RECORD_WARMUP: u32 = 24;
             let (dt, t_sec) = if cfg.record_dir.is_some() {
                 let rfps = cfg.record_fps.max(1.0);
-                if frame_count == RECORD_WARMUP {
-                    live_fps = rfps;
-                }
                 let rec_step = frame_count.saturating_sub(RECORD_WARMUP);
                 let rec_t = (rec_step as f32) / rfps;
                 (1.0f32 / rfps, rec_t)
@@ -3495,6 +3496,20 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             ctx.signal_and_wait();
             frame_fences[slot] = 0;
+            if cfg.record_dir.is_some() {
+                let render_secs = render_start.elapsed().as_secs_f32().max(1e-4);
+                let inst_fps = (1.0 / render_secs).min(999.0);
+                if frame_count < 8 {
+                    ema_render_fps = inst_fps;
+                } else {
+                    ema_render_fps = ema_render_fps * 0.85 + inst_fps * 0.15;
+                }
+                live_fps = if wstate.fps_cap > 0 {
+                    ema_render_fps.min(wstate.fps_cap as f32)
+                } else {
+                    ema_render_fps
+                };
+            }
             if wstate.use_gpu && !taken.is_empty() {
                 last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
                 if last_decode_ms > 1e-4 {
@@ -3528,35 +3543,55 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     let rng = D3D12_RANGE { Begin: 0, End: (ss_row_pitch * SWAP_H) as usize };
                     ss_readback.Map(0, Some(&rng), Some(&mut ptr)).unwrap();
                     let raw = std::slice::from_raw_parts(ptr as *const u8, (ss_row_pitch * SWAP_H) as usize);
-                    let dw = (SWAP_W / 2) as usize;
-                    let dh = (SWAP_H / 2) as usize;
                     let pitch = ss_row_pitch as usize;
-                    let mut down = vec![0u8; dw * dh * 4];
-                    for y in 0..dh {
-                        let r0 = (y * 2) * pitch;
-                        let r1 = (y * 2 + 1) * pitch;
-                        for x in 0..dw {
-                            let c0 = x * 2 * 4;
-                            let c1 = (x * 2 + 1) * 4;
-                            let dst_o = (y * dw + x) * 4;
-                            for ch in 0..4 {
-                                let sum = raw[r0 + c0 + ch] as u32
-                                    + raw[r0 + c1 + ch] as u32
-                                    + raw[r1 + c0 + ch] as u32
-                                    + raw[r1 + c1 + ch] as u32;
-                                down[dst_o + ch] = (sum >> 2) as u8;
+                    if cfg.record_fullres {
+                        let w = SWAP_W as usize;
+                        let h = SWAP_H as usize;
+                        let mut rgb = vec![0u8; w * h * 3];
+                        for y in 0..h {
+                            let row = &raw[y * pitch..y * pitch + w * 4];
+                            let dst = &mut rgb[y * w * 3..(y + 1) * w * 3];
+                            for x in 0..w {
+                                dst[x * 3] = row[x * 4];
+                                dst[x * 3 + 1] = row[x * 4 + 1];
+                                dst[x * 3 + 2] = row[x * 4 + 2];
                             }
                         }
+                        ss_readback.Unmap(0, None);
+                        let out_path = dir.join(format!("frame_{:04}.jpg", ri));
+                        let enc_file = File::create(&out_path).expect("create record frame");
+                        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(BufWriter::new(enc_file), 92);
+                        enc.encode(&rgb, SWAP_W, SWAP_H, image::ExtendedColorType::Rgb8).unwrap();
+                    } else {
+                        let dw = (SWAP_W / 2) as usize;
+                        let dh = (SWAP_H / 2) as usize;
+                        let mut down = vec![0u8; dw * dh * 4];
+                        for y in 0..dh {
+                            let r0 = (y * 2) * pitch;
+                            let r1 = (y * 2 + 1) * pitch;
+                            for x in 0..dw {
+                                let c0 = x * 2 * 4;
+                                let c1 = (x * 2 + 1) * 4;
+                                let dst_o = (y * dw + x) * 4;
+                                for ch in 0..4 {
+                                    let sum = raw[r0 + c0 + ch] as u32
+                                        + raw[r0 + c1 + ch] as u32
+                                        + raw[r1 + c0 + ch] as u32
+                                        + raw[r1 + c1 + ch] as u32;
+                                    down[dst_o + ch] = (sum >> 2) as u8;
+                                }
+                            }
+                        }
+                        ss_readback.Unmap(0, None);
+                        let out_path = dir.join(format!("frame_{:04}.png", ri));
+                        let file = File::create(&out_path).expect("create record frame");
+                        let mut enc = png::Encoder::new(BufWriter::new(file), dw as u32, dh as u32);
+                        enc.set_color(png::ColorType::Rgba);
+                        enc.set_depth(png::BitDepth::Eight);
+                        enc.set_compression(png::Compression::Fast);
+                        let mut writer = enc.write_header().unwrap();
+                        writer.write_image_data(&down).unwrap();
                     }
-                    ss_readback.Unmap(0, None);
-                    let out_path = dir.join(format!("frame_{:04}.png", ri));
-                    let file = File::create(&out_path).expect("create record frame");
-                    let mut enc = png::Encoder::new(BufWriter::new(file), dw as u32, dh as u32);
-                    enc.set_color(png::ColorType::Rgba);
-                    enc.set_depth(png::BitDepth::Eight);
-                    enc.set_compression(png::Compression::Fast);
-                    let mut writer = enc.write_header().unwrap();
-                    writer.write_image_data(&down).unwrap();
                     if ri + 1 >= cfg.record_frames {
                         println!("[aaa-record] Saved {} frames to {}", cfg.record_frames, dir.display());
                         break;
@@ -3598,7 +3633,9 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             if (now - last_title).as_secs_f64() >= 0.35 {
                 let secs = (now - last_title).as_secs_f64();
                 let fps_val = fps_accum as f64 / secs;
-                live_fps = fps_val as f32;
+                if cfg.record_dir.is_none() {
+                    live_fps = fps_val as f32;
+                }
                 fps_accum = 0;
                 last_title = now;
                 let mode_str = if wstate.use_gpu { "GPU Async" } else { "CPU 1T" };
@@ -3657,13 +3694,14 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let n = bench_frame_ms.len().max(1);
                 bench_frame_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let avg_ms: f64 = bench_frame_ms.iter().sum::<f64>() / (n as f64);
+                let p01_ms = bench_frame_ms[((n as f64 * 0.01) as usize).min(n - 1)];
                 let p99_ms = bench_frame_ms[((n as f64 * 0.99) as usize).min(n - 1)];
                 let p999_ms = bench_frame_ms[((n as f64 * 0.999) as usize).min(n - 1)];
                 let pre_tris = meshlet_city.as_ref().map(|c| c.total_tris).unwrap_or(0);
                 let fc = frame_count.max(1) as f64;
                 println!("=== BCPack AAA Benchmark v0.8.0 Summary ({:.1}s sim, {}x{}) ===", t_sec, render_w, render_h);
-                println!("  Frames: {} | Average FPS: {:.2} ({:.2} ms) | 1% Low: {:.2} FPS ({:.2} ms) | 0.1% Low: {:.2} FPS ({:.2} ms)",
-                    frame_count, 1000.0 / avg_ms.max(0.01), avg_ms, 1000.0 / p99_ms.max(0.01), p99_ms, 1000.0 / p999_ms.max(0.01), p999_ms);
+                println!("  Frames: {} | Average FPS: {:.2} ({:.2} ms) | Peak (1% High): {:.2} FPS ({:.2} ms) | 1% Low: {:.2} FPS ({:.2} ms) | 0.1% Low: {:.2} FPS ({:.2} ms)",
+                    frame_count, 1000.0 / avg_ms.max(0.01), avg_ms, 1000.0 / p01_ms.max(0.01), p01_ms, 1000.0 / p99_ms.max(0.01), p99_ms, 1000.0 / p999_ms.max(0.01), p999_ms);
                 println!("  GPU BCPack Peak Throughput (Live 64K BC7/BC5 Tiles): {:.2} GB/s", bench_peak_gbps);
                 println!("  SFS VRAM Residency: {:.1}/{:.1} MiB (Saved {:.1} MiB, Evictions={}, FullMip0={}/{})",
                     cur_mib, tot_mib, saved_mib, residency.total_evictions, residency.num_mip0_full(), pack.textures.len());

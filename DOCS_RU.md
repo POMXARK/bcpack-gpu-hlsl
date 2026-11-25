@@ -1,7 +1,18 @@
-# bcpack-gpu-hlsl v0.10.0 — Zero-Copy C-ABI, Vulkan 1.3 SPIR-V и 4K AAA-бенчмарк (150.6 FPS, 19/19 PASS)
+# bcpack-gpu-hlsl v0.10.0 — Zero-Copy C-ABI, Vulkan 1.3 SPIR-V и 4K AAA-бенчмарк (> 400 FPS без лимита, 19/19 PASS)
 
-![Живой высококадровый прогон v0.10.0 AAA-бенчмарка (50 FPS GIF / 60 FPS исходник + HUD-ползунки FPS и Sim Speed)](media/aaa_benchmark_60fps.gif)
-- **Видео 60.0 FPS (MP4 `960×540`):** [`media/aaa_benchmark_60fps.mp4`](media/aaa_benchmark_60fps.mp4) | **Обзор 3 актов:** [`media/aaa_showcase_v8.gif`](media/aaa_showcase_v8.gif)
+![Живой 4-режимный прогон v0.10.0 AAA-бенчмарка (60 / 120 / 240 / Unlimited MAX на RTX 5080)](media/aaa_benchmark_4modes.gif)
+- **Full HD (`1920×1080`) видео:** [`60 FPS MP4`](media/aaa_benchmark_60fps.mp4) | [`120 FPS MP4`](media/aaa_benchmark_120fps.mp4) | [`240 FPS MP4`](media/aaa_benchmark_240fps.mp4) | [`Без лимита (MAX) MP4`](media/aaa_benchmark_unlimited.mp4) | [`Обзор 3 актов`](media/aaa_showcase_v8.gif)
+
+> **Важно про лимит FPS:** режимы `60 / 120 / 240 FPS` в роликах и HUD — это **искусственные ограничители (`--fps-cap`)**, а **не максимум производительности**. Без лимита на NVIDIA GeForce RTX 5080 (`1920×1080` HDR) конвейер выдаёт **`163.30 FPS Avg` (пик `250.96 FPS`)** с полным **DXR 1.1 + RTGI + 12.41M городом + 500 NPC**, **`231.62 FPS Avg` (пик `361.79 FPS`)** в растеризации с полным **12.41M городом + 500 NPC**, и **`452.01 FPS Avg` (пик `708.27 FPS`, т.е. > 400 FPS)** в базовом профиле потокового **4K BC7/BC5 SFS** (`--no-rt --no-rtgi --no-city --no-crowd`).
+
+| Пресет (`1920×1080` HDR, RTX 5080) | Активный конвейер | Средний FPS | Пик (`1% High`) | `1% Low` | SFS VRAM |
+|---|---|---:|---:|---:|---:|
+| **60 FPS Cap** | Full AAA + DXR 1.1 + RTGI + 12.41M город + 500 NPC | `58.31 FPS` | `60.00 FPS` | `34.77 FPS` | `86.2 / 204.7 MiB` |
+| **120 FPS Cap** | Full AAA + DXR 1.1 + RTGI + 12.41M город + 500 NPC | `111.00 FPS` | `119.98 FPS` | `41.05 FPS` | `86.2 / 204.7 MiB` |
+| **240 FPS Cap** (`--no-rt --no-rtgi`) | Растеризация + 12.41M город + 500 NPC + 4K SFS | `204.43 FPS` | `239.92 FPS` | `69.07 FPS` | `86.2 / 204.7 MiB` |
+| **Без лимита (`MAX`, Full DXR 1.1)** | Full AAA + DXR 1.1 + RTGI + 12.41M город + 500 NPC | **`163.30 FPS`** | **`250.96 FPS`** | `49.07 FPS` | `86.2 / 204.7 MiB` |
+| **Без лимита (`MAX`, Растеризация + город)** | Растеризация + 12.41M город + 500 NPC + 4K SFS | **`231.62 FPS`** | **`361.79 FPS`** | `141.80 FPS` | `86.2 / 204.7 MiB` |
+| **Без лимита (`MAX`, Core 4K SFS > 400 FPS)** | Стриминг 4K BC7/BC5 + SFS + Hero PBR + TAA/AgX | **`452.01 FPS`** | **`708.27 FPS`** | `212.65 FPS` | `54.2 / 204.7 MiB` |
 
 ![Скриншот v0.8.0: 4K BC7/BC5 + модульные фасады Mesh Shaders (12.41M трис) + 500 NPC + DXR 1.1 + TAA + AgX](media/aaa_showcase_v8.png)
 

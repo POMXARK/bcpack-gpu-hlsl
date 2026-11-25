@@ -46,8 +46,19 @@
 
 ## Open AAA Benchmark (`v0.10.0` — 4K BC7/BC5 + Active SFS + 12.41M Mesh-Shader City + 500 NPCs + DXR 1.1 + TAA)
 
-![v0.10.0 High-FPS Live AAA Benchmark (50 FPS GIF / 60 FPS Source + Interactive HUD Sliders)](media/aaa_benchmark_60fps.gif)
-- **True 60.0 FPS (`960×540` MP4) Capture:** [`media/aaa_benchmark_60fps.mp4`](media/aaa_benchmark_60fps.mp4) | **3-Act 8s Overview GIF:** [`media/aaa_showcase_v8.gif`](media/aaa_showcase_v8.gif)
+![v0.10.0 4-Mode AAA Benchmark Showcase (60 / 120 / 240 / Unlimited MAX > 400 FPS on RTX 5080)](media/aaa_benchmark_4modes.gif)
+- **Full HD (`1920×1080`) Captures:** [`60 FPS MP4`](media/aaa_benchmark_60fps.mp4) | [`120 FPS MP4`](media/aaa_benchmark_120fps.mp4) | [`240 FPS MP4`](media/aaa_benchmark_240fps.mp4) | [`Unlimited (MAX) MP4`](media/aaa_benchmark_unlimited.mp4) | [`3-Act 8s Overview GIF`](media/aaa_showcase_v8.gif)
+
+> **Important Throughput Note:** `60 / 120 / 240 FPS` above are **display/capture cap presets** (`--fps-cap` / HUD slider)—**NOT** the hardware limit. Uncapped on NVIDIA GeForce RTX 5080 (`1920×1080` native HDR), the benchmark runs at **`163.30 FPS Avg` (`250.96 FPS Peak`)** with full **DXR 1.1 + RTGI + 12.41M City + 500 NPCs**, **`231.62 FPS Avg` (`361.79 FPS Peak`)** with the full **12.41M Mesh-Shader City + 500 NPCs** raster pipeline (`--no-rt --no-rtgi`), and **`452.01 FPS Avg` (`708.27 FPS Peak`)** (`> 400 FPS`) in core **4K BC7/BC5 SFS** streaming (`--no-rt --no-rtgi --no-city --no-crowd`).
+
+| Benchmark Preset (`1920×1080` Native HDR, RTX 5080) | Pipeline Active | Average FPS | Peak (`1% High`) | `1% Low` | SFS VRAM Used / Saved |
+|---|---|---:|---:|---:|---:|
+| **60 FPS Cap** (`--fps-cap 60`) | Full AAA + DXR 1.1 + RTGI + 12.41M City + 500 NPCs | `58.31 FPS` | `60.00 FPS` | `34.77 FPS` | `86.2 / 204.7 MiB` (`-118.5 MiB`) |
+| **120 FPS Cap** (`--fps-cap 120`) | Full AAA + DXR 1.1 + RTGI + 12.41M City + 500 NPCs | `111.00 FPS` | `119.98 FPS` | `41.05 FPS` | `86.2 / 204.7 MiB` (`-118.5 MiB`) |
+| **240 FPS Cap** (`--no-rt --no-rtgi --fps-cap 240`) | Raster AAA + 12.41M Mesh-Shader City + 500 NPCs + 4K SFS | `204.43 FPS` | `239.92 FPS` | `69.07 FPS` | `86.2 / 204.7 MiB` (`-118.5 MiB`) |
+| **Unlimited (`MAX`, Full DXR 1.1)** (`--no-vsync --fps-cap 0`) | Full AAA + DXR 1.1 + RTGI + 12.41M City + 500 NPCs | **`163.30 FPS`** | **`250.96 FPS`** | `49.07 FPS` | `86.2 / 204.7 MiB` (`-118.5 MiB`) |
+| **Unlimited (`MAX`, Raster City)** (`--no-vsync --no-rt --no-rtgi`) | Raster AAA + 12.41M Mesh-Shader City + 500 NPCs + 4K SFS | **`231.62 FPS`** | **`361.79 FPS`** | `141.80 FPS` | `86.2 / 204.7 MiB` (`-118.5 MiB`) |
+| **Unlimited (`MAX`, Core 4K SFS >400 FPS)** (`--no-rt --no-rtgi --no-city --no-crowd`) | 4K BC7/BC5 Tile Streaming + Active SFS + Hero PBR + TAA/AgX | **`452.01 FPS`** | **`708.27 FPS`** | `212.65 FPS` | `54.2 / 204.7 MiB` (`-150.5 MiB`) |
 
 ![v0.8.0 Cinematic AAA Benchmark: 4K BC7/BC5 + Modular Mesh-Shader City + 500 GPU-Skinned NPCs + DXR 1.1 + AgX + TAA](media/aaa_showcase_v8.png)
 
