@@ -1,7 +1,7 @@
 use crate::assets::{TILE_BC1_BYTES, TILE_BLOCKS};
 use crate::gltf_loader::{
-    find_aaa_assets_dir, load_glb_as_bcpack, load_hdr_fp16, load_png_as_bcpack, BcpackTexture2D,
-    LoadedGlbModel, PbrSubmesh, PbrVertex,
+    find_aaa_assets_dir, load_glb_as_bcpack, load_hdr_fp16, load_png_as_bcpack, BcpackMipChunk,
+    BcpackTexture2D, LoadedGlbModel, PbrSubmesh, PbrVertex,
 };
 use crate::gpu_decoder::{
     cmd_barriers, create_committed_buffer, dump_d3d12_info_queue, heap_props, pack_batch,
@@ -48,6 +48,8 @@ pub const AAA_COMP_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_ps.dxil"
 
 const WIN_W: u32 = 1280;
 const WIN_H: u32 = 720;
+const SWAP_W: u32 = 1920;
+const SWAP_H: u32 = 1080;
 const TEX_SLOT_CAP: usize = 32;
 const SRV_TABLE_STRIDE: usize = 35; // t0..t31 textures, t32 envHdr, t33 tlas, t34 instColors
 const MAX_BATCH_TILES: usize = 256;
@@ -965,6 +967,8 @@ impl AaaPostPipeline {
         device.CreateShaderResourceView(&direct_hdr, Some(&srv_desc), cpu_at(81));
         device.CreateShaderResourceView(&denoise_b, Some(&srv_desc), cpu_at(82));
         device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(83));
+        device.CreateShaderResourceView(&denoise_b, Some(&srv_desc), cpu_at(84));
+        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(85));
 
         // Denoise root sig (CB b0 + SRV range(2) t0..t1 + UAV range(1) u0)
         let d_srv_rng = D3D12_DESCRIPTOR_RANGE {
@@ -1184,12 +1188,14 @@ impl AaaPostPipeline {
 
         cmd.SetDescriptorHeaps(&[Some(main_srv_heap.clone())]);
 
-        // 1. 2-Pass A-Trous Bilateral Denoiser for 1-spp Diffuse RTGI
+        // 1. 4-Pass A-Trous Bilateral Denoiser (step = 1, 2, 4, 8) for 2-spp Diffuse RTGI
         if rtgi_enabled {
             let gx = self.width.div_ceil(8);
             let gy = self.height.div_ceil(8);
             cmd.SetComputeRootSignature(&self.denoise_root_sig);
             cmd.SetPipelineState(&self.denoise_pso);
+
+            // Pass 1 (step=1): raw_rtgi(70) -> denoise_a(74)
             cmd_barriers(cmd, vec![transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
             let c1 = [self.width, self.height, 1u32, 0u32];
             cmd.SetComputeRoot32BitConstants(0, 4, c1.as_ptr() as *const c_void, 0);
@@ -1197,6 +1203,7 @@ impl AaaPostPipeline {
             cmd.SetComputeRootDescriptorTable(2, gpu_at(74));
             cmd.Dispatch(gx, gy, 1);
 
+            // Pass 2 (step=2): denoise_a(72) -> denoise_b(75)
             cmd_barriers(
                 cmd,
                 vec![
@@ -1207,6 +1214,36 @@ impl AaaPostPipeline {
             );
             let c2 = [self.width, self.height, 2u32, 0u32];
             cmd.SetComputeRoot32BitConstants(0, 4, c2.as_ptr() as *const c_void, 0);
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(72));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(75));
+            cmd.Dispatch(gx, gy, 1);
+
+            // Pass 3 (step=4): denoise_b(84) -> denoise_a(74)
+            cmd_barriers(
+                cmd,
+                vec![
+                    uav_barrier(&self.denoise_b),
+                    transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                ],
+            );
+            let c3 = [self.width, self.height, 4u32, 0u32];
+            cmd.SetComputeRoot32BitConstants(0, 4, c3.as_ptr() as *const c_void, 0);
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(84));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(74));
+            cmd.Dispatch(gx, gy, 1);
+
+            // Pass 4 (step=8): denoise_a(72) -> denoise_b(75)
+            cmd_barriers(
+                cmd,
+                vec![
+                    uav_barrier(&self.denoise_a),
+                    transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                ],
+            );
+            let c4 = [self.width, self.height, 8u32, 0u32];
+            cmd.SetComputeRoot32BitConstants(0, 4, c4.as_ptr() as *const c_void, 0);
             cmd.SetComputeRootDescriptorTable(1, gpu_at(72));
             cmd.SetComputeRootDescriptorTable(2, gpu_at(75));
             cmd.Dispatch(gx, gy, 1);
@@ -1463,8 +1500,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let _ = ShowWindow(hwnd, SW_SHOW);
 
         let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: WIN_W,
-            Height: WIN_H,
+            Width: SWAP_W,
+            Height: SWAP_H,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             Stereo: false.into(),
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
@@ -1521,7 +1558,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             backbuffers.push(bb);
         }
 
-        let (render_w, render_h) = if cfg.render_1440p { (2560u32, 1440u32) } else { (WIN_W, WIN_H) };
+        let (render_w, render_h) = if cfg.render_1440p { (2560u32, 1440u32) } else { (SWAP_W, SWAP_H) };
         let depth_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: render_w as u64,
@@ -1582,7 +1619,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let vb_def = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, vb_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
         let ib_def = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, ib_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-        // Live 23 PBR BC1 Textures + 1 Dummy Fallback + 1 FP16 HDRI Texture
+        // Live 23 PBR BC1 Textures with Console-Native Full Mipmap Chains + 1 Dummy Fallback + 1 FP16 HDRI Texture
         let mut pbr_textures = Vec::with_capacity(pack.textures.len());
         for t in &pack.textures {
             let desc = D3D12_RESOURCE_DESC {
@@ -1590,7 +1627,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 Width: t.width as u64,
                 Height: t.height,
                 DepthOrArraySize: 1,
-                MipLevels: 1,
+                MipLevels: t.mip_levels as u16,
                 Format: DXGI_FORMAT_BC1_UNORM,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
@@ -1712,6 +1749,9 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         ctx.queue.ExecuteCommandLists(&exec);
         ctx.signal_and_wait();
 
+        // Decode & upload Console Mip 1..Tail (incl. Packed Mip Tail 32..4) across all 23 PBR textures via Async Compute
+        decode_and_upload_lower_mips(&mut ctx, &mut gpu_dec, &pack.textures, &pbr_textures);
+
         let dxr = AaaDxrScene::new(
             &mut ctx,
             &vb_def,
@@ -1743,7 +1783,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                         ..Default::default()
                     };
-                    sd.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+                    sd.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                        MipLevels: pack.textures[i].mip_levels,
+                        ..Default::default()
+                    };
                     ctx.device.CreateShaderResourceView(&pbr_textures[i], Some(&sd), cpu_at(base + i));
                 } else {
                     let mut sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -2003,11 +2046,11 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let mut cpu_scratch = vec![0u8; MAX_BATCH_TILES * TILE_BC1_BYTES];
 
         // Screenshot readback
-        let ss_row_pitch = (WIN_W * 4).div_ceil(256) * 256;
+        let ss_row_pitch = (SWAP_W * 4).div_ceil(256) * 256;
         let ss_readback = create_committed_buffer(
             &ctx.device,
             D3D12_HEAP_TYPE_READBACK,
-            (ss_row_pitch * WIN_H) as u64,
+            (ss_row_pitch * SWAP_H) as u64,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
@@ -2463,8 +2506,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 cmd,
                 &main_srv_heap,
                 bb_rtv,
-                WIN_W,
-                WIN_H,
+                SWAP_W,
+                SWAP_H,
                 wstate.rtgi_enabled,
                 t_sec,
             );
@@ -2480,8 +2523,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                                Width: WIN_W,
-                                Height: WIN_H,
+                                Width: SWAP_W,
+                                Height: SWAP_H,
                                 Depth: 1,
                                 RowPitch: ss_row_pitch,
                             },
@@ -2527,11 +2570,11 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             if take_shot {
                 let out_path = cfg.screenshot_path.as_ref().unwrap();
                 let mut ptr: *mut c_void = std::ptr::null_mut();
-                let rng = D3D12_RANGE { Begin: 0, End: (ss_row_pitch * WIN_H) as usize };
+                let rng = D3D12_RANGE { Begin: 0, End: (ss_row_pitch * SWAP_H) as usize };
                 ss_readback.Map(0, Some(&rng), Some(&mut ptr)).unwrap();
-                let raw = std::slice::from_raw_parts(ptr as *const u8, (ss_row_pitch * WIN_H) as usize);
+                let raw = std::slice::from_raw_parts(ptr as *const u8, (ss_row_pitch * SWAP_H) as usize);
                 let file = File::create(out_path).expect("create screenshot");
-                let mut enc = png::Encoder::new(BufWriter::new(file), WIN_W, WIN_H);
+                let mut enc = png::Encoder::new(BufWriter::new(file), SWAP_W, SWAP_H);
                 enc.set_color(png::ColorType::Rgba);
                 enc.set_depth(png::BitDepth::Eight);
                 let mut writer = enc.write_header().unwrap();
@@ -2540,8 +2583,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 println!(
                     "[aaa-screenshot] Saved {} ({}x{}, resident={}/{} tiles, xray={})",
                     out_path.display(),
-                    WIN_W,
-                    WIN_H,
+                    SWAP_W,
+                    SWAP_H,
                     residency.total_resident(),
                     residency.total_tiles(),
                     wstate.xray_enabled
@@ -2691,4 +2734,182 @@ unsafe fn draw_static_mesh(
     };
     cmd.SetGraphicsRoot32BitConstants(0, (size_of::<AaaDrawCB>() / 4) as u32, &cb as *const AaaDrawCB as *const c_void, 0);
     cmd.DrawIndexedInstanced(idx_count, 1, idx_offset, base_vert as i32, 0);
+}
+
+struct StagedMipSlice {
+    tex_idx: usize,
+    mip_level: u32,
+    width: u32,
+    height: u32,
+    dst_y: u32,
+    row_pitch: u32,
+    offset: u64,
+}
+
+unsafe fn decode_and_upload_lower_mips(
+    ctx: &mut GpuContext,
+    gpu_dec: &mut BcpackGpuDecoder,
+    textures: &[BcpackTexture2D],
+    pbr_textures: &[ID3D12Resource],
+) {
+    let mut items: Vec<(usize, &BcpackMipChunk)> = Vec::new();
+    for (ti, tex) in textures.iter().enumerate() {
+        for mc in &tex.lower_mips {
+            items.push((ti, mc));
+        }
+    }
+    if items.is_empty() {
+        return;
+    }
+
+    let mut staging: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
+    let mut slices: Vec<StagedMipSlice> = Vec::with_capacity(items.len() + textures.len() * 4);
+
+    let push_slice = |staging: &mut Vec<u8>,
+                      slices: &mut Vec<StagedMipSlice>,
+                      tex_idx: usize,
+                      mip_level: u32,
+                      w: u32,
+                      h: u32,
+                      dst_y: u32,
+                      bc1_sub: &[u8]| {
+        let blocks_x = (w / 4).max(1) as usize;
+        let blocks_y = (h / 4).max(1) as usize;
+        let row_bytes = blocks_x * 8;
+        let aligned_pitch = row_bytes.div_ceil(256) * 256;
+        let aligned_off = staging.len().div_ceil(512) * 512;
+        staging.resize(aligned_off + aligned_pitch * blocks_y, 0);
+        for row in 0..blocks_y {
+            let src_start = row * row_bytes;
+            let dst_start = aligned_off + row * aligned_pitch;
+            staging[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&bc1_sub[src_start..src_start + row_bytes]);
+        }
+        slices.push(StagedMipSlice {
+            tex_idx,
+            mip_level,
+            width: w,
+            height: h,
+            dst_y,
+            row_pitch: aligned_pitch as u32,
+            offset: aligned_off as u64,
+        });
+    };
+
+    for chunk in items.chunks(MAX_BATCH_TILES) {
+        let batch = pack_batch(chunk.iter().map(|(_, mc)| (mc.bcpack.as_slice(), mc.blocks)));
+        let (decoded, statuses, _kms, _tms) = gpu_dec.decode_batch_and_readback(ctx, &batch);
+        let mut block_off = 0usize;
+        for (ci, &(tex_idx, mc)) in chunk.iter().enumerate() {
+            assert_eq!(
+                statuses[ci].code, 0,
+                "GPU lower-mip decode error tex={tex_idx} mip={}: {:?}",
+                mc.mip_level, statuses[ci]
+            );
+            let chunk_bc1 = &decoded[block_off * 8..(block_off + mc.blocks) * 8];
+            block_off += mc.blocks;
+
+            if !mc.is_packed_tail {
+                push_slice(
+                    &mut staging,
+                    &mut slices,
+                    tex_idx,
+                    mc.mip_level,
+                    mc.dim,
+                    mc.strip_h,
+                    mc.strip_y,
+                    chunk_bc1,
+                );
+            } else {
+                // Expand Packed Mip Tail (32x32 + 16x16 + 8x8 + 4x4) into individual DX12 subresources
+                let mut cur_dim = mc.dim;
+                let mut cur_mip = mc.mip_level;
+                let mut src_off = 0usize;
+                loop {
+                    let blocks_side = (cur_dim / 4).max(1) as usize;
+                    let sub_bytes = blocks_side * blocks_side * 8;
+                    push_slice(
+                        &mut staging,
+                        &mut slices,
+                        tex_idx,
+                        cur_mip,
+                        cur_dim,
+                        cur_dim,
+                        0,
+                        &chunk_bc1[src_off..src_off + sub_bytes],
+                    );
+                    src_off += sub_bytes;
+                    if cur_dim <= 4 {
+                        break;
+                    }
+                    cur_dim /= 2;
+                    cur_mip += 1;
+                }
+            }
+        }
+    }
+
+    let up_buf = create_committed_buffer(
+        &ctx.device,
+        D3D12_HEAP_TYPE_UPLOAD,
+        staging.len().max(512) as u64,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+    );
+    upload_slice(&up_buf, &staging);
+
+    let mip_alloc: ID3D12CommandAllocator = ctx
+        .device
+        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+        .unwrap();
+    let mip_cmd: ID3D12GraphicsCommandList = ctx
+        .device
+        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &mip_alloc, None)
+        .unwrap();
+
+    let to_dst: Vec<_> = pbr_textures
+        .iter()
+        .map(|res| transition_barrier(res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST))
+        .collect();
+    cmd_barriers(&mip_cmd, to_dst);
+
+    for sl in &slices {
+        let mut dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(pbr_textures[sl.tex_idx].clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: sl.mip_level,
+            },
+        };
+        let mut src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(up_buf.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: sl.offset,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_BC1_UNORM,
+                        Width: sl.width,
+                        Height: sl.height,
+                        Depth: 1,
+                        RowPitch: sl.row_pitch,
+                    },
+                },
+            },
+        };
+        mip_cmd.CopyTextureRegion(&dst, 0, sl.dst_y, 0, &src, None);
+        let _ = ManuallyDrop::take(&mut dst.pResource);
+        let _ = ManuallyDrop::take(&mut src.pResource);
+    }
+
+    let to_srv: Vec<_> = pbr_textures
+        .iter()
+        .map(|res| transition_barrier(res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+        .collect();
+    cmd_barriers(&mip_cmd, to_srv);
+
+    mip_cmd.Close().unwrap();
+    let exec = [Some(mip_cmd.cast::<ID3D12CommandList>().unwrap())];
+    ctx.queue.ExecuteCommandLists(&exec);
+    ctx.signal_and_wait();
 }

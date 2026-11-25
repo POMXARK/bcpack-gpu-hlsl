@@ -1,5 +1,6 @@
 use crate::assets::{
-    compress_rgba_dims_to_bc1, encode_bc1_to_bcpack, TILE_BC1_BYTES, TILE_BLOCKS,
+    compress_rgba_dims_to_bc1, downsample_rgba_box2, encode_bc1_to_bcpack, TILE_BC1_BYTES,
+    TILE_BLOCKS,
 };
 use crate::gpu_decoder::{pack_batch, BcpackGpuDecoder, GpuContext};
 use bcpack::bc1::{QuadTable, Window};
@@ -36,14 +37,27 @@ pub struct PbrSubmesh {
     pub emissive_tex: Option<usize>,
 }
 
+pub struct BcpackMipChunk {
+    pub mip_level: u32,
+    pub dim: u32,
+    pub strip_y: u32,
+    pub strip_h: u32,
+    pub is_packed_tail: bool,
+    pub blocks: usize,
+    pub bcpack: Vec<u8>,
+    pub expected_bc1: Vec<u8>,
+}
+
 pub struct BcpackTexture2D {
     pub name: String,
     pub width: u32,
     pub height: u32,
     pub strip_height: u32,
     pub num_strips: usize,
+    pub mip_levels: u32,
     pub bcpack_tiles: Vec<Vec<u8>>,
     pub expected_bc1: Vec<u8>,
+    pub lower_mips: Vec<BcpackMipChunk>,
 }
 
 pub struct LoadedGlbModel {
@@ -194,15 +208,17 @@ fn snap_pow2_dim(w: u32, h: u32) -> u32 {
 fn try_read_cache(cache_path: &Path, name: &str) -> Option<BcpackTexture2D> {
     let f = File::open(cache_path).ok()?;
     let mut r = BufReader::new(f);
-    let mut hdr = [0u8; 20];
+    let mut hdr = [0u8; 28];
     r.read_exact(&mut hdr).ok()?;
-    if &hdr[0..4] != b"BCPT" {
+    if &hdr[0..4] != b"BCPM" {
         return None;
     }
     let width = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
     let height = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
     let strip_height = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
     let num_strips = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
+    let mip_levels = u32::from_le_bytes(hdr[20..24].try_into().unwrap());
+    let num_lower = u32::from_le_bytes(hdr[24..28].try_into().unwrap()) as usize;
 
     let mut expected_bc1 = vec![0u8; num_strips * TILE_BC1_BYTES];
     r.read_exact(&mut expected_bc1).ok()?;
@@ -215,14 +231,45 @@ fn try_read_cache(cache_path: &Path, name: &str) -> Option<BcpackTexture2D> {
         r.read_exact(&mut t).ok()?;
         bcpack_tiles.push(t);
     }
+
+    let mut lower_mips = Vec::with_capacity(num_lower);
+    let mut m_hdr = [0u8; 32];
+    for _ in 0..num_lower {
+        r.read_exact(&mut m_hdr).ok()?;
+        let mip_level = u32::from_le_bytes(m_hdr[0..4].try_into().unwrap());
+        let dim = u32::from_le_bytes(m_hdr[4..8].try_into().unwrap());
+        let strip_y = u32::from_le_bytes(m_hdr[8..12].try_into().unwrap());
+        let strip_h = u32::from_le_bytes(m_hdr[12..16].try_into().unwrap());
+        let is_packed_tail = u32::from_le_bytes(m_hdr[16..20].try_into().unwrap()) != 0;
+        let blocks = u32::from_le_bytes(m_hdr[20..24].try_into().unwrap()) as usize;
+        let exp_len = u32::from_le_bytes(m_hdr[24..28].try_into().unwrap()) as usize;
+        let comp_len = u32::from_le_bytes(m_hdr[28..32].try_into().unwrap()) as usize;
+        let mut exp_buf = vec![0u8; exp_len];
+        let mut comp_buf = vec![0u8; comp_len];
+        r.read_exact(&mut exp_buf).ok()?;
+        r.read_exact(&mut comp_buf).ok()?;
+        lower_mips.push(BcpackMipChunk {
+            mip_level,
+            dim,
+            strip_y,
+            strip_h,
+            is_packed_tail,
+            blocks,
+            bcpack: comp_buf,
+            expected_bc1: exp_buf,
+        });
+    }
+
     Some(BcpackTexture2D {
         name: name.to_string(),
         width,
         height,
         strip_height,
         num_strips,
+        mip_levels,
         bcpack_tiles,
         expected_bc1,
+        lower_mips,
     })
 }
 
@@ -232,15 +279,29 @@ fn write_cache(cache_path: &Path, tex: &BcpackTexture2D) {
     }
     if let Ok(f) = File::create(cache_path) {
         let mut w = BufWriter::new(f);
-        let _ = w.write_all(b"BCPT");
+        let _ = w.write_all(b"BCPM");
         let _ = w.write_all(&tex.width.to_le_bytes());
         let _ = w.write_all(&tex.height.to_le_bytes());
         let _ = w.write_all(&tex.strip_height.to_le_bytes());
         let _ = w.write_all(&(tex.num_strips as u32).to_le_bytes());
+        let _ = w.write_all(&tex.mip_levels.to_le_bytes());
+        let _ = w.write_all(&(tex.lower_mips.len() as u32).to_le_bytes());
         let _ = w.write_all(&tex.expected_bc1);
         for t in &tex.bcpack_tiles {
             let _ = w.write_all(&(t.len() as u32).to_le_bytes());
             let _ = w.write_all(t);
+        }
+        for mc in &tex.lower_mips {
+            let _ = w.write_all(&mc.mip_level.to_le_bytes());
+            let _ = w.write_all(&mc.dim.to_le_bytes());
+            let _ = w.write_all(&mc.strip_y.to_le_bytes());
+            let _ = w.write_all(&mc.strip_h.to_le_bytes());
+            let _ = w.write_all(&(if mc.is_packed_tail { 1u32 } else { 0u32 }).to_le_bytes());
+            let _ = w.write_all(&(mc.blocks as u32).to_le_bytes());
+            let _ = w.write_all(&(mc.expected_bc1.len() as u32).to_le_bytes());
+            let _ = w.write_all(&(mc.bcpack.len() as u32).to_le_bytes());
+            let _ = w.write_all(&mc.expected_bc1);
+            let _ = w.write_all(&mc.bcpack);
         }
         let _ = w.flush();
     }
@@ -297,14 +358,82 @@ pub fn encode_rgba_as_bcpack_2d(
         bcpack_tiles.push(bcpack);
     }
 
+    // Generate console-native full mipmap chain (Mip 1..64 as major mips + Packed Mip Tail 32..4)
+    let mut lower_mips = Vec::new();
+    let mut cur_rgba = downsample_rgba_box2(raw, dim as usize, dim as usize);
+    let mut cur_dim = dim / 2;
+    let mut mip_idx = 1u32;
+
+    while cur_dim >= 64 {
+        let strips_for_mip = if cur_dim >= 512 {
+            let m_strip_h = ((TILE_BLOCKS as u32 * 16) / cur_dim).min(cur_dim);
+            (cur_dim / m_strip_h) as usize
+        } else {
+            1usize
+        };
+        let m_strip_h = cur_dim / strips_for_mip as u32;
+        let strip_bytes = (cur_dim * m_strip_h * 4) as usize;
+        let mip_chunks: Vec<BcpackMipChunk> = (0..strips_for_mip)
+            .into_par_iter()
+            .map(|s| {
+                let slice = &cur_rgba[s * strip_bytes..(s + 1) * strip_bytes];
+                let bc1 = compress_rgba_dims_to_bc1(slice, cur_dim as usize, m_strip_h as usize);
+                let bcpack = encode_bc1_to_bcpack(&bc1, window, quads);
+                BcpackMipChunk {
+                    mip_level: mip_idx,
+                    dim: cur_dim,
+                    strip_y: (s as u32) * m_strip_h,
+                    strip_h: m_strip_h,
+                    is_packed_tail: false,
+                    blocks: bc1.len() / 8,
+                    bcpack,
+                    expected_bc1: bc1,
+                }
+            })
+            .collect();
+        lower_mips.extend(mip_chunks);
+
+        cur_rgba = downsample_rgba_box2(&cur_rgba, cur_dim as usize, cur_dim as usize);
+        cur_dim /= 2;
+        mip_idx += 1;
+    }
+
+    // Packed Mip Tail: 32x32 + 16x16 + 8x8 + 4x4 = 85 blocks in a single .bcpack chunk
+    let tail_base_mip = mip_idx;
+    let tail_base_dim = cur_dim;
+    let mut tail_bc1 = Vec::with_capacity(85 * 8);
+    loop {
+        let bc1 = compress_rgba_dims_to_bc1(&cur_rgba, cur_dim as usize, cur_dim as usize);
+        tail_bc1.extend_from_slice(&bc1);
+        mip_idx += 1;
+        if cur_dim <= 4 {
+            break;
+        }
+        cur_rgba = downsample_rgba_box2(&cur_rgba, cur_dim as usize, cur_dim as usize);
+        cur_dim /= 2;
+    }
+    let tail_bcpack = encode_bc1_to_bcpack(&tail_bc1, window, quads);
+    lower_mips.push(BcpackMipChunk {
+        mip_level: tail_base_mip,
+        dim: tail_base_dim,
+        strip_y: 0,
+        strip_h: tail_base_dim,
+        is_packed_tail: true,
+        blocks: tail_bc1.len() / 8,
+        bcpack: tail_bcpack,
+        expected_bc1: tail_bc1,
+    });
+
     let tex = BcpackTexture2D {
         name: name.to_string(),
         width: dim,
         height: dim,
         strip_height: strip_h,
         num_strips,
+        mip_levels: mip_idx,
         bcpack_tiles,
         expected_bc1,
+        lower_mips,
     };
     if let Some(cp) = cache_path {
         write_cache(cp, &tex);
@@ -706,6 +835,30 @@ pub fn run_aaa_2k_bcpack_verify(
         comp_bytes += c;
         raw_bytes += r;
         gpu_ms += ms;
+
+        // Also bit-exact verify full console mipmap chain + Packed Mip Tail (1024 -> 32..4)
+        let mip_batch = pack_batch(
+            asphalt_2k
+                .lower_mips
+                .iter()
+                .map(|m| (m.bcpack.as_slice(), m.blocks)),
+        );
+        let (mip_gpu_out, mip_sts, mip_ms, _) = gpu_dec.decode_batch_and_readback(ctx, &mip_batch);
+        let mut m_off = 0usize;
+        for (mi, chunk) in asphalt_2k.lower_mips.iter().enumerate() {
+            assert_eq!(mip_sts[mi].code, 0, "GPU status error on asphalt mip chunk {mi}");
+            let len = chunk.blocks * 8;
+            let got = &mip_gpu_out[m_off..m_off + len];
+            assert_eq!(got, chunk.expected_bc1.as_slice(), "FAIL asphalt mip chunk {mi}");
+            m_off += len;
+        }
+        gpu_ms += mip_ms;
+        println!(
+            "  [aaa-mips] Verified {} lower-mip chunks + Packed Mip Tail ({} mip levels, GPU={:.3} ms, 0 mismatches)",
+            asphalt_2k.lower_mips.len(),
+            asphalt_2k.mip_levels,
+            mip_ms
+        );
 
         for t in &glb.textures {
             let (c, r, ms) = verify_tex_tiles(ctx, gpu_dec, t);

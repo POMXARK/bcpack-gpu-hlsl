@@ -701,7 +701,7 @@ pub fn swizzle_gfx10_cpu(
     swizzled
 }
 
-fn downsample_rgba_box2(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+pub fn downsample_rgba_box2(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     let nw = (w / 2).max(4);
     let nh = (h / 2).max(4);
     let mut dst = vec![0u8; nw * nh * 4];

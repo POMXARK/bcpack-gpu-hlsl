@@ -140,13 +140,7 @@ float noise2(float2 p) {
     return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
 }
 
-float3 trace_diffuse_rtgi(float3 worldPos, float3 N, float2 screenXY) {
-    float3 upVec = (abs(N.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
-    float3 T = normalize(cross(upVec, N));
-    float3 B = cross(N, T);
-    float f = floor(g_EmissiveTime.w * 60.0);
-    float r1 = ign(screenXY, f);
-    float r2 = ign(screenXY + float2(17.0, 31.0), f);
+float3 sample_rtgi_ray(float3 worldPos, float3 N, float3 T, float3 B, float r1, float r2) {
     float phi = 2.0 * PI * r1;
     float cosTheta = sqrt(r2);
     float sinTheta = sqrt(max(1.0 - r2, 0.0));
@@ -168,6 +162,18 @@ float3 trace_diffuse_rtgi(float3 worldPos, float3 N, float2 screenXY) {
         return hd.rgb * (0.40 + hd.a * 1.8) * fade;
     }
     return sample_env_lod(giDir, 0.85) * 0.48;
+}
+
+float3 trace_diffuse_rtgi(float3 worldPos, float3 N, float2 screenXY) {
+    float3 upVec = (abs(N.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    float3 T = normalize(cross(upVec, N));
+    float3 B = cross(N, T);
+    // Static IGN + 2 stratified rays eliminate 60 Hz Monte Carlo boiling across walls & asphalt
+    float r1a = ign(screenXY, 0.0);
+    float r2a = ign(screenXY + float2(17.0, 31.0), 0.0) * 0.5;
+    float r1b = frac(r1a + 0.5);
+    float r2b = r2a + 0.5;
+    return 0.5 * (sample_rtgi_ray(worldPos, N, T, B, r1a, r2a) + sample_rtgi_ray(worldPos, N, T, B, r1b, r2b));
 }
 
 GBufferOut PSMain(PSIn input) {
@@ -251,9 +257,15 @@ GBufferOut PSMain(PSIn input) {
         float laneWet = smoothstep(14.0, 1.5, abs(input.worldPos.x));
         puddle = saturate(puddle * (0.72 + 0.45 * laneWet));
         N = normalize(lerp(N, geomN, puddle * 0.94));
-        roughness = lerp(roughness, 0.035, puddle);
-        albedo *= lerp(1.0, 0.48, puddle);
+        roughness = lerp(roughness, 0.065, puddle);
+        albedo *= lerp(1.0, 0.50, puddle);
     }
+
+    // Geometric / Normal Specular Anti-Aliasing (Kaplanyan/Toksvig screen-space derivative filter)
+    float3 dNdx = ddx(N);
+    float3 dNdy = ddy(N);
+    float nVar = dot(dNdx, dNdx) + dot(dNdy, dNdy);
+    roughness = sqrt(saturate(roughness * roughness + min(nVar * 0.75, 0.25)));
 
     // 3. HDR Sunset Directional Light matching 2K Sunset HDRI peak azimuth
     float3 sunDir = normalize(float3(0.28, 0.16, 0.94));
@@ -276,14 +288,14 @@ GBufferOut PSMain(PSIn input) {
         }
     }
 
-    float3 sunRadiance = float3(2.15, 1.24, 0.64) * sunVis;
+    float3 sunRadiance = float3(1.85, 1.12, 0.60) * sunVis;
 
     // 4. Cook-Torrance GGX Direct BRDF
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
     if (isGlass) {
         albedo = float3(0.015, 0.018, 0.022);
         metallic = 0.0;
-        roughness = 0.035;
+        roughness = 0.04;
         F0 = float3(0.10, 0.11, 0.12);
     }
 
@@ -294,7 +306,7 @@ GBufferOut PSMain(PSIn input) {
     float G = geometry_smith(ndv, ndl, roughness);
     float3 F = fresnel_schlick_roughness(hdv, F0, roughness);
 
-    float3 specular = (D * G * F) / max(4.0 * ndv * ndl, 0.001);
+    float3 specular = min((D * G * F) / max(4.0 * ndv * ndl, 0.001), float3(6.0, 6.0, 6.0));
     float3 kD = (1.0 - F) * (1.0 - metallic);
     float3 directLit = (kD * albedo / PI + specular) * sunRadiance * ndl;
 
@@ -309,7 +321,7 @@ GBufferOut PSMain(PSIn input) {
     float3 diffuseIBL = sample_env_diffuse(N) * albedo * kD_ibl * ao;
 
     float3 reflDir = reflect(-V, N);
-    float3 specEnv = sample_env_lod(reflDir, roughness);
+    float3 specEnv = min(sample_env_lod(reflDir, roughness), float3(5.0, 5.0, 5.0));
 
     if (rtEnabled && (roughness < 0.58 || isGlass || puddle > 0.25)) {
         RayDesc rRay;
@@ -398,6 +410,6 @@ GBufferOut PSMain(PSIn input) {
     GBufferOut o;
     o.directHDR = float4(hdr, 1.0);
     o.rawRTGI = float4(gi, 1.0);
-    o.normalDepth = float4(N, camDist);
+    o.normalDepth = float4(geomN, camDist);
     return o;
 }
