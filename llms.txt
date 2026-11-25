@@ -11,7 +11,7 @@
 - Zero-copy DX12 C-ABI texture upload (`bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D`)
 - HLSL SM 6.6 -> Vulkan 1.3 SPIR-V (`dxc -spirv -fspv-target-env=vulkan1.3`, `VK_EXT_subgroup_size_control`)
 - GPU Sampler Feedback Streaming (`g_SfsFeedback` + `ResourceMinLODClamp` saving `118.5-151.0 MiB` VRAM live) + anti-thrash hysteresis
-- Low-VRAM 8GB GPU scaling (`--preset auto|low|medium|ultra`, `IDXGIAdapter3::QueryVideoMemoryInfo`): `50%/67%/100%` Catmull-Rom TAAU upscaler (`aaa_taa.hlsl`) + Hardware VRS Tier 2 (`aaa_vrs.hlsl`, `aaa_vrs.spv`, `+30.1%` FPS on `ultra`, `394.2 FPS` `medium`, `551.5 FPS` `low`)
+- Low-VRAM 8GB GPU scaling (`--preset auto|low|medium|ultra`, `IDXGIAdapter3::QueryVideoMemoryInfo`): `50%/67%/100%` Catmull-Rom TAAU upscaler (`aaa_taa.hlsl`), Xbox/RDNA2-style Compute `RayQuery` RTGI (`aaa_rtgi_cs.hlsl`, `aaa_rtgi_cs.spv` `VK_KHR_ray_query`, `196.8 FPS` Ultra / `258.9 FPS` +VRS), & Hardware VRS Tier 2 (`aaa_vrs.hlsl`, `aaa_vrs.spv`)
 - Hardware Mesh Shaders (`as_6_5`/`ms_6_5`) + 6-Mip Conservative Hi-Z Occlusion Culling (`12.41M -> 0.99M` tris)
 
 ## Canonical Files for AI Agents

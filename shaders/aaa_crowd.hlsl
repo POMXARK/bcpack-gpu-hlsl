@@ -158,7 +158,7 @@ GBufferOut PSMain(CrowdPSIn input) {
 
     GBufferOut o;
     o.directHDR = float4(hdr, 1.0);
-    o.rawRTGI = float4(0.0, 0.0, 0.0, 1.0);
+    o.rawRTGI = float4(albedo * 0.35, (camDist < 95.0) ? 1.0 : 0.0);
     o.normalDepth = float4(N, camDist);
     o.motionVec = prevUV - curUV;
     return o;

@@ -51,6 +51,7 @@ pub const AAA_BLOOM_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_bloom.dxil")
 pub const AAA_TAA_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_taa.dxil");
 pub const AAA_AUTOEXP_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_autoexp.dxil");
 pub const AAA_VRS_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_vrs.dxil");
+pub const AAA_RTGI_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_rtgi_cs.dxil");
 pub const AAA_COMP_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_vs.dxil");
 pub const AAA_COMP_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_ps.dxil");
 
@@ -176,6 +177,15 @@ struct AaaFrameCB {
     camera_pos: [f32; 4],
     sun_dir_time: [f32; 4],
     jitter_res: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RtgiCsCB {
+    inv_vp: [f32; 16],
+    camera_pos: [f32; 4],
+    sun_dir_time: [f32; 4],
+    params: [u32; 4],
 }
 
 struct WindowState {
@@ -1344,12 +1354,15 @@ struct AaaPostPipeline {
     bloom_pso: ID3D12PipelineState,
     vrs_root_sig: ID3D12RootSignature,
     vrs_pso: ID3D12PipelineState,
+    rtgi_cs_root_sig: ID3D12RootSignature,
+    rtgi_cs_pso: Option<ID3D12PipelineState>,
+    rtgi_cb_upload: [ID3D12Resource; 2],
     comp_root_sig: ID3D12RootSignature,
     comp_pso: ID3D12PipelineState,
     // Descriptor indices inside main_srv_heap (starting at slot 74):
     // 74..75 = raw_rtgi, normal_depth (pass 1)
     // 76..77 = denoise_a, normal_depth (pass 2 & 4)
-    // 78..79 = denoise_b, normal_depth (pass 3)
+    // 78..79 = denoise_b, normal_depth (pass 1 & 3 from Compute RTGI -> denoise_b)
     // 80 = denoise_a UAV, 81 = denoise_b UAV
     // 82..86 = TAA0 SRVs (direct, gi, mv, hist1, nd), 87 = hist0 UAV
     // 88..92 = TAA1 SRVs (direct, gi, mv, hist0, nd), 93 = hist1 UAV
@@ -1358,6 +1371,7 @@ struct AaaPostPipeline {
     // 101..103 = Composite0 (hist0, bloom_a, exposure_buf)
     // 104..106 = Composite1 (hist1, bloom_a, exposure_buf)
     // 120..121 = VRS0 SRVs (motion_vec, hist0), 122..123 = VRS1 SRVs (motion_vec, hist1), 124 = vrs_tex UAV
+    // 125..131 = Compute RTGI Slot 0, 132..138 = Compute RTGI Slot 1 (raw_rtgi, normal_depth, tlas, instMeta, vb, ib, envHdr)
     srv_inc: u32,
 }
 
@@ -1375,6 +1389,12 @@ impl AaaPostPipeline {
         vrs_tile_size: u32,
         vrs_allow_4x4: bool,
         vrs_aggressive: bool,
+        dxr: Option<&AaaDxrScene>,
+        vb_def: &ID3D12Resource,
+        ib_def: &ID3D12Resource,
+        vb_bytes: u64,
+        ib_count: u32,
+        hdri_tex: &ID3D12Resource,
     ) -> Self {
         let half_w = (out_w / 2).max(1);
         let half_h = (out_h / 2).max(1);
@@ -1548,7 +1568,69 @@ impl AaaPostPipeline {
         device.CreateShaderResourceView(&taa_hist[1], Some(&srv_desc), cpu_at(123));
         device.CreateUnorderedAccessView(&vrs_tex, None, Some(&vrs_uav), cpu_at(124));
 
+        // Compute RayQuery RTGI SRV tables (slots 125..131 and 132..138)
+        let rtgi_cb_upload = [
+            create_committed_buffer(device, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+            create_committed_buffer(device, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+        ];
+        if let Some(rt) = dxr {
+            let mut vb_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            vb_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: (vb_bytes / 4) as u32,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            };
+            let mut ib_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            ib_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: ib_count,
+                StructureByteStride: 4,
+                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            };
+            let mut meta_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            meta_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: MAX_RT_INSTANCES as u32,
+                StructureByteStride: size_of::<RtInstMeta>() as u32,
+                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            };
+            for s in 0..2usize {
+                let b = 125 + s * 7;
+                let mut tlas_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    ..Default::default()
+                };
+                tlas_sd.Anonymous.RaytracingAccelerationStructure.Location = rt.tlas_result[s].GetGPUVirtualAddress();
+                device.CreateShaderResourceView(&raw_rtgi, Some(&srv_desc), cpu_at(b));
+                device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(b + 1));
+                device.CreateShaderResourceView(None, Some(&tlas_sd), cpu_at(b + 2));
+                device.CreateShaderResourceView(&rt.inst_meta_upload[s], Some(&meta_sd), cpu_at(b + 3));
+                device.CreateShaderResourceView(vb_def, Some(&vb_sd), cpu_at(b + 4));
+                device.CreateShaderResourceView(ib_def, Some(&ib_sd), cpu_at(b + 5));
+                device.CreateShaderResourceView(hdri_tex, Some(&srv_desc), cpu_at(b + 6));
+            }
+        }
+
         let clamp_samp = static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 1);
+        let env_samp = static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 1);
 
         // Helper closure-style root sig builder for compute post passes
         let make_cs_rs = |cb_dwords: u32, num_srvs: u32, use_samp: bool| -> ID3D12RootSignature {
@@ -1607,6 +1689,46 @@ impl AaaPostPipeline {
 
         let vrs_root_sig = make_cs_rs(8, 2, true);
         let vrs_pso = create_compute_pso_local(device, &vrs_root_sig, AAA_VRS_CS_DXIL);
+
+        let rtgi_srv_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 7,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let rtgi_uav_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let rtgi_params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &rtgi_srv_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &rtgi_uav_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let rtgi_cs_root_sig = create_root_sig(device, &rtgi_params, &[env_samp], D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        let rtgi_cs_pso = dxr.map(|_| create_compute_pso_local(device, &rtgi_cs_root_sig, AAA_RTGI_CS_DXIL));
 
         // Composite root sig (CB b0 + SRV range(3) t0..t2 + clamp sampler s0)
         let c_srv_rng = D3D12_DESCRIPTOR_RANGE {
@@ -1704,6 +1826,9 @@ impl AaaPostPipeline {
             bloom_pso,
             vrs_root_sig,
             vrs_pso,
+            rtgi_cs_root_sig,
+            rtgi_cs_pso,
+            rtgi_cb_upload,
             comp_root_sig,
             comp_pso,
             srv_inc,
@@ -1746,6 +1871,10 @@ impl AaaPostPipeline {
         rtgi_enabled: bool,
         vrs_enabled: bool,
         frame_idx: u32,
+        slot: usize,
+        inv_vp_unjit: &Mat4,
+        cam_pos: [f32; 3],
+        sun_dir: [f32; 3],
         sun_screen_dir: [f32; 2],
         jitter_ndc: [f32; 2],
         time: f32,
@@ -1773,15 +1902,44 @@ impl AaaPostPipeline {
         let gx = self.width.div_ceil(8);
         let gy = self.height.div_ceil(8);
 
-        // 1. 4-Pass A-Trous Bilateral Denoiser (step = 1, 2, 4, 8) for 2-spp Diffuse RTGI
+        // 1. Xbox/RDNA2-Style Compute RayQuery RTGI Pass + 4-Pass A-Trous Bilateral Denoiser (step = 1, 2, 4, 8)
         if rtgi_enabled {
+            if let Some(ref rtgi_pso) = self.rtgi_cs_pso {
+                let rcb = RtgiCsCB {
+                    inv_vp: inv_vp_unjit.0,
+                    camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], 120.0],
+                    sun_dir_time: [sun_dir[0], sun_dir[1], sun_dir[2], time],
+                    params: [self.width, self.height, frame_idx, 1u32],
+                };
+                upload_slice(&self.rtgi_cb_upload[slot], std::slice::from_ref(&rcb));
+
+                cmd_barriers(cmd, vec![transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                cmd.SetComputeRootSignature(&self.rtgi_cs_root_sig);
+                cmd.SetPipelineState(rtgi_pso);
+                cmd.SetComputeRootConstantBufferView(0, self.rtgi_cb_upload[slot].GetGPUVirtualAddress());
+                cmd.SetComputeRootDescriptorTable(1, gpu_at(125 + slot * 7));
+                cmd.SetComputeRootDescriptorTable(2, gpu_at(81)); // denoise_b UAV
+                cmd.Dispatch(gx, gy, 1);
+
+                cmd_barriers(
+                    cmd,
+                    vec![
+                        uav_barrier(&self.denoise_b),
+                        transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                        transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    ],
+                );
+            } else {
+                cmd_barriers(cmd, vec![transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                cmd_barriers(cmd, vec![transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            }
+
             cmd.SetComputeRootSignature(&self.denoise_root_sig);
             cmd.SetPipelineState(&self.denoise_pso);
 
-            cmd_barriers(cmd, vec![transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
             let c1 = [self.width, self.height, 1u32, 0u32];
             cmd.SetComputeRoot32BitConstants(0, 4, c1.as_ptr() as *const c_void, 0);
-            cmd.SetComputeRootDescriptorTable(1, gpu_at(74));
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(if self.rtgi_cs_pso.is_some() { 78 } else { 74 }));
             cmd.SetComputeRootDescriptorTable(2, gpu_at(80));
             cmd.Dispatch(gx, gy, 1);
 
@@ -1790,7 +1948,7 @@ impl AaaPostPipeline {
                 vec![
                     uav_barrier(&self.denoise_a),
                     transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                    transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
                 ],
             );
             let c2 = [self.width, self.height, 2u32, 0u32];
@@ -2615,6 +2773,12 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             ctx.vrs_tile_size,
             ctx.vrs_additional_rates,
             vrs_aggressive,
+            dxr.as_ref(),
+            &vb_def,
+            &ib_def,
+            vb_bytes,
+            all_indices.len() as u32,
+            &hdri_tex,
         );
 
         // Sky PSO
@@ -3640,6 +3804,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 wstate.rtgi_enabled,
                 wstate.vrs_enabled,
                 frame_count,
+                slot,
+                &inv_vp_unjit,
+                cam_pos,
+                sun_dir,
                 sun_screen_dir,
                 [jit_x, jit_y],
                 t_sec,

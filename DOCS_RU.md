@@ -12,10 +12,10 @@
 2. **Аппаратный Variable Rate Shading (VRS Tier 2, [`shaders/aaa_vrs.hlsl`](shaders/aaa_vrs.hlsl) + `aaa_vrs.spv`):**
    - Compute-пасс строит карту тайлов `16×16` (`R8_UINT`, переключение клавишей **`[K]`** / `--vrs` / `--no-vrs`), оставляя **`1×1`** в центре внимания и на контрастных границах и переводя периферию/движение в **`2×2`** (и небо на `low` в `4×4`).
    - Прирост только от VRS Tier 2 в нативном `1080p` Full DXR 1.1 + RTGI: **`155.66 → 202.55 FPS Avg` (`+30.1%`)**, пик **`239.98 → 347.75 FPS` (`+44.9%`)**.
-3. **Встроенный темпоральный апскейлер TAAU (`50% / 67% / 100%`, [`shaders/aaa_taa.hlsl`](shaders/aaa_taa.hlsl)):**
-   - 16-фазный Halton(2,3) джиттер, выбор скорости по ближней глубине, бикубический Catmull-Rom семплер истории и адаптивное YCoCg-ограничение:
-     - `--preset ultra` (`1080p → 1080p`, DXR + RTGI, `VRS OFF`): `155.66 FPS Avg` | `239.98 FPS Peak` | `86.2/204.7 MiB`
-     - `--preset ultra --vrs` (`1080p → 1080p`, DXR + RTGI + **VRS**): **`202.55 FPS Avg`** | **`347.75 FPS Peak`** | `86.2/204.7 MiB`
+3. **Встроенный темпоральный апскейлер TAAU (`50% / 67% / 100%`, [`shaders/aaa_taa.hlsl`](shaders/aaa_taa.hlsl)) и Xbox/RDNA2 Compute `RayQuery` RTGI ([`shaders/aaa_rtgi_cs.hlsl`](shaders/aaa_rtgi_cs.hlsl) + `aaa_rtgi_cs.spv`):**
+   - 16-фазный Halton(2,3) джиттер, выбор скорости по ближней глубине, бикубический Catmull-Rom семплер истории и когерентный Compute `RayQuery` (`[numthreads(8,8,1)]`, общий стандарт для NVIDIA RTX и AMD Radeon / Xbox RDNA2 + Vulkan `VK_KHR_ray_query`):
+     - `--preset ultra` (`1080p → 1080p`, DXR + **Compute RTGI**, `VRS OFF`): **`196.77 FPS Avg`** (вместо `155.66` в PS) | **`313.19 FPS Peak`** | `86.2/204.7 MiB`
+     - `--preset ultra --vrs` (`1080p → 1080p`, DXR + **Compute RTGI + VRS Tier 2**): **`258.91 FPS Avg`** | **`420.63 FPS Peak`** | `86.2/204.7 MiB`
      - `--preset medium` (`720p → 1080p` 67%, DXR + **TAAU + VRS**, SFS 96 MiB): **`394.24 FPS Avg`** | **`639.06 FPS Peak`** | `1% Low: 219.86 FPS`
      - `--preset low` (`540p → 1080p` 50%, Raster + **TAAU + VRS**, SFS 64 MiB): **`551.51 FPS Avg`** | **`853.53 FPS Peak`** | `1% Low: 320.31 FPS` | **`53.7/204.7 MiB` (экономия `151.0 MiB` VRAM!)**
 4. **Защита от трэшинга SFS на жёстком бюджете (`src/aaa_scene.rs`):**

@@ -312,31 +312,9 @@ GBufferOut PSMain(AaaMSOut input) {
     float3 fogCol = float3(0.66, 0.36, 0.24);
     hdr = lerp(hdr, fogCol, saturate(fog * 0.65));
 
-    // Diffuse RTGI bounce on foreground architecture & palms
-    float3 gi = float3(0.0, 0.0, 0.0);
-    if (rtgiEnabled && camDist < 85.0 && matId != 1u && matId != 6u && matId != 7u) {
-        float3 upVec = (abs(N.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
-        float3 T = normalize(cross(upVec, N));
-        float3 B = cross(N, T);
-        float r1 = ign(input.pos.xy, 0.0);
-        float r2 = ign(input.pos.xy + float2(17.0, 31.0), 0.0);
-        float phi = 2.0 * PI * r1;
-        float cosTheta = sqrt(r2);
-        float sinTheta = sqrt(max(1.0 - r2, 0.0));
-        float3 giDir = normalize(T * (cos(phi) * sinTheta) + B * (sin(phi) * sinTheta) + N * cosTheta);
-        RayDesc gRay;
-        gRay.Origin = input.worldPos + N * 0.04;
-        gRay.Direction = giDir;
-        gRay.TMin = 0.04;
-        gRay.TMax = 35.0;
-        RayQuery<RAY_FLAG_FORCE_OPAQUE> gq;
-        gq.TraceRayInline(g_SceneTlas, RAY_FLAG_NONE, 0xFFu, gRay);
-        while (gq.Proceed()) {}
-        float3 giSample = (gq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
-            ? eval_dxr_hit(gq.CommittedInstanceID(), gq.CommittedPrimitiveIndex(), gq.CommittedTriangleBarycentrics(), gq.CommittedRayT(), 2.5, gq.CommittedObjectToWorld3x4(), sunDir) * saturate(1.0 - gq.CommittedRayT() / 35.0)
-            : sample_env_lod(giDir, 0.85) * 0.45;
-        gi = giSample * albedo * (1.0 - metallic * 0.7) * 0.40;
-    }
+    // Output diffuse GI albedo + eligibility mask for Xbox/RDNA2-style Compute RayQuery RTGI pass
+    float giMask = (camDist < 85.0 && matId != 1u && matId != 6u && matId != 7u) ? 1.0 : 0.0;
+    float3 giAlb = albedo * (1.0 - metallic * 0.7) * 0.40 * giMask;
 
     // [V] X-Ray overlay (Concrete SFS state + Mesh-Shader highlight)
     if (xrayEnabled) {
@@ -360,7 +338,7 @@ GBufferOut PSMain(AaaMSOut input) {
 
     GBufferOut o;
     o.directHDR = float4(hdr, 1.0);
-    o.rawRTGI = float4(gi, 1.0);
+    o.rawRTGI = float4(giAlb, giMask);
     o.normalDepth = float4(geomN, camDist);
     o.motionVec = prevUV - curUV;
     return o;

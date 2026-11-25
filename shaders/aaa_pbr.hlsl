@@ -468,11 +468,9 @@ GBufferOut PSMain(PSIn input) {
     float3 fogCol = float3(0.62, 0.34, 0.22);
     hdr = lerp(hdr, fogCol, saturate(fog * 0.60));
 
-    // 6. 2-spp Static-IGN Diffuse RTGI Bounce
-    float3 gi = float3(0.0, 0.0, 0.0);
-    if (rtgiEnabled && camDist < 120.0 && !isGlass) {
-        gi = trace_diffuse_rtgi(input.worldPos, N, input.pos.xy, sunDir) * albedo * (1.0 - metallic * 0.7) * 0.45;
-    }
+    // 6. Output diffuse GI albedo + eligibility mask for Xbox/RDNA2-style Compute RayQuery RTGI pass
+    float giMask = (!isGlass && camDist < 120.0) ? 1.0 : 0.0;
+    float3 giAlb = albedo * (1.0 - metallic * 0.7) * 0.45 * giMask;
 
     // 7. [V] X-Ray BCPack 4K-Tile & SFS Residency Heatmap Overlay
     if (xrayEnabled) {
@@ -518,7 +516,7 @@ GBufferOut PSMain(PSIn input) {
 
     GBufferOut o;
     o.directHDR = float4(hdr, 1.0);
-    o.rawRTGI = float4(gi, 1.0);
+    o.rawRTGI = float4(giAlb, giMask);
     o.normalDepth = float4(geomN, camDist);
     o.motionVec = prevUV - curUV;
     return o;

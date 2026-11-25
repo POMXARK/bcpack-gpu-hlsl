@@ -17,6 +17,7 @@ SHADERS=(
   crowd_skin
   bindless_paging
   aaa_vrs
+  aaa_rtgi_cs
 )
 
 for s in "${SHADERS[@]}"; do
