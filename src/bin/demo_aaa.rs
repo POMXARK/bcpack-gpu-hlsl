@@ -16,6 +16,7 @@ fn main() {
             "--flush-bench" => cfg.flush_bench = true,
             "--debug" => cfg.enable_debug = true,
             "--xray" => cfg.xray_mode = true,
+            "--vsync" => cfg.vsync = true,
             "--tiles-per-frame" if i + 1 < args.len() => {
                 cfg.tiles_per_frame = args[i + 1].parse().unwrap_or(256);
                 i += 1;

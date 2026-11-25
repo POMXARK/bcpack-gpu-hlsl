@@ -224,6 +224,7 @@ struct WindowState {
     rtgi_enabled: bool,
     mesh_shaders_enabled: bool,
     tiles_per_frame: usize,
+    vsync_enabled: bool,
     cam_mode: u8, // 0 = Chase, 1 = Free Drive, 2 = Helicopter
     should_quit: bool,
 }
@@ -236,6 +237,14 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
     match msg {
+        WM_CLOSE => {
+            if !ptr.is_null() {
+                (*ptr).should_quit = true;
+            }
+            let _ = DestroyWindow(hwnd);
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             if !ptr.is_null() {
                 (*ptr).should_quit = true;
@@ -249,9 +258,12 @@ unsafe extern "system" fn wnd_proc(
                 let vk = wparam.0 as u16;
                 if vk == VK_ESCAPE.0 {
                     st.should_quit = true;
+                    let _ = DestroyWindow(hwnd);
                     PostQuitMessage(0);
                 } else if vk == VK_SPACE.0 && st.mode == DemoMode::Toggleable {
                     st.use_gpu = !st.use_gpu;
+                } else if vk == b'L' as u16 {
+                    st.vsync_enabled = !st.vsync_enabled;
                 } else if vk == VK_F.0 {
                     st.sfs_enabled = !st.sfs_enabled;
                 } else if vk == VK_R.0 {
@@ -529,6 +541,7 @@ pub fn run_demo(
             rtgi_enabled: false,
             mesh_shaders_enabled: false,
             tiles_per_frame: init_tiles,
+            vsync_enabled: false,
             cam_mode: 0,
             should_quit: false,
         });
@@ -1096,6 +1109,7 @@ pub fn run_demo(
         println!("  [N]       Toggle DX12 Mesh Shaders (4.0M+ Tris) <-> Classic VS Pipeline");
         println!("  [R]       Toggle DXR 1.1 Shadows + Reflections");
         println!("  [G]       Toggle DXR 1.1 Diffuse RTGI + 2-Pass Bilateral Denoiser");
+        println!("  [L]       Toggle VSync (Limit FPS to Monitor Refresh Rate)");
         println!("  [C]       Camera Mode: Chase Car / Free Drive (WASD+QE) / Heli Orbit");
         println!("  [UP/DOWN] Streamed 4K-tiles/frame (48..1024 = 1.5..32 MiB BC1/frame)");
         println!("  [ESC]     Exit");
@@ -1113,7 +1127,7 @@ pub fn run_demo(
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            if wstate.should_quit {
+            if wstate.should_quit || !IsWindow(hwnd).as_bool() {
                 break;
             }
 
@@ -1690,7 +1704,10 @@ pub fn run_demo(
             cmd_list.Close().unwrap();
             let lists = [Some(cmd_list.cast::<ID3D12CommandList>().unwrap())];
             ctx.queue.ExecuteCommandLists(&lists);
-            let _ = swap_chain.Present(0, DXGI_PRESENT(0));
+            let sync_interval = if wstate.vsync_enabled { 1u32 } else { 0u32 };
+            if swap_chain.Present(sync_interval, DXGI_PRESENT(0)).is_err() {
+                break;
+            }
 
             if take_shot || save_rec_frame || !wstate.use_gpu {
                 ctx.signal_and_wait();
@@ -1854,20 +1871,21 @@ pub fn run_demo(
                 } else {
                     0.0
                 };
+                let vsync_str = if wstate.vsync_enabled { "ON" } else { "OFF" };
                 let title = if wstate.sfs_enabled {
                     format!(
-                        "{} | {:.1} FPS | Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Peak:{:.0}MB/s | MS[N]:{} ({:.2}M/{:.2}M Cull:{:.0}%) | TLAS:{} RT[R]:{} RTGI[G]:{} Cam[C]:{}",
-                        mode_str, fps, last_world_res_mb, last_world_cap_mb, last_world_evict, last_world_peak_mbs, ms_str, ms_vis_m, ms_total_m, ms_cull_pct, tlas_inst_count, rt_str, rtgi_str, cam_str
+                        "{} | {:.1} FPS | Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Peak:{:.0}MB/s | MS[N]:{} ({:.2}M/{:.2}M Cull:{:.0}%) | TLAS:{} RT[R]:{} RTGI[G]:{} VSync[L]:{} Cam[C]:{}",
+                        mode_str, fps, last_world_res_mb, last_world_cap_mb, last_world_evict, last_world_peak_mbs, ms_str, ms_vis_m, ms_total_m, ms_cull_pct, tlas_inst_count, rt_str, rtgi_str, vsync_str, cam_str
                     )
                 } else if use_meshlets {
                     format!(
-                        "{} | {:.1} FPS | {:.1} MB/f | MS[N]:ON Tris:{:.2}M/{:.2}M (Cull:{:.0}%) | TLAS:{} RT[R]:{} RTGI[G]:{} SFS[F]:{} Cam[C]:{}",
-                        mode_str, fps, streamed_mb, ms_vis_m, ms_total_m, ms_cull_pct, tlas_inst_count, rt_str, rtgi_str, sfs_str, cam_str
+                        "{} | {:.1} FPS | {:.1} MB/f | MS[N]:ON Tris:{:.2}M/{:.2}M (Cull:{:.0}%) | TLAS:{} RT[R]:{} RTGI[G]:{} SFS[F]:{} VSync[L]:{} Cam[C]:{}",
+                        mode_str, fps, streamed_mb, ms_vis_m, ms_total_m, ms_cull_pct, tlas_inst_count, rt_str, rtgi_str, sfs_str, vsync_str, cam_str
                     )
                 } else {
                     format!(
-                        "{} | {:.1} FPS | {:.1} MB/f ({}t) | Dec:{:.2}ms ({:.0} MB/s) | RT[R]:{} RTGI[G]:{} SFS[F]:{} | Cam[C]:{}",
-                        mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, rt_str, rtgi_str, sfs_str, cam_str
+                        "{} | {:.1} FPS | {:.1} MB/f ({}t) | Dec:{:.2}ms ({:.0} MB/s) | RT[R]:{} RTGI[G]:{} SFS[F]:{} VSync[L]:{} | Cam[C]:{}",
+                        mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, rt_str, rtgi_str, sfs_str, vsync_str, cam_str
                     )
                 };
                 let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();

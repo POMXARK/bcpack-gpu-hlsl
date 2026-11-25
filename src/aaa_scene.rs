@@ -31,11 +31,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetWindowLongPtrW,
-    LoadCursorW, PeekMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
-    SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WM_DESTROY, WM_KEYDOWN,
-    WM_QUIT, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetWindowLongPtrW, IsWindow, LoadCursorW, PeekMessageW, PostQuitMessage, RegisterClassExW,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
+    WM_DESTROY, WM_KEYDOWN, WM_QUIT, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 pub const AAA_SKY_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_sky_vs.dxil");
@@ -60,6 +60,7 @@ pub struct AaaDemoConfig {
     pub flush_bench: bool,
     pub enable_debug: bool,
     pub xray_mode: bool,
+    pub vsync: bool,
     pub tiles_per_frame: usize,
     pub measure_frames: Option<u32>,
     pub flush_at_frame: Option<u32>,
@@ -76,6 +77,7 @@ impl Default for AaaDemoConfig {
             flush_bench: false,
             enable_debug: false,
             xray_mode: false,
+            vsync: false,
             tiles_per_frame: 256,
             measure_frames: None,
             flush_at_frame: None,
@@ -111,6 +113,7 @@ struct WindowState {
     rt_enabled: bool,
     rtgi_enabled: bool,
     xray_enabled: bool,
+    vsync_enabled: bool,
     cam_mode: u32, // 0=Showroom 3/4 Orbit, 1=Chase Drive, 2=Free Cam
     flush_requested: bool,
     should_quit: bool,
@@ -269,22 +272,35 @@ fn norm3(a: [f32; 3]) -> [f32; 3] {
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_DESTROY {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+    if msg == WM_CLOSE {
+        if !ptr.is_null() {
+            (*ptr).should_quit = true;
+        }
+        let _ = DestroyWindow(hwnd);
         PostQuitMessage(0);
         return LRESULT(0);
     }
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+    if msg == WM_DESTROY {
+        if !ptr.is_null() {
+            (*ptr).should_quit = true;
+        }
+        PostQuitMessage(0);
+        return LRESULT(0);
+    }
     if !ptr.is_null() && msg == WM_KEYDOWN {
         let st = &mut *ptr;
         match wparam.0 as u32 {
             x if x == VK_SPACE.0 as u32 => st.use_gpu = !st.use_gpu,
             x if x == b'T' as u32 => st.flush_requested = true,
             x if x == b'V' as u32 => st.xray_enabled = !st.xray_enabled,
+            x if x == b'L' as u32 => st.vsync_enabled = !st.vsync_enabled,
             x if x == b'R' as u32 => st.rt_enabled = !st.rt_enabled,
             x if x == b'G' as u32 => st.rtgi_enabled = !st.rtgi_enabled,
             x if x == b'C' as u32 => st.cam_mode = (st.cam_mode + 1) % 3,
             x if x == VK_ESCAPE.0 as u32 => {
                 st.should_quit = true;
+                let _ = DestroyWindow(hwnd);
                 PostQuitMessage(0);
             }
             _ => {}
@@ -1438,6 +1454,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             rt_enabled: true,
             rtgi_enabled: true,
             xray_enabled: cfg.xray_mode,
+            vsync_enabled: cfg.vsync,
             cam_mode: 0,
             flush_requested: false,
             should_quit: false,
@@ -2031,7 +2048,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             pack.total_bcpack_bytes as f64 / (1024.0 * 1024.0),
             pack.total_bc1_bytes as f64 / pack.total_bcpack_bytes.max(1) as f64
         );
-        println!("  Controls: [T] Flush VRAM Wave | [V] X-Ray Heatmap | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Camera | [ESC] Quit");
+        println!("  Controls: [T] Flush VRAM Wave | [V] X-Ray Heatmap | [L] VSync (Monitor Hz) | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Camera | [ESC] Quit");
 
         let mut frame_fences = [0u64; 2];
         let mut frame_count: u32 = 0;
@@ -2047,12 +2064,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
+                    wstate.should_quit = true;
                     break 'main_loop;
                 }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            if wstate.should_quit {
+            if wstate.should_quit || !IsWindow(hwnd).as_bool() {
                 break;
             }
 
@@ -2486,7 +2504,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             cmd.Close().unwrap();
             let lists = [Some(cmd.cast::<ID3D12CommandList>().unwrap())];
             ctx.queue.ExecuteCommandLists(&lists);
-            let _ = swap_chain.Present(0, DXGI_PRESENT(0));
+            let sync_interval = if wstate.vsync_enabled { 1u32 } else { 0u32 };
+            if swap_chain.Present(sync_interval, DXGI_PRESENT(0)).is_err() {
+                break;
+            }
 
             if take_shot {
                 ctx.signal_and_wait();
@@ -2540,7 +2561,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     _ => "FreeCam",
                 };
                 let title = format!(
-                    "BCPack AAA v0.7 | {} | {:.1} FPS | VRAM {}/{} tiles ({:.1} MiB) | dec {:.2}ms ({:.2}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
+                    "BCPack AAA v0.7 | {} | {:.1} FPS | VRAM {}/{} tiles ({:.1} MiB) | dec {:.2}ms ({:.2}MiB) | DXR:{} RTGI:{} XRay:{} VSync[L]:{} | {}",
                     mode_str,
                     fps_val,
                     residency.total_resident(),
@@ -2551,6 +2572,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     if wstate.rt_enabled { "ON" } else { "OFF" },
                     if wstate.rtgi_enabled { "ON" } else { "OFF" },
                     if wstate.xray_enabled { "ON" } else { "OFF" },
+                    if wstate.vsync_enabled { "ON" } else { "OFF" },
                     cam_str,
                 );
                 let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
@@ -2577,6 +2599,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         }
 
         ctx.signal_and_wait();
+        ctx.signal_and_wait_compute();
         if cfg.enable_debug {
             dump_d3d12_info_queue(&ctx.device);
         }
