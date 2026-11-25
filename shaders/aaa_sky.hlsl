@@ -1,6 +1,7 @@
-// Open AAA Showcase Skybox: 2K Equirectangular Sunset HDRI -> 3-MRT HDR G-Buffer
+// Open AAA Showcase Skybox: 2K Equirectangular Sunset HDRI -> 4-MRT HDR G-Buffer + Motion Vectors
 cbuffer SkyCB : register(b0) {
     float4x4 g_InvViewProj;
+    float4x4 g_PrevViewProj;
     float3   g_CameraPos;
     float    g_Time;
 };
@@ -17,6 +18,7 @@ struct GBufferOut {
     float4 directHDR   : SV_Target0;
     float4 rawRTGI     : SV_Target1;
     float4 normalDepth : SV_Target2;
+    float2 motionVec   : SV_Target3;
 };
 
 SkyPSIn VSMain(uint vid : SV_VertexID) {
@@ -40,16 +42,24 @@ GBufferOut PSMain(SkyPSIn input) {
     float3 dir = (dot(rawDir, rawDir) > 1e-6) ? normalize(rawDir) : float3(0.0, 0.0, 1.0);
 
     float2 envUv = dir_to_equirect_uv(dir);
-    float3 hdrSky = g_EnvHdr.SampleLevel(g_EnvSampler, envUv, 0.0).rgb * 0.54;
+    float3 hdrSky = g_EnvHdr.SampleLevel(g_EnvSampler, envUv, 0.0).rgb * 0.40;
 
     float3 sunDir = normalize(float3(0.28, 0.16, 0.94));
     float sunCos = max(dot(dir, sunDir), 0.0);
-    hdrSky += float3(0.85, 0.36, 0.12) * pow(sunCos, 40.0);
-    hdrSky += float3(0.75, 0.38, 0.18) * pow(sunCos, 6.0) * 0.16;
+    hdrSky += float3(2.20, 0.95, 0.38) * pow(sunCos, 256.0);
+    hdrSky += float3(0.32, 0.14, 0.06) * pow(sunCos, 10.0);
+
+    float2 curUV = float2(input.ndc.x * 0.5 + 0.5, 0.5 - input.ndc.y * 0.5);
+    float4 prevClip = mul(g_PrevViewProj, float4(g_CameraPos + dir * 200.0, 1.0));
+    float2 prevUV = curUV;
+    if (abs(prevClip.w) > 1e-5) {
+        prevUV = float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5);
+    }
 
     GBufferOut o;
     o.directHDR = float4(hdrSky, 1.0);
     o.rawRTGI = float4(0.0, 0.0, 0.0, 0.0);
     o.normalDepth = float4(0.0, 0.0, 0.0, 9999.0);
+    o.motionVec = prevUV - curUV;
     return o;
 }

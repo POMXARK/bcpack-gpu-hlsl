@@ -43,6 +43,8 @@ pub const AAA_SKY_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_sky_ps.dxil");
 pub const AAA_PBR_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_pbr_vs.dxil");
 pub const AAA_PBR_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_pbr_ps.dxil");
 pub const AAA_BLOOM_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_bloom.dxil");
+pub const AAA_TAA_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_taa.dxil");
+pub const AAA_AUTOEXP_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_autoexp.dxil");
 pub const AAA_COMP_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_vs.dxil");
 pub const AAA_COMP_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_ps.dxil");
 
@@ -51,7 +53,7 @@ const WIN_H: u32 = 720;
 const SWAP_W: u32 = 1920;
 const SWAP_H: u32 = 1080;
 const TEX_SLOT_CAP: usize = 32;
-const SRV_TABLE_STRIDE: usize = 35; // t0..t31 textures, t32 envHdr, t33 tlas, t34 instColors
+const SRV_TABLE_STRIDE: usize = 37; // t0..t31 textures, t32 envHdr, t33 tlas, t34 instMeta, t35 sceneVB, t36 sceneIB
 const MAX_BATCH_TILES: usize = 256;
 
 #[derive(Clone, Debug)]
@@ -97,6 +99,7 @@ impl Default for AaaDemoConfig {
 #[derive(Clone, Copy)]
 struct SkyConstants {
     inv_view_proj: [f32; 16],
+    prev_view_proj: [f32; 16],
     camera_pos: [f32; 3],
     time: f32,
 }
@@ -104,14 +107,24 @@ struct SkyConstants {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct AaaDrawCB {
-    mvp: [f32; 16],
     model: [f32; 16],
-    camera_pos: [f32; 4],
+    prev_model: [f32; 16],
     base_color: [f32; 4],
     mat_params: [f32; 4],
     emissive_time: [f32; 4],
     tex_indices: [u32; 4],
     tile_states: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AaaFrameCB {
+    vp_jittered: [f32; 16],
+    vp_unjittered: [f32; 16],
+    prev_vp_unjittered: [f32; 16],
+    camera_pos: [f32; 4],
+    sun_dir_time: [f32; 4],
+    jitter_res: [f32; 4],
 }
 
 struct WindowState {
@@ -512,6 +525,14 @@ impl TextureResidency {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RtInstMeta {
+    base_color: [f32; 4],
+    geom: [u32; 4],
+    uv_params: [f32; 4],
+}
+
 struct AaaDxrScene {
     blas_car: ID3D12Resource,
     blas_box: ID3D12Resource,
@@ -520,7 +541,7 @@ struct AaaDxrScene {
     tlas_scratch: [ID3D12Resource; 2],
     tlas_result: [ID3D12Resource; 2],
     instances_upload: [ID3D12Resource; 2],
-    inst_colors_upload: [ID3D12Resource; 2],
+    inst_meta_upload: [ID3D12Resource; 2],
     tlas_alloc: ID3D12CommandAllocator,
     tlas_cmd: ID3D12GraphicsCommandList,
 }
@@ -662,14 +683,14 @@ impl AaaDxrScene {
         ctx.signal_and_wait();
 
         let inst_bytes = (MAX_RT_INSTANCES * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>()) as u64;
-        let col_bytes = (MAX_RT_INSTANCES * size_of::<[f32; 4]>()) as u64;
+        let meta_bytes = (MAX_RT_INSTANCES * size_of::<RtInstMeta>()) as u64;
         let instances_upload = [
             create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, inst_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
             create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, inst_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
         ];
-        let inst_colors_upload = [
-            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, col_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
-            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, col_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+        let inst_meta_upload = [
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, meta_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, meta_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
         ];
         let tlas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
@@ -708,7 +729,7 @@ impl AaaDxrScene {
             tlas_scratch,
             tlas_result,
             instances_upload,
-            inst_colors_upload,
+            inst_meta_upload,
             tlas_alloc,
             tlas_cmd,
         })
@@ -718,28 +739,28 @@ impl AaaDxrScene {
         &self,
         ctx: &mut GpuContext,
         slot: usize,
-        instances: &[(usize, [f32; 12], [f32; 4])], // (blas_kind 0=car,1=box,2=plane, 3x4, color)
+        instances: &[(usize, [f32; 12], RtInstMeta)],
     ) {
         let s = slot & 1;
         let count = instances.len().min(MAX_RT_INSTANCES);
         let mut descs = Vec::with_capacity(count);
-        let mut cols = Vec::with_capacity(count);
+        let mut metas = Vec::with_capacity(count);
         let blas_vas = [
             self.blas_car.GetGPUVirtualAddress(),
             self.blas_box.GetGPUVirtualAddress(),
             self.blas_plane.GetGPUVirtualAddress(),
         ];
-        for (idx, (kind, xf, col)) in instances.iter().take(count).enumerate() {
+        for (idx, (kind, xf, meta)) in instances.iter().take(count).enumerate() {
             descs.push(D3D12_RAYTRACING_INSTANCE_DESC {
                 Transform: *xf,
                 _bitfield1: (idx as u32 & 0x00FF_FFFF) | (0xFFu32 << 24),
                 _bitfield2: 0,
                 AccelerationStructure: blas_vas[*kind],
             });
-            cols.push(*col);
+            metas.push(*meta);
         }
         upload_slice(&self.instances_upload[s], &descs);
-        upload_slice(&self.inst_colors_upload[s], &cols);
+        upload_slice(&self.inst_meta_upload[s], &metas);
 
         self.tlas_alloc.Reset().unwrap();
         self.tlas_cmd.Reset(&self.tlas_alloc, None).unwrap();
@@ -768,10 +789,11 @@ impl AaaDxrScene {
     }
 }
 
-unsafe fn create_fp16_tex(
+unsafe fn create_tex2d_fmt(
     device: &ID3D12Device,
     w: u32,
     h: u32,
+    fmt: DXGI_FORMAT,
     flags: D3D12_RESOURCE_FLAGS,
     init_state: D3D12_RESOURCE_STATES,
     clear_rgba: Option<[f32; 4]>,
@@ -782,14 +804,14 @@ unsafe fn create_fp16_tex(
         Height: h,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        Format: fmt,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
         Flags: flags,
         ..Default::default()
     };
     let cv = clear_rgba.map(|col| D3D12_CLEAR_VALUE {
-        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        Format: fmt,
         Anonymous: D3D12_CLEAR_VALUE_0 { Color: col },
     });
     let mut res: Option<ID3D12Resource> = None;
@@ -802,8 +824,27 @@ unsafe fn create_fp16_tex(
             cv.as_ref().map(|c| c as *const D3D12_CLEAR_VALUE),
             &mut res,
         )
-        .expect("CreateCommittedResource fp16_tex");
+        .expect("CreateCommittedResource tex2d_fmt");
     res.unwrap()
+}
+
+unsafe fn create_fp16_tex(
+    device: &ID3D12Device,
+    w: u32,
+    h: u32,
+    flags: D3D12_RESOURCE_FLAGS,
+    init_state: D3D12_RESOURCE_STATES,
+    clear_rgba: Option<[f32; 4]>,
+) -> ID3D12Resource {
+    create_tex2d_fmt(
+        device,
+        w,
+        h,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        flags,
+        init_state,
+        clear_rgba,
+    )
 }
 
 unsafe fn create_root_sig(
@@ -879,24 +920,36 @@ struct AaaPostPipeline {
     direct_hdr: ID3D12Resource,
     raw_rtgi: ID3D12Resource,
     normal_depth: ID3D12Resource,
+    motion_vec: ID3D12Resource,
     denoise_a: ID3D12Resource,
     denoise_b: ID3D12Resource,
+    taa_hist: [ID3D12Resource; 2],
+    exposure_buf: ID3D12Resource,
     bloom_a: ID3D12Resource,
     bloom_b: ID3D12Resource,
     gbuf_rtv_heap: ID3D12DescriptorHeap,
     rtv_inc: u32,
     denoise_root_sig: ID3D12RootSignature,
     denoise_pso: ID3D12PipelineState,
+    taa_root_sig: ID3D12RootSignature,
+    taa_pso: ID3D12PipelineState,
+    autoexp_root_sig: ID3D12RootSignature,
+    autoexp_pso: ID3D12PipelineState,
     bloom_root_sig: ID3D12RootSignature,
     bloom_pso: ID3D12PipelineState,
     comp_root_sig: ID3D12RootSignature,
     comp_pso: ID3D12PipelineState,
-    // Descriptor indices inside main_srv_heap:
-    // 70..71 = raw_rtgi, normal_depth (pass 1 src)
-    // 72..73 = denoise_a, normal_depth (pass 2 src)
-    // 74 = denoise_a UAV, 75 = denoise_b UAV
-    // 76 = direct_hdr SRV, 77 = bloom_a SRV, 78 = bloom_b SRV, 79 = bloom_a UAV, 80 = bloom_b UAV
-    // 81..83 = direct_hdr, denoise_b, bloom_a (composite contiguous SRVs t0, t1, t2)
+    // Descriptor indices inside main_srv_heap (starting at slot 74):
+    // 74..75 = raw_rtgi, normal_depth (pass 1)
+    // 76..77 = denoise_a, normal_depth (pass 2 & 4)
+    // 78..79 = denoise_b, normal_depth (pass 3)
+    // 80 = denoise_a UAV, 81 = denoise_b UAV
+    // 82..86 = TAA0 SRVs (direct, gi, mv, hist1, nd), 87 = hist0 UAV
+    // 88..92 = TAA1 SRVs (direct, gi, mv, hist0, nd), 93 = hist1 UAV
+    // 94 = exposure_buf UAV, 95 = hist0 SRV, 96 = hist1 SRV
+    // 97 = bloom_a SRV, 98 = bloom_b SRV, 99 = bloom_a UAV, 100 = bloom_b UAV
+    // 101..103 = Composite0 (hist0, bloom_a, exposure_buf)
+    // 104..106 = Composite1 (hist1, bloom_a, exposure_buf)
     srv_inc: u32,
 }
 
@@ -910,6 +963,7 @@ impl AaaPostPipeline {
     ) -> Self {
         let half_w = (width / 2).max(1);
         let half_h = (height / 2).max(1);
+        let srv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let direct_hdr = create_fp16_tex(
             device, width, height,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
@@ -928,22 +982,40 @@ impl AaaPostPipeline {
             D3D12_RESOURCE_STATE_RENDER_TARGET,
             Some([0.0, 0.0, 0.0, 9999.0]),
         );
+        let motion_vec = create_tex2d_fmt(
+            device, width, height,
+            DXGI_FORMAT_R16G16_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            Some([0.0, 0.0, 0.0, 0.0]),
+        );
         let denoise_a = create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
         let denoise_b = create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
+        let taa_hist = [
+            create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, srv_state, None),
+            create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, srv_state, None),
+        ];
+        let exposure_buf = create_committed_buffer(
+            device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            256,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
         let bloom_a = create_fp16_tex(device, half_w, half_h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
         let bloom_b = create_fp16_tex(device, half_w, half_h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
 
         let gbuf_rtv_heap: ID3D12DescriptorHeap = device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: 3,
+                NumDescriptors: 4,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                 NodeMask: 0,
             })
             .unwrap();
         let rtv_inc = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         let rtv_base = gbuf_rtv_heap.GetCPUDescriptorHandleForHeapStart();
-        for (i, tex) in [&direct_hdr, &raw_rtgi, &normal_depth].iter().enumerate() {
+        for (i, tex) in [&direct_hdr, &raw_rtgi, &normal_depth, &motion_vec].iter().enumerate() {
             device.CreateRenderTargetView(
                 *tex,
                 None,
@@ -962,113 +1034,135 @@ impl AaaPostPipeline {
             ..Default::default()
         };
         srv_desc.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+        let mut mv_srv = srv_desc;
+        mv_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        let mut exp_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        exp_srv.Anonymous.Buffer = D3D12_BUFFER_SRV {
+            FirstElement: 0,
+            NumElements: 1,
+            StructureByteStride: 4,
+            Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+        };
+
         let mut uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
         uav_desc.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
-
-        device.CreateShaderResourceView(&raw_rtgi, Some(&srv_desc), cpu_at(70));
-        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(71));
-        device.CreateShaderResourceView(&denoise_a, Some(&srv_desc), cpu_at(72));
-        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(73));
-        device.CreateUnorderedAccessView(&denoise_a, None, Some(&uav_desc), cpu_at(74));
-        device.CreateUnorderedAccessView(&denoise_b, None, Some(&uav_desc), cpu_at(75));
-
-        device.CreateShaderResourceView(&direct_hdr, Some(&srv_desc), cpu_at(76));
-        device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(77));
-        device.CreateShaderResourceView(&bloom_b, Some(&srv_desc), cpu_at(78));
-        device.CreateUnorderedAccessView(&bloom_a, None, Some(&uav_desc), cpu_at(79));
-        device.CreateUnorderedAccessView(&bloom_b, None, Some(&uav_desc), cpu_at(80));
-
-        device.CreateShaderResourceView(&direct_hdr, Some(&srv_desc), cpu_at(81));
-        device.CreateShaderResourceView(&denoise_b, Some(&srv_desc), cpu_at(82));
-        device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(83));
-        device.CreateShaderResourceView(&denoise_b, Some(&srv_desc), cpu_at(84));
-        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(85));
-
-        // Denoise root sig (CB b0 + SRV range(2) t0..t1 + UAV range(1) u0)
-        let d_srv_rng = D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            NumDescriptors: 2,
-            BaseShaderRegister: 0,
-            RegisterSpace: 0,
-            OffsetInDescriptorsFromTableStart: 0,
+        let mut exp_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            ..Default::default()
         };
-        let d_uav_rng = D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-            NumDescriptors: 1,
-            BaseShaderRegister: 0,
-            RegisterSpace: 0,
-            OffsetInDescriptorsFromTableStart: 0,
+        exp_uav.Anonymous.Buffer = D3D12_BUFFER_UAV {
+            FirstElement: 0,
+            NumElements: 1,
+            StructureByteStride: 4,
+            CounterOffsetInBytes: 0,
+            Flags: D3D12_BUFFER_UAV_FLAG_NONE,
         };
-        let d_params = [
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+
+        // Denoiser slots 74..81
+        device.CreateShaderResourceView(&raw_rtgi, Some(&srv_desc), cpu_at(74));
+        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(75));
+        device.CreateShaderResourceView(&denoise_a, Some(&srv_desc), cpu_at(76));
+        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(77));
+        device.CreateShaderResourceView(&denoise_b, Some(&srv_desc), cpu_at(78));
+        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(79));
+        device.CreateUnorderedAccessView(&denoise_a, None, Some(&uav_desc), cpu_at(80));
+        device.CreateUnorderedAccessView(&denoise_b, None, Some(&uav_desc), cpu_at(81));
+
+        // TAA Slot 0 (82..87) & Slot 1 (88..93)
+        for p in 0..2 {
+            let b = 82 + p * 6;
+            let prev = &taa_hist[p ^ 1];
+            let cur = &taa_hist[p];
+            device.CreateShaderResourceView(&direct_hdr, Some(&srv_desc), cpu_at(b));
+            device.CreateShaderResourceView(&denoise_b, Some(&srv_desc), cpu_at(b + 1));
+            device.CreateShaderResourceView(&motion_vec, Some(&mv_srv), cpu_at(b + 2));
+            device.CreateShaderResourceView(prev, Some(&srv_desc), cpu_at(b + 3));
+            device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(b + 4));
+            device.CreateUnorderedAccessView(cur, None, Some(&uav_desc), cpu_at(b + 5));
+        }
+
+        // AutoExposure & Bloom (94..100)
+        device.CreateUnorderedAccessView(&exposure_buf, None, Some(&exp_uav), cpu_at(94));
+        device.CreateShaderResourceView(&taa_hist[0], Some(&srv_desc), cpu_at(95));
+        device.CreateShaderResourceView(&taa_hist[1], Some(&srv_desc), cpu_at(96));
+        device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(97));
+        device.CreateShaderResourceView(&bloom_b, Some(&srv_desc), cpu_at(98));
+        device.CreateUnorderedAccessView(&bloom_a, None, Some(&uav_desc), cpu_at(99));
+        device.CreateUnorderedAccessView(&bloom_b, None, Some(&uav_desc), cpu_at(100));
+
+        // Composite Slot 0 (101..103) & Slot 1 (104..106)
+        device.CreateShaderResourceView(&taa_hist[0], Some(&srv_desc), cpu_at(101));
+        device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(102));
+        device.CreateShaderResourceView(&exposure_buf, Some(&exp_srv), cpu_at(103));
+        device.CreateShaderResourceView(&taa_hist[1], Some(&srv_desc), cpu_at(104));
+        device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(105));
+        device.CreateShaderResourceView(&exposure_buf, Some(&exp_srv), cpu_at(106));
+
+        let clamp_samp = static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 1);
+
+        // Helper closure-style root sig builder for compute post passes
+        let make_cs_rs = |cb_dwords: u32, num_srvs: u32, use_samp: bool| -> ID3D12RootSignature {
+            let srv_rng = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: num_srvs,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                OffsetInDescriptorsFromTableStart: 0,
+            };
+            let uav_rng = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                NumDescriptors: 1,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                OffsetInDescriptorsFromTableStart: 0,
+            };
+            let params = [
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: cb_dwords },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
                 },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &d_srv_rng },
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &srv_rng },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
                 },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &d_uav_rng },
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &uav_rng },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
                 },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-        ];
-        let denoise_root_sig = create_root_sig(device, &d_params, &[], D3D12_ROOT_SIGNATURE_FLAG_NONE);
+            ];
+            let samps = if use_samp { std::slice::from_ref(&clamp_samp) } else { &[] };
+            create_root_sig(device, &params, samps, D3D12_ROOT_SIGNATURE_FLAG_NONE)
+        };
+
+        let denoise_root_sig = make_cs_rs(4, 2, false);
         let denoise_pso = create_compute_pso_local(device, &denoise_root_sig, RTGI_DENOISE_CS_DXIL);
 
-        // Bloom root sig (CB b0 + SRV range(1) t0 + UAV range(1) u0 + clamp sampler s0)
-        let b_srv_rng = D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            NumDescriptors: 1,
-            BaseShaderRegister: 0,
-            RegisterSpace: 0,
-            OffsetInDescriptorsFromTableStart: 0,
-        };
-        let b_uav_rng = D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-            NumDescriptors: 1,
-            BaseShaderRegister: 0,
-            RegisterSpace: 0,
-            OffsetInDescriptorsFromTableStart: 0,
-        };
-        let b_params = [
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &b_srv_rng },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &b_uav_rng },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-        ];
-        let clamp_samp = static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 1);
-        let bloom_root_sig = create_root_sig(device, &b_params, &[clamp_samp], D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        let taa_root_sig = make_cs_rs(8, 5, true);
+        let taa_pso = create_compute_pso_local(device, &taa_root_sig, AAA_TAA_CS_DXIL);
+
+        let autoexp_root_sig = make_cs_rs(4, 1, true);
+        let autoexp_pso = create_compute_pso_local(device, &autoexp_root_sig, AAA_AUTOEXP_CS_DXIL);
+
+        let bloom_root_sig = make_cs_rs(4, 1, true);
         let bloom_pso = create_compute_pso_local(device, &bloom_root_sig, AAA_BLOOM_CS_DXIL);
 
         // Composite root sig (CB b0 + SRV range(3) t0..t2 + clamp sampler s0)
@@ -1138,14 +1232,21 @@ impl AaaPostPipeline {
             direct_hdr,
             raw_rtgi,
             normal_depth,
+            motion_vec,
             denoise_a,
             denoise_b,
+            taa_hist,
+            exposure_buf,
             bloom_a,
             bloom_b,
             gbuf_rtv_heap,
             rtv_inc,
             denoise_root_sig,
             denoise_pso,
+            taa_root_sig,
+            taa_pso,
+            autoexp_root_sig,
+            autoexp_pso,
             bloom_root_sig,
             bloom_pso,
             comp_root_sig,
@@ -1160,12 +1261,14 @@ impl AaaPostPipeline {
             D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr },
             D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + self.rtv_inc as usize },
             D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + 2 * self.rtv_inc as usize },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + 3 * self.rtv_inc as usize },
         ];
         cmd.ClearRenderTargetView(rtvs[0], &[0.14, 0.08, 0.14, 1.0], None);
         cmd.ClearRenderTargetView(rtvs[1], &[0.0, 0.0, 0.0, 0.0], None);
         cmd.ClearRenderTargetView(rtvs[2], &[0.0, 0.0, 0.0, 9999.0], None);
+        cmd.ClearRenderTargetView(rtvs[3], &[0.0, 0.0, 0.0, 0.0], None);
         cmd.ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, &[]);
-        cmd.OMSetRenderTargets(3, Some(rtvs.as_ptr()), false, Some(&dsv_handle));
+        cmd.OMSetRenderTargets(4, Some(rtvs.as_ptr()), false, Some(&dsv_handle));
         let vp = D3D12_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
@@ -1179,6 +1282,7 @@ impl AaaPostPipeline {
         cmd.RSSetScissorRects(&[sc]);
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn run_post_and_composite(
         &self,
         cmd: &ID3D12GraphicsCommandList,
@@ -1187,6 +1291,8 @@ impl AaaPostPipeline {
         out_w: u32,
         out_h: u32,
         rtgi_enabled: bool,
+        frame_idx: u32,
+        sun_screen_dir: [f32; 2],
         time: f32,
     ) {
         let srv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1194,6 +1300,7 @@ impl AaaPostPipeline {
         let gpu_at = |slot: usize| D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: gpu_base.ptr + (slot * self.srv_inc as usize) as u64,
         };
+        let cur = (frame_idx & 1) as usize;
 
         cmd_barriers(
             cmd,
@@ -1201,27 +1308,27 @@ impl AaaPostPipeline {
                 transition_barrier(&self.direct_hdr, D3D12_RESOURCE_STATE_RENDER_TARGET, srv_state),
                 transition_barrier(&self.raw_rtgi, D3D12_RESOURCE_STATE_RENDER_TARGET, srv_state),
                 transition_barrier(&self.normal_depth, D3D12_RESOURCE_STATE_RENDER_TARGET, srv_state),
+                transition_barrier(&self.motion_vec, D3D12_RESOURCE_STATE_RENDER_TARGET, srv_state),
             ],
         );
 
         cmd.SetDescriptorHeaps(&[Some(main_srv_heap.clone())]);
 
+        let gx = self.width.div_ceil(8);
+        let gy = self.height.div_ceil(8);
+
         // 1. 4-Pass A-Trous Bilateral Denoiser (step = 1, 2, 4, 8) for 2-spp Diffuse RTGI
         if rtgi_enabled {
-            let gx = self.width.div_ceil(8);
-            let gy = self.height.div_ceil(8);
             cmd.SetComputeRootSignature(&self.denoise_root_sig);
             cmd.SetPipelineState(&self.denoise_pso);
 
-            // Pass 1 (step=1): raw_rtgi(70) -> denoise_a(74)
             cmd_barriers(cmd, vec![transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
             let c1 = [self.width, self.height, 1u32, 0u32];
             cmd.SetComputeRoot32BitConstants(0, 4, c1.as_ptr() as *const c_void, 0);
-            cmd.SetComputeRootDescriptorTable(1, gpu_at(70));
-            cmd.SetComputeRootDescriptorTable(2, gpu_at(74));
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(74));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(80));
             cmd.Dispatch(gx, gy, 1);
 
-            // Pass 2 (step=2): denoise_a(72) -> denoise_b(75)
             cmd_barriers(
                 cmd,
                 vec![
@@ -1232,11 +1339,10 @@ impl AaaPostPipeline {
             );
             let c2 = [self.width, self.height, 2u32, 0u32];
             cmd.SetComputeRoot32BitConstants(0, 4, c2.as_ptr() as *const c_void, 0);
-            cmd.SetComputeRootDescriptorTable(1, gpu_at(72));
-            cmd.SetComputeRootDescriptorTable(2, gpu_at(75));
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(76));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(81));
             cmd.Dispatch(gx, gy, 1);
 
-            // Pass 3 (step=4): denoise_b(84) -> denoise_a(74)
             cmd_barriers(
                 cmd,
                 vec![
@@ -1247,11 +1353,10 @@ impl AaaPostPipeline {
             );
             let c3 = [self.width, self.height, 4u32, 0u32];
             cmd.SetComputeRoot32BitConstants(0, 4, c3.as_ptr() as *const c_void, 0);
-            cmd.SetComputeRootDescriptorTable(1, gpu_at(84));
-            cmd.SetComputeRootDescriptorTable(2, gpu_at(74));
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(78));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(80));
             cmd.Dispatch(gx, gy, 1);
 
-            // Pass 4 (step=8): denoise_a(72) -> denoise_b(75)
             cmd_barriers(
                 cmd,
                 vec![
@@ -1262,33 +1367,79 @@ impl AaaPostPipeline {
             );
             let c4 = [self.width, self.height, 8u32, 0u32];
             cmd.SetComputeRoot32BitConstants(0, 4, c4.as_ptr() as *const c_void, 0);
-            cmd.SetComputeRootDescriptorTable(1, gpu_at(72));
-            cmd.SetComputeRootDescriptorTable(2, gpu_at(75));
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(76));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(81));
             cmd.Dispatch(gx, gy, 1);
 
             cmd_barriers(
                 cmd,
                 vec![
                     uav_barrier(&self.denoise_b),
-                    transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                    transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                     transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                 ],
             );
         } else {
-            cmd_barriers(cmd, vec![transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
+            cmd_barriers(cmd, vec![transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
         }
 
-        // 2. 3-Dispatch Half-Res HDR Bloom (Bright-pass downsample -> H blur -> V blur)
+        // 2. Screen-Space Contact Shadows + Variance-Clipped YCoCg TAA
+        cmd_barriers(cmd, vec![transition_barrier(&self.taa_hist[cur], srv_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        cmd.SetComputeRootSignature(&self.taa_root_sig);
+        cmd.SetPipelineState(&self.taa_pso);
+        let taa_cb: [u32; 8] = [
+            self.width,
+            self.height,
+            frame_idx,
+            if rtgi_enabled { 0.80f32.to_bits() } else { 0u32 },
+            sun_screen_dir[0].to_bits(),
+            sun_screen_dir[1].to_bits(),
+            1.0f32.to_bits(),
+            0u32,
+        ];
+        cmd.SetComputeRoot32BitConstants(0, 8, taa_cb.as_ptr() as *const c_void, 0);
+        cmd.SetComputeRootDescriptorTable(1, gpu_at(82 + cur * 6));
+        cmd.SetComputeRootDescriptorTable(2, gpu_at(87 + cur * 6));
+        cmd.Dispatch(gx, gy, 1);
+
+        cmd_barriers(
+            cmd,
+            vec![
+                uav_barrier(&self.taa_hist[cur]),
+                transition_barrier(&self.taa_hist[cur], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv_state),
+                transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&self.exposure_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ],
+        );
+
+        // 3. Log-Average Histogram Auto-Exposure
+        cmd.SetComputeRootSignature(&self.autoexp_root_sig);
+        cmd.SetPipelineState(&self.autoexp_pso);
+        let exp_cb = [self.width, self.height, frame_idx, 0.06f32.to_bits()];
+        cmd.SetComputeRoot32BitConstants(0, 4, exp_cb.as_ptr() as *const c_void, 0);
+        cmd.SetComputeRootDescriptorTable(1, gpu_at(95 + cur));
+        cmd.SetComputeRootDescriptorTable(2, gpu_at(94));
+        cmd.Dispatch(1, 1, 1);
+
+        cmd_barriers(
+            cmd,
+            vec![
+                uav_barrier(&self.exposure_buf),
+                transition_barrier(&self.exposure_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            ],
+        );
+
+        // 4. 3-Dispatch Half-Res HDR Bloom (threshold=1.45 to keep sunset sky crisp)
         let bx = self.half_w.div_ceil(8);
         let by = self.half_h.div_ceil(8);
         cmd.SetComputeRootSignature(&self.bloom_root_sig);
         cmd.SetPipelineState(&self.bloom_pso);
 
         cmd_barriers(cmd, vec![transition_barrier(&self.bloom_a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
-        let b0 = [self.half_w, self.half_h, 0u32, 1.05f32.to_bits()];
+        let b0 = [self.half_w, self.half_h, 0u32, 1.45f32.to_bits()];
         cmd.SetComputeRoot32BitConstants(0, 4, b0.as_ptr() as *const c_void, 0);
-        cmd.SetComputeRootDescriptorTable(1, gpu_at(76)); // direct_hdr
-        cmd.SetComputeRootDescriptorTable(2, gpu_at(79)); // bloom_a UAV
+        cmd.SetComputeRootDescriptorTable(1, gpu_at(95 + cur)); // taa_hist[cur]
+        cmd.SetComputeRootDescriptorTable(2, gpu_at(99)); // bloom_a UAV
         cmd.Dispatch(bx, by, 1);
 
         cmd_barriers(
@@ -1301,8 +1452,8 @@ impl AaaPostPipeline {
         );
         let b1 = [self.half_w, self.half_h, 1u32, 0u32];
         cmd.SetComputeRoot32BitConstants(0, 4, b1.as_ptr() as *const c_void, 0);
-        cmd.SetComputeRootDescriptorTable(1, gpu_at(77)); // bloom_a SRV
-        cmd.SetComputeRootDescriptorTable(2, gpu_at(80)); // bloom_b UAV
+        cmd.SetComputeRootDescriptorTable(1, gpu_at(97)); // bloom_a SRV
+        cmd.SetComputeRootDescriptorTable(2, gpu_at(100)); // bloom_b UAV
         cmd.Dispatch(bx, by, 1);
 
         cmd_barriers(
@@ -1315,8 +1466,8 @@ impl AaaPostPipeline {
         );
         let b2 = [self.half_w, self.half_h, 2u32, 0u32];
         cmd.SetComputeRoot32BitConstants(0, 4, b2.as_ptr() as *const c_void, 0);
-        cmd.SetComputeRootDescriptorTable(1, gpu_at(78)); // bloom_b SRV
-        cmd.SetComputeRootDescriptorTable(2, gpu_at(79)); // bloom_a UAV
+        cmd.SetComputeRootDescriptorTable(1, gpu_at(98)); // bloom_b SRV
+        cmd.SetComputeRootDescriptorTable(2, gpu_at(99)); // bloom_a UAV
         cmd.Dispatch(bx, by, 1);
 
         cmd_barriers(
@@ -1328,7 +1479,7 @@ impl AaaPostPipeline {
             ],
         );
 
-        // 3. Final Composite Pass: HDR + RTGI + Bloom + ACES + sRGB + Vignette
+        // 5. Final Composite Pass: TAA + Bloom + Auto-Exposure + AgX Filmic + CAS Sharpen
         cmd.OMSetRenderTargets(1, Some(&backbuffer_rtv), false, None);
         let vp = D3D12_VIEWPORT {
             TopLeftX: 0.0,
@@ -1344,14 +1495,9 @@ impl AaaPostPipeline {
 
         cmd.SetGraphicsRootSignature(&self.comp_root_sig);
         cmd.SetPipelineState(&self.comp_pso);
-        let comp_cb = [
-            if rtgi_enabled { 0.85f32 } else { 0.0f32 },
-            0.22f32,
-            1.15f32,
-            time,
-        ];
+        let comp_cb = [0.12f32, 0.35f32, 1.0f32, time];
         cmd.SetGraphicsRoot32BitConstants(0, 4, comp_cb.as_ptr() as *const c_void, 0);
-        cmd.SetGraphicsRootDescriptorTable(1, gpu_at(81)); // direct_hdr, denoise_b, bloom_a
+        cmd.SetGraphicsRootDescriptorTable(1, gpu_at(101 + cur * 3));
         cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmd.DrawInstanced(3, 1, 0, 0);
 
@@ -1361,8 +1507,9 @@ impl AaaPostPipeline {
                 transition_barrier(&self.direct_hdr, srv_state, D3D12_RESOURCE_STATE_RENDER_TARGET),
                 transition_barrier(&self.raw_rtgi, srv_state, D3D12_RESOURCE_STATE_RENDER_TARGET),
                 transition_barrier(&self.normal_depth, srv_state, D3D12_RESOURCE_STATE_RENDER_TARGET),
-                transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&self.motion_vec, srv_state, D3D12_RESOURCE_STATE_RENDER_TARGET),
                 transition_barrier(&self.bloom_a, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&self.exposure_buf, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
             ],
         );
     }
@@ -1551,12 +1698,12 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 NodeMask: 0,
             })
             .unwrap();
-        // 0..34 (table slot 0) + 35..69 (table slot 1) + 70..83 (RTGI / Bloom / Composite)
+        // 0..36 (table slot 0) + 37..73 (table slot 1) + 74..106 (RTGI / TAA / AutoExp / Bloom / Composite)
         let main_srv_heap: ID3D12DescriptorHeap = ctx
             .device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 96,
+                NumDescriptors: 128,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1753,11 +1900,12 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let _ = ManuallyDrop::take(&mut h_dst.pResource);
         let _ = ManuallyDrop::take(&mut h_src.pResource);
 
+        let geo_srv_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         cmd_barriers(
             &init_cmd,
             vec![
-                transition_barrier(&vb_def, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
-                transition_barrier(&ib_def, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER),
+                transition_barrier(&vb_def, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | geo_srv_state),
+                transition_barrier(&ib_def, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER | geo_srv_state),
                 transition_barrier(&dummy_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
                 transition_barrier(&hdri_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             ],
@@ -1786,7 +1934,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             wstate.rtgi_enabled = false;
         }
 
-        // Populate main_srv_heap slots 0..34 (frame slot 0) and 35..69 (frame slot 1)
+        // Populate main_srv_heap slots 0..36 (frame slot 0) and 37..73 (frame slot 1)
         let srv_base = main_srv_heap.GetCPUDescriptorHandleForHeapStart();
         let cpu_at = |idx: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: srv_base.ptr + idx * srv_inc as usize,
@@ -1836,19 +1984,19 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 tlas_sd.Anonymous.RaytracingAccelerationStructure.Location = rt.tlas_result[frame_slot].GetGPUVirtualAddress();
                 ctx.device.CreateShaderResourceView(None, Some(&tlas_sd), cpu_at(base + 33));
 
-                let mut col_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                let mut meta_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: DXGI_FORMAT_UNKNOWN,
                     ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
                     Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                     ..Default::default()
                 };
-                col_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                meta_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
                     FirstElement: 0,
                     NumElements: MAX_RT_INSTANCES as u32,
-                    StructureByteStride: size_of::<[f32; 4]>() as u32,
+                    StructureByteStride: size_of::<RtInstMeta>() as u32,
                     Flags: D3D12_BUFFER_SRV_FLAG_NONE,
                 };
-                ctx.device.CreateShaderResourceView(&rt.inst_colors_upload[frame_slot], Some(&col_sd), cpu_at(base + 34));
+                ctx.device.CreateShaderResourceView(&rt.inst_meta_upload[frame_slot], Some(&meta_sd), cpu_at(base + 34));
             } else {
                 // Fallback SRVs when DXR is absent
                 let mut buf_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -1860,12 +2008,41 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 buf_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
                     FirstElement: 0,
                     NumElements: 1,
-                    StructureByteStride: 16,
+                    StructureByteStride: size_of::<RtInstMeta>() as u32,
                     Flags: D3D12_BUFFER_SRV_FLAG_NONE,
                 };
                 ctx.device.CreateShaderResourceView(&vb_def, Some(&buf_sd), cpu_at(base + 33));
                 ctx.device.CreateShaderResourceView(&vb_def, Some(&buf_sd), cpu_at(base + 34));
             }
+
+            // t35 = ByteAddressBuffer g_SceneVB, t36 = StructuredBuffer<uint> g_SceneIB (for textured DXR hits)
+            let mut vb_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            vb_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: (vb_bytes / 4) as u32,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            };
+            ctx.device.CreateShaderResourceView(&vb_def, Some(&vb_sd), cpu_at(base + 35));
+
+            let mut ib_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            ib_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: all_indices.len() as u32,
+                StructureByteStride: 4,
+                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            };
+            ctx.device.CreateShaderResourceView(&ib_def, Some(&ib_sd), cpu_at(base + 36));
         }
 
         let post = AaaPostPipeline::new(&ctx.device, render_w, render_h, &main_srv_heap, srv_inc);
@@ -1882,7 +2059,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 20 },
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: (size_of::<SkyConstants>() / 4) as u32 },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
@@ -1901,6 +2078,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         gbuf_formats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         gbuf_formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         gbuf_formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        gbuf_formats[3] = DXGI_FORMAT_R16G16_FLOAT;
         let gbuf_blends = [D3D12_RENDER_TARGET_BLEND_DESC {
             RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
             ..Default::default()
@@ -1924,7 +2102,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 ..Default::default()
             },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-            NumRenderTargets: 3,
+            NumRenderTargets: 4,
             RTVFormats: gbuf_formats,
             DSVFormat: DXGI_FORMAT_D32_FLOAT,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
@@ -1933,7 +2111,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let sky_pso: ID3D12PipelineState = ctx.device.CreateGraphicsPipelineState(&sky_pso_desc).unwrap();
         let _ = ManuallyDrop::take(&mut sky_pso_desc.pRootSignature);
 
-        // AAA PBR PSO
+        // AAA PBR PSO (b0 = AaaDrawCB 52 DWORDs, t0..t36 SRV table, b1 = AaaFrameCB root CBV)
         let pbr_srv_rng = D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             NumDescriptors: SRV_TABLE_STRIDE as u32,
@@ -1960,6 +2138,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
         ];
         let pbr_samplers = [
             static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, 8),
@@ -1971,6 +2156,11 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             &pbr_samplers,
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
         );
+
+        let frame_cb_upload = [
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+        ];
 
         let input_elems = [
             D3D12_INPUT_ELEMENT_DESC {
@@ -2032,7 +2222,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 NumElements: input_elems.len() as u32,
             },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-            NumRenderTargets: 3,
+            NumRenderTargets: 4,
             RTVFormats: gbuf_formats,
             DSVFormat: DXGI_FORMAT_D32_FLOAT,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
@@ -2120,6 +2310,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let mut last_title = start_time;
         let mut fps_accum = 0u32;
         let mut last_decode_ms = 0.0f64;
+        let mut prev_vp_unjittered: Option<Mat4> = None;
+        let mut prev_traffic_mats: Option<Vec<Mat4>> = None;
 
         'main_loop: loop {
             let mut msg = MSG::default();
@@ -2240,13 +2432,55 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 }
             };
 
+            let halton = |mut idx: u32, base: u32| -> f32 {
+                let mut f = 1.0f32;
+                let mut r = 0.0f32;
+                while idx > 0 {
+                    f /= base as f32;
+                    r += f * (idx % base) as f32;
+                    idx /= base;
+                }
+                r
+            };
+            let j_idx = (frame_count % 8) + 1;
+            let jit_x = (halton(j_idx, 2) - 0.5) * (2.0 / render_w as f32);
+            let jit_y = (halton(j_idx, 3) - 0.5) * (2.0 / render_h as f32);
+
             let view = Mat4::look_at_rh(cam_pos, cam_target, [0.0, 1.0, 0.0]);
-            let proj = Mat4::perspective_rh(46.0f32.to_radians(), render_w as f32 / render_h as f32, 0.1, 600.0);
-            let vp = proj.mul(&view);
-            let inv_vp = vp.inverse();
+            let proj_unjit = Mat4::perspective_rh(46.0f32.to_radians(), render_w as f32 / render_h as f32, 0.1, 600.0);
+            let mut proj_jit = proj_unjit;
+            proj_jit.0[8] += jit_x;
+            proj_jit.0[9] += jit_y;
+
+            let vp_unjit = proj_unjit.mul(&view);
+            let vp_jit = proj_jit.mul(&view);
+            let inv_vp_unjit = vp_unjit.inverse();
+            let prev_vp = prev_vp_unjittered.unwrap_or(vp_unjit);
+
+            let sun_dir = norm3([0.28, 0.16, 0.94]);
+            let proj_pt_px = |p: [f32; 3]| -> Option<[f32; 2]> {
+                let m = &vp_unjit.0;
+                let cx = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12];
+                let cy = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13];
+                let cw = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15];
+                if cw.abs() < 1e-4 {
+                    return None;
+                }
+                let u = (cx / cw) * 0.5 + 0.5;
+                let v = 0.5 - (cy / cw) * 0.5;
+                Some([u * render_w as f32, v * render_h as f32])
+            };
+            let sun_screen_dir = match (
+                proj_pt_px(cam_target),
+                proj_pt_px([cam_target[0] + sun_dir[0] * 2.0, cam_target[1] + sun_dir[1] * 2.0, cam_target[2] + sun_dir[2] * 2.0]),
+            ) {
+                (Some(a), Some(b)) => [b[0] - a[0], b[1] - a[1]],
+                _ => [0.35, -0.45],
+            };
 
             // Build scene instance list (Hero Car + 5 Traffic Cars + Environment)
             let mut traffic_mats = Vec::with_capacity(5);
+            let mut cur_traffic_xfs = Vec::with_capacity(5);
             let traffic_specs = [
                 (-5.2f32, 34.0f32, 0.0f32, 11.0f32, [0.85f32, 0.22, 0.18, 0.0]),
                 (5.4f32, 19.0f32, std::f32::consts::PI, -14.0f32, [0.18, 0.55, 0.88, 0.0]),
@@ -2258,8 +2492,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let z = ((z0 + t_sec * spd + 110.0).rem_euclid(220.0)) - 110.0;
                 // Keep traffic lane far clear of hero car lane (-3..+3)
                 let xf = Mat4::translation(lx, 0.0, z).mul(&Mat4::rotate_y(yaw));
+                cur_traffic_xfs.push(xf);
                 traffic_mats.push((xf, col));
             }
+            let prev_t_xfs = prev_traffic_mats.as_deref().unwrap_or(&cur_traffic_xfs);
 
             let cmd_alloc = &cmd_allocs[slot];
             let cmd = &cmd_lists[slot];
@@ -2333,7 +2569,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 residency.mark_resident(&taken);
             }
 
-            // Build TLAS BEFORE OMSetRenderTargets
+            // Build TLAS BEFORE OMSetRenderTargets (with textured surface metadata per instance)
             let asphalt_model = Mat4::translation(0.0, 0.0, 0.0).mul(&Mat4::scale(24.0, 1.0, 320.0));
             let prom_l_model = Mat4::translation(-18.0, 0.08, 0.0).mul(&Mat4::scale(12.0, 1.0, 320.0));
             let prom_r_model = Mat4::translation(18.0, 0.08, 0.0).mul(&Mat4::scale(12.0, 1.0, 320.0));
@@ -2342,22 +2578,78 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             if let Some(ref rt) = dxr {
                 let mut rt_insts = Vec::with_capacity(32);
-                rt_insts.push((0usize, hero_model.to_3x4(), [0.78, 0.28, 0.14, 0.25]));
+                rt_insts.push((
+                    0usize,
+                    hero_model.to_3x4(),
+                    RtInstMeta {
+                        base_color: [0.80, 0.08, 0.05, 0.12],
+                        geom: [0, 0, u32::MAX, 0],
+                        uv_params: [1.0, 0.0, 0.0, 0.0],
+                    },
+                ));
                 for (m, col) in &traffic_mats {
-                    rt_insts.push((0usize, m.to_3x4(), *col));
+                    rt_insts.push((
+                        0usize,
+                        m.to_3x4(),
+                        RtInstMeta {
+                            base_color: *col,
+                            geom: [0, 0, u32::MAX, 0],
+                            uv_params: [1.0, 0.0, 0.0, 0.0],
+                        },
+                    ));
                 }
-                rt_insts.push((2usize, asphalt_model.to_3x4(), [0.16, 0.15, 0.17, 0.0]));
-                rt_insts.push((2usize, prom_l_model.to_3x4(), [0.46, 0.34, 0.26, 0.0]));
-                rt_insts.push((2usize, prom_r_model.to_3x4(), [0.46, 0.34, 0.26, 0.0]));
-                rt_insts.push((1usize, seawall_model.to_3x4(), [0.58, 0.54, 0.48, 0.0]));
+                rt_insts.push((
+                    2usize,
+                    asphalt_model.to_3x4(),
+                    RtInstMeta {
+                        base_color: [0.95, 0.95, 0.95, 0.0],
+                        geom: [plane_base_vert, plane_idx_offset, pack.asphalt_tex[0], 0],
+                        uv_params: [22.0, 0.0, 0.0, 0.0],
+                    },
+                ));
+                rt_insts.push((
+                    2usize,
+                    prom_l_model.to_3x4(),
+                    RtInstMeta {
+                        base_color: [1.0, 0.96, 0.94, 0.0],
+                        geom: [plane_base_vert, plane_idx_offset, pack.promenade_tex[0], 0],
+                        uv_params: [28.0, 0.0, 0.0, 0.0],
+                    },
+                ));
+                rt_insts.push((
+                    2usize,
+                    prom_r_model.to_3x4(),
+                    RtInstMeta {
+                        base_color: [1.0, 0.96, 0.94, 0.0],
+                        geom: [plane_base_vert, plane_idx_offset, pack.promenade_tex[0], 0],
+                        uv_params: [28.0, 0.0, 0.0, 0.0],
+                    },
+                ));
+                rt_insts.push((
+                    1usize,
+                    seawall_model.to_3x4(),
+                    RtInstMeta {
+                        base_color: [0.92, 0.88, 0.84, 0.0],
+                        geom: [box_base_vert, box_idx_offset, pack.concrete_tex[0], 0],
+                        uv_params: [12.0, 0.0, 0.0, 0.0],
+                    },
+                ));
                 for (pos, scale, col) in &towers {
                     let tm = Mat4::translation(pos[0], pos[1], pos[2]).mul(&Mat4::scale(scale[0], scale[1], scale[2]));
-                    rt_insts.push((1usize, tm.to_3x4(), [col[0], col[1], col[2], 0.12]));
+                    rt_insts.push((
+                        1usize,
+                        tm.to_3x4(),
+                        RtInstMeta {
+                            base_color: [col[0], col[1], col[2], 0.08],
+                            geom: [box_base_vert, box_idx_offset, pack.concrete_tex[0], 0],
+                            uv_params: [4.0, 0.0, 0.0, 0.0],
+                        },
+                    ));
                 }
                 rt.build_tlas(&mut ctx, slot, &rt_insts);
             }
 
-            // Begin 3-MRT G-Buffer pass
+            // Begin 4-MRT G-Buffer pass (DirectHDR + RawRTGI + NormalDepth + MotionVec)
             post.begin_gbuffer(cmd, dsv_handle);
             let gpu_base = main_srv_heap.GetGPUDescriptorHandleForHeapStart();
             let table_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
@@ -2372,51 +2664,59 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             cmd.SetGraphicsRootSignature(&sky_root_sig);
             cmd.SetPipelineState(&sky_pso);
             let sky_cb = SkyConstants {
-                inv_view_proj: inv_vp.0,
+                inv_view_proj: inv_vp_unjit.0,
+                prev_view_proj: prev_vp.0,
                 camera_pos: cam_pos,
                 time: t_sec,
             };
-            cmd.SetGraphicsRoot32BitConstants(0, 20, &sky_cb as *const SkyConstants as *const c_void, 0);
+            cmd.SetGraphicsRoot32BitConstants(0, (size_of::<SkyConstants>() / 4) as u32, &sky_cb as *const SkyConstants as *const c_void, 0);
             cmd.SetGraphicsRootDescriptorTable(1, env_gpu);
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cmd.DrawInstanced(3, 1, 0, 0);
 
             // 2. PBR Geometry
-            cmd.SetGraphicsRootSignature(&pbr_root_sig);
-            cmd.SetPipelineState(&pbr_pso);
-            cmd.SetGraphicsRootDescriptorTable(1, table_gpu);
-            cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            cmd.IASetVertexBuffers(0, Some(&[vb_view]));
-            cmd.IASetIndexBuffer(Some(&ib_view));
-
             let flags_bits = (if wstate.rt_enabled { 1u32 } else { 0u32 })
                 | (if wstate.rtgi_enabled { 2u32 } else { 0u32 })
                 | (if wstate.xray_enabled { 4u32 } else { 0u32 });
             let flags_f = flags_bits as f32;
 
-            let draw_car = |model: &Mat4| {
-                let mvp = vp.mul(model);
+            let frame_cb = AaaFrameCB {
+                vp_jittered: vp_jit.0,
+                vp_unjittered: vp_unjit.0,
+                prev_vp_unjittered: prev_vp.0,
+                camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], flags_f],
+                sun_dir_time: [sun_dir[0], sun_dir[1], sun_dir[2], t_sec],
+                jitter_res: [jit_x, jit_y, render_w as f32, render_h as f32],
+            };
+            upload_slice(&frame_cb_upload[slot], std::slice::from_ref(&frame_cb));
+
+            cmd.SetGraphicsRootSignature(&pbr_root_sig);
+            cmd.SetPipelineState(&pbr_pso);
+            cmd.SetGraphicsRootDescriptorTable(1, table_gpu);
+            cmd.SetGraphicsRootConstantBufferView(2, frame_cb_upload[slot].GetGPUVirtualAddress());
+            cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd.IASetVertexBuffers(0, Some(&[vb_view]));
+            cmd.IASetIndexBuffer(Some(&ib_view));
+
+            let draw_car = |model: &Mat4, prev_model: &Mat4| {
                 for sm in &pack.car.submeshes {
-                    draw_car_submesh(cmd, &mvp, model, cam_pos, flags_f, t_sec, sm, &residency, &pack.textures);
+                    draw_car_submesh(cmd, model, prev_model, t_sec, sm, &residency, &pack.textures);
                 }
             };
 
             // Hero Car + 5 animated CarConcept traffic cars
-            draw_car(&hero_model);
-            for (tm, _) in &traffic_mats {
-                draw_car(tm);
+            draw_car(&hero_model, &hero_model);
+            for (idx, (tm, _)) in traffic_mats.iter().enumerate() {
+                draw_car(tm, &prev_t_xfs[idx]);
             }
 
             // Wet 4-lane Asphalt Road
             draw_static_mesh(
                 cmd,
-                &vp,
                 &asphalt_model,
                 plane_base_vert,
                 plane_idx_offset,
                 6,
-                cam_pos,
-                flags_f,
                 t_sec,
                 [0.95, 0.95, 0.95, 1.0],
                 [0.0, 0.85, 22.0, 3.0], // wetAsphalt mode=3, 22x tiled
@@ -2427,13 +2727,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             // Brick Promenades (Left + Right)
             draw_static_mesh(
                 cmd,
-                &vp,
                 &prom_l_model,
                 plane_base_vert,
                 plane_idx_offset,
                 6,
-                cam_pos,
-                flags_f,
                 t_sec,
                 [1.0, 0.96, 0.94, 1.0],
                 [0.0, 0.85, 28.0, 2.0], // PolyHaven mode=2
@@ -2443,13 +2740,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             );
             draw_static_mesh(
                 cmd,
-                &vp,
                 &prom_r_model,
                 plane_base_vert,
                 plane_idx_offset,
                 6,
-                cam_pos,
-                flags_f,
                 t_sec,
                 [1.0, 0.96, 0.94, 1.0],
                 [0.0, 0.85, 28.0, 2.0],
@@ -2460,13 +2754,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             // Concrete Seawall Curb
             draw_static_mesh(
                 cmd,
-                &vp,
                 &seawall_model,
                 box_base_vert,
                 box_idx_offset,
                 36,
-                cam_pos,
-                flags_f,
                 t_sec,
                 [0.92, 0.88, 0.84, 1.0],
                 [0.0, 0.88, 12.0, 2.0],
@@ -2477,13 +2768,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             // Glossy Sunset Ocean Plane
             draw_static_mesh(
                 cmd,
-                &vp,
                 &ocean_model,
                 plane_base_vert,
                 plane_idx_offset,
                 6,
-                cam_pos,
-                flags_f,
                 t_sec,
                 [0.05, 0.14, 0.22, 1.0],
                 [0.15, 0.05, 1.0, 0.0],
@@ -2496,13 +2784,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let tm = Mat4::translation(pos[0], pos[1], pos[2]).mul(&Mat4::scale(scale[0], scale[1], scale[2]));
                 draw_static_mesh(
                     cmd,
-                    &vp,
                     &tm,
                     box_base_vert,
                     box_idx_offset,
                     36,
-                    cam_pos,
-                    flags_f,
                     t_sec,
                     [col[0], col[1], col[2], 1.0],
                     [0.05, 0.72, 4.0, 2.0],
@@ -2512,7 +2797,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 );
             }
 
-            // Backbuffer transition -> RT + Run RTGI Denoiser + Bloom + ACES Composite
+            // Backbuffer transition -> RT + Run RTGI Denoiser + TAA + AutoExp + Bloom + AgX/CAS Composite
             let bb_idx = swap_chain.GetCurrentBackBufferIndex();
             let bb = &backbuffers[bb_idx as usize];
             let bb_rtv = D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -2527,8 +2812,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 SWAP_W,
                 SWAP_H,
                 wstate.rtgi_enabled,
+                frame_count,
+                sun_screen_dir,
                 t_sec,
             );
+
+            prev_vp_unjittered = Some(vp_unjit);
+            prev_traffic_mats = Some(cur_traffic_xfs);
 
             let take_shot = cfg.screenshot_path.is_some() && frame_count + 1 >= cfg.screenshot_frames;
             if take_shot {
@@ -2664,10 +2954,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_car_submesh(
     cmd: &ID3D12GraphicsCommandList,
-    mvp: &Mat4,
     model: &Mat4,
-    cam_pos: [f32; 3],
-    flags_f: f32,
+    prev_model: &Mat4,
     t_sec: f32,
     sm: &PbrSubmesh,
     residency: &TextureResidency,
@@ -2683,9 +2971,8 @@ unsafe fn draw_car_submesh(
         .unwrap_or(16.0);
 
     let cb = AaaDrawCB {
-        mvp: mvp.0,
         model: model.0,
-        camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], flags_f],
+        prev_model: prev_model.0,
         base_color: sm.base_color_factor,
         mat_params: [
             sm.metallic_factor,
@@ -2709,13 +2996,10 @@ unsafe fn draw_car_submesh(
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_static_mesh(
     cmd: &ID3D12GraphicsCommandList,
-    vp: &Mat4,
     model: &Mat4,
     base_vert: u32,
     idx_offset: u32,
     idx_count: u32,
-    cam_pos: [f32; 3],
-    flags_f: f32,
     t_sec: f32,
     base_color: [f32; 4],
     mat_params: [f32; 4],
@@ -2723,16 +3007,14 @@ unsafe fn draw_static_mesh(
     residency: &TextureResidency,
     textures: &[BcpackTexture2D],
 ) {
-    let mvp = vp.mul(model);
     let strips = if tex3[0] != u32::MAX {
         (textures[tex3[0] as usize].height / textures[tex3[0] as usize].strip_height.max(1)) as f32
     } else {
         16.0
     };
     let cb = AaaDrawCB {
-        mvp: mvp.0,
         model: model.0,
-        camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], flags_f],
+        prev_model: model.0,
         base_color,
         mat_params,
         emissive_time: [0.0, 0.0, 0.0, t_sec],
