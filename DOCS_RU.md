@@ -1,6 +1,21 @@
-# bcpack-gpu-hlsl v0.4.0 — Безбарьерный WaveReadLaneAt + Ping-Pong Async Compute (11.33 GB/s, 189 FPS)
+# bcpack-gpu-hlsl v0.5.0 — WaveReadLaneAt + Ping-Pong + DXR 1.1 RayQuery (11.33 GB/s, 171 FPS с RT / 189 FPS без RT)
 
-![Живая 3D-сцена Coastal Highway на Ping-Pong Async Compute GPU](media/highway_demo.gif)
+![Живая 3D-сцена Coastal Highway с аппаратным DXR 1.1 и распаковкой BCPack на лету](media/highway_demo.gif)
+
+![Скриншот v0.5.0: отражения в мокром асфальте/океане и тени от солнца через DXR 1.1 RayQuery](media/highway_rt_v5.png)
+
+---
+
+## Что нового в v0.5.0 (Аппаратный DXR 1.1 `RayQuery` + BVH на RTX 5080)
+
+1. **Полноценная сборка BLAS/TLAS и Inline Ray Tracing ([`src/raytracing.rs`](src/raytracing.rs), [`shaders/scene.hlsl`](shaders/scene.hlsl) `ps_6_5`):**
+   - 5 статических BLAS-структур + пересборка TLAS каждый кадр (`PREFER_FAST_BUILD`, до запуска render pass).
+   - Аппаратные `RayQuery`-тени от солнца + отражения в мокром асфальте, океане, стеклянных башнях и кузовах спорткаров.
+2. **Верификация RT-ядер (`--verify` 8/8 PASS):**
+   - Тест `PASS 8/8 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery`: 4 аналитических луча ([`shaders/rt_verify.hlsl`](shaders/rt_verify.hlsl)) проверены на RT-ядрах RTX 5080 за **`0.003 мс`** (`0` расхождений, DX12 Debug Layer чист).
+3. **Живой FPS в 3D-сцене 1280×720 с DXR 1.1 (`8.0 MiB/кадр` BCPack на лету):**
+   - **DXR 1.1 ON (`[R]`):** **171.45 FPS** (`4.770 мс` декод BCPack) — почти нулевое падение относительно `172.98 FPS` (`--no-rt`).
+   - Клавиша **`[R]`** в окне переключает DXR 1.1 Shadows + Reflections в реальном времени.
 
 ---
 

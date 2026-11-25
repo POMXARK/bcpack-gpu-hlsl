@@ -7,6 +7,7 @@ use crate::gpu_decoder::{
     transition_barrier, upload_slice, BcpackGpuDecoder, GpuContext,
 };
 use crate::meshes::{build_all_meshes, MeshRange, Vertex};
+use crate::raytracing::{tex_reflection_color, RayTracingScene, RtInstanceInput, MAX_RT_INSTANCES};
 use bcpack::bc1::{self, QuadTable, Window};
 use rayon::prelude::*;
 use std::ffi::c_void;
@@ -25,7 +26,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_A, VK_C, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F, VK_LEFT, VK_M, VK_Q,
-    VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
+    VK_R, VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -192,6 +193,8 @@ pub struct DemoConfig {
     pub mode: DemoMode,
     pub initial_chunks: usize, // number of 4096-block tiles/frame (256 = 8.0 MiB/frame)
     pub multi_core_cpu: bool,
+    pub enable_debug: bool,
+    pub start_rt_enabled: bool,
     pub screenshot_path: Option<PathBuf>,
     pub screenshot_frames: u32,
     pub measure_frames: Option<u32>,
@@ -204,6 +207,7 @@ struct WindowState {
     use_gpu: bool,
     multi_core_cpu: bool,
     sfs_enabled: bool,
+    rt_enabled: bool,
     tiles_per_frame: usize,
     cam_mode: u8, // 0 = Chase, 1 = Free Drive, 2 = Helicopter
     should_quit: bool,
@@ -235,6 +239,8 @@ unsafe extern "system" fn wnd_proc(
                     st.use_gpu = !st.use_gpu;
                 } else if vk == VK_F.0 {
                     st.sfs_enabled = !st.sfs_enabled;
+                } else if vk == VK_R.0 {
+                    st.rt_enabled = !st.rt_enabled;
                 } else if vk == VK_M.0 && (st.mode == DemoMode::CpuOnly || !st.use_gpu) {
                     st.multi_core_cpu = !st.multi_core_cpu;
                 } else if vk == VK_C.0 {
@@ -420,7 +426,7 @@ pub fn run_demo(
     cfg: DemoConfig,
 ) {
     unsafe {
-        let mut ctx = GpuContext::new(false);
+        let mut ctx = GpuContext::new(cfg.enable_debug);
         let levels = [48usize, 128, 256, 512, 1024];
         let max_tiles = 1024usize;
         let max_blocks = max_tiles * TILE_BLOCKS;
@@ -497,6 +503,7 @@ pub fn run_demo(
             use_gpu: init_use_gpu,
             multi_core_cpu: cfg.multi_core_cpu,
             sfs_enabled: false,
+            rt_enabled: false,
             tiles_per_frame: init_tiles,
             cam_mode: 0,
             should_quit: false,
@@ -749,7 +756,7 @@ pub fn run_demo(
         let sky_pso: ID3D12PipelineState = ctx.device.CreateGraphicsPipelineState(&sky_pso_desc).unwrap();
         let _ = ManuallyDrop::take(&mut sky_pso_desc.pRootSignature);
 
-        // Scene Root Signature: Root CBV (b0) + DescriptorTable (12 SRVs t0..t11) + StaticSampler (s0)
+        // Scene Root Signature: Root CBV (b0) + DescriptorTable (t0..t11) + Root SRV t12 (TLAS) + Root SRV t13 (InstColors) + StaticSampler (s0)
         let range = D3D12_DESCRIPTOR_RANGE1 {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             NumDescriptors: NUM_TEX as u32,
@@ -776,6 +783,28 @@ pub fn run_demo(
                     DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
                         NumDescriptorRanges: 1,
                         pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            },
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 12,
+                        RegisterSpace: 0,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            },
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 13,
+                        RegisterSpace: 0,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
@@ -923,6 +952,10 @@ pub fn run_demo(
             Format: DXGI_FORMAT_R16_UINT,
         };
 
+        // Build Hardware DXR 1.1 BLAS/TLAS scene (enabled automatically on RTX / RDNA2+ Tier 1.1 GPUs)
+        let rt_scene = RayTracingScene::new(&mut ctx, &vb_buf, &ib_buf, &meshes);
+        wstate.rt_enabled = cfg.start_rt_enabled && rt_scene.is_some();
+
         let frame_allocs: [ID3D12CommandAllocator; 2] = [
             ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(),
             ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(),
@@ -958,9 +991,9 @@ pub fn run_demo(
 
         println!("================================================================");
         match cfg.mode {
-            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.4 (Zero-Barrier + Ping-Pong Async Compute) on: {}", ctx.adapter_name),
-            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.4 (bcpack-rs) on: {}", ctx.adapter_name),
-            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.4 on: {}", ctx.adapter_name),
+            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.5 (Zero-Barrier + Ping-Pong Async Compute + DXR 1.1) on: {}", ctx.adapter_name),
+            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.5 (bcpack-rs) on: {}", ctx.adapter_name),
+            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.5 on: {}", ctx.adapter_name),
         }
         println!("Controls:");
         if cfg.mode == DemoMode::Toggleable {
@@ -970,6 +1003,7 @@ pub fn run_demo(
             println!("  [M]       Toggle CPU 1-Core <-> CPU Multi-Core");
         }
         println!("  [F]       Toggle Sampler Feedback Streaming (SFS) distance LOD budgeting");
+        println!("  [R]       Toggle DXR 1.1 Hardware Inline Ray Tracing (Shadows + Reflections)");
         println!("  [C]       Camera Mode: Chase Car / Free Drive (WASD+QE) / Heli Orbit");
         println!("  [UP/DOWN] Streamed 4K-tiles/frame (48..1024 = 1.5..32 MiB BC1/frame)");
         println!("  [ESC]     Exit");
@@ -1075,10 +1109,14 @@ pub fn run_demo(
                     Some(v) => v,
                     None => gpu_dec.submit_slot_async_compute(&mut ctx, cur_slot, batch),
                 };
-                // 2) Kick next frame's decode onto next_slot asynchronously BEFORE waiting on Direct!
-                let kick_next = cfg.screenshot_path.is_none()
+                // 2) Kick next frame's decode onto next_slot asynchronously ONLY when DXR is off
+                //    (on Blackwell, concurrent high-occupancy Compute + DXR BuildTLAS/RayQuery can trip TDR).
+                let rt_active = rt_scene.is_some() && wstate.rt_enabled;
+                let kick_next = !rt_active
+                    && cfg.screenshot_path.is_none()
                     && (cfg.record_dir.is_none() || frame_count + 1 < cfg.record_frames);
                 if kick_next && pending_compute_fences[next_slot].is_none() {
+                    ctx.wait_direct_cpu(frame_fences[next_slot]);
                     let nf = gpu_dec.submit_slot_async_compute(&mut ctx, next_slot, batch);
                     pending_compute_fences[next_slot] = Some(nf);
                 }
@@ -1145,6 +1183,37 @@ pub fn run_demo(
             }
             cmd_barriers(cmd_list, to_srv);
 
+            // 1. Rebuild Hardware DXR 1.1 TLAS BEFORE binding RenderTarget / starting Render Pass
+            let (objs, point_lights, light_colors) = build_highway_frame(&meshes, t_sec, hero_z);
+            if let Some(ref rt) = rt_scene {
+                let mut rt_inputs = Vec::with_capacity(objs.len().min(MAX_RT_INSTANCES));
+                for obj in objs.iter().take(MAX_RT_INSTANCES) {
+                    let mesh_idx = if obj.mesh.index_offset == meshes.unit_box.index_offset {
+                        0
+                    } else if obj.mesh.index_offset == meshes.car_body.index_offset {
+                        1
+                    } else if obj.mesh.index_offset == meshes.palm_trunk.index_offset {
+                        2
+                    } else if obj.mesh.index_offset == meshes.palm_canopy.index_offset {
+                        3
+                    } else {
+                        4
+                    };
+                    let m = Mat4::trs(obj.pos, obj.rot_y, obj.scale).0;
+                    let transform_3x4 = [
+                        m[0], m[4], m[8], m[12],
+                        m[1], m[5], m[9], m[13],
+                        m[2], m[6], m[10], m[14],
+                    ];
+                    rt_inputs.push(RtInstanceInput {
+                        mesh_idx,
+                        transform_3x4,
+                        color_emissive: tex_reflection_color(obj.tex, obj.emissive),
+                    });
+                }
+                rt.update_and_record_tlas(cmd_list, cur_slot, &rt_inputs);
+            }
+
             let bb_idx = swap_chain.GetCurrentBackBufferIndex();
             let bb = &backbuffers[bb_idx as usize];
             let mut b_rt = [transition_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)];
@@ -1210,7 +1279,7 @@ pub fn run_demo(
             let vp_mat = proj.mul(&view);
             let inv_vp = vp_mat.inverse();
 
-            // 1. Draw Sunset Synthwave Sky Dome
+            // 2. Draw Sunset Synthwave Sky Dome
             cmd_list.SetGraphicsRootSignature(&sky_root_sig);
             cmd_list.SetPipelineState(&sky_pso);
             cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1227,15 +1296,19 @@ pub fn run_demo(
             );
             cmd_list.DrawInstanced(3, 1, 0, 0);
 
-            // 2. Draw Highway, Art-Deco City, Curved Palms, Streetlamps, Hero & Traffic Cars
-            let (objs, point_lights, light_colors) = build_highway_frame(&meshes, t_sec, hero_z);
+            // 3. Draw Highway, Art-Deco City, Curved Palms, Streetlamps, Hero & Traffic Cars
             cmd_list.SetGraphicsRootSignature(&gfx_root_sig);
             cmd_list.SetPipelineState(&gfx_pso);
             cmd_list.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
             cmd_list.SetGraphicsRootDescriptorTable(1, srv_heap.GetGPUDescriptorHandleForHeapStart());
+            if let Some(ref rt) = rt_scene {
+                cmd_list.SetGraphicsRootShaderResourceView(2, rt.tlas_gpu_va(cur_slot));
+                cmd_list.SetGraphicsRootShaderResourceView(3, rt.inst_colors_gpu_va(cur_slot));
+            }
             cmd_list.IASetVertexBuffers(0, Some(&[vbv]));
             cmd_list.IASetIndexBuffer(Some(&ibv));
 
+            let rt_flag = if rt_scene.is_some() && wstate.rt_enabled { 1.0f32 } else { 0.0f32 };
             for (di, obj) in objs.iter().take(MAX_DRAWS).enumerate() {
                 let model = Mat4::trs(obj.pos, obj.rot_y, obj.scale);
                 let mvp = vp_mat.mul(&model);
@@ -1248,7 +1321,7 @@ pub fn run_demo(
                     emissive: obj.emissive,
                     time: t_sec,
                     uv_scale: obj.uv_scale,
-                    camera_pos: [eye[0], eye[1], eye[2], 1.0],
+                    camera_pos: [eye[0], eye[1], eye[2], rt_flag],
                     point_lights,
                     light_colors: lcols,
                 };
@@ -1370,7 +1443,9 @@ pub fn run_demo(
                         let secs = measure_start.unwrap().elapsed().as_secs_f64();
                         let avg_fps = measured as f64 / secs;
                         let avg_dec = measure_decode_sum / measured as f64;
-                        let mode_tag = if wstate.use_gpu {
+                        let mode_tag = if wstate.use_gpu && wstate.rt_enabled && rt_scene.is_some() {
+                            "NEW_GPU_RTX5080_PINGPONG_DXR_V5"
+                        } else if wstate.use_gpu {
                             "NEW_GPU_RTX5080_PINGPONG_V4"
                         } else if wstate.multi_core_cpu {
                             "OLD_CPU_MULTICORE"
@@ -1395,7 +1470,7 @@ pub fn run_demo(
                     0.0
                 };
                 let mode_str = if wstate.use_gpu {
-                    "NEW v0.4: GPU Zero-Barrier + PingPong Async"
+                    "NEW v0.5: AsyncCompute+DXR"
                 } else if wstate.multi_core_cpu {
                     "OLD: CPU Multi-Core"
                 } else {
@@ -1407,9 +1482,10 @@ pub fn run_demo(
                     _ => "Orbit",
                 };
                 let sfs_str = if wstate.sfs_enabled { "ON" } else { "OFF" };
+                let rt_str = if rt_scene.is_some() && wstate.rt_enabled { "ON" } else { "OFF" };
                 let title = format!(
-                    "{} | {:.1} FPS | {:.1} MB/f ({} tiles) | Dec: {:.2}ms ({:.0} MB/s) | SFS[F]:{} | Cam[C]:{}",
-                    mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, sfs_str, cam_str
+                    "{} | {:.1} FPS | {:.1} MB/f ({}t) | Dec:{:.2}ms ({:.0} MB/s) | RT[R]:{} SFS[F]:{} | Cam[C]:{}",
+                    mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, rt_str, sfs_str, cam_str
                 );
                 let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
@@ -1420,5 +1496,8 @@ pub fn run_demo(
         // Drain both GPU queues before dropping resources
         ctx.signal_and_wait();
         ctx.signal_and_wait_compute();
+        if cfg.enable_debug {
+            crate::gpu_decoder::dump_d3d12_info_queue(&ctx.device);
+        }
     }
 }

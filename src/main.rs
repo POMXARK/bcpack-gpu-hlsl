@@ -16,6 +16,7 @@ use bcpack_gpu::ffi::{
 use bcpack_gpu::gpu_decoder::{
     pack_batch, Bc7RansGpuDecoder, BcpackGpuDecoder, Gfx10DetileGpu, GpuContext,
 };
+use bcpack_gpu::raytracing::run_rt_verify;
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -283,6 +284,12 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
             "[verify] PASS 7/7 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
         );
     }
+
+    // 8) DXR 1.1 Hardware BVH + Inline RayQuery verification on RT Cores
+    let rt_ms = run_rt_verify(&mut ctx);
+    println!(
+        "[verify] PASS 8/8 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
+    );
     let _ = (BCPACK_SWIZZLE_GFX10_4KB_S,);
 }
 
@@ -570,6 +577,8 @@ fn main() {
     let do_bench = args.iter().any(|a| a == "--bench");
     let do_demo = args.iter().any(|a| a == "--demo");
     let regen_assets = args.iter().any(|a| a == "--regen-assets");
+    let enable_debug = args.iter().any(|a| a == "--debug");
+    let start_rt_enabled = !args.iter().any(|a| a == "--no-rt");
 
     let mut screenshot: Option<PathBuf> = None;
     let mut frames = 20u32;
@@ -629,6 +638,8 @@ fn main() {
                 mode: DemoMode::Toggleable,
                 initial_chunks: chunks,
                 multi_core_cpu: true,
+                enable_debug,
+                start_rt_enabled,
                 screenshot_path: screenshot,
                 screenshot_frames: frames,
                 measure_frames,
