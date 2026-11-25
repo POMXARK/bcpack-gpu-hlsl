@@ -1,0 +1,684 @@
+use bcpack::bc1::{QuadTable, Window};
+use bcpack::tables::{BASE_TABLE, FREQ_TABLE, RF_TABLE, RN_TABLE, RS_TABLE};
+use std::ffi::c_void;
+use std::mem::{size_of, ManuallyDrop};
+use std::ptr::copy_nonoverlapping;
+use windows::core::Interface;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
+    DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+
+pub const DECODE_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_decode.dxil");
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModelDataGpu {
+    pub thr: [u32; 10],
+    pub base: [u32; 10],
+    pub freq: [u32; 10],
+    pub rf: [u32; 10],
+    pub rs: [u32; 10],
+    pub rn: [u32; 10],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ChunkDescGpu {
+    pub stream_offset: u32,
+    pub stream_len: u32,
+    pub blocks: u32,
+    pub out_block_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkStatusGpu {
+    pub code: u32,
+    pub consumed: u32,
+    pub cycles: u32,
+    pub blocks_written: u32,
+}
+
+pub struct BatchPayload {
+    pub stream_bytes: Vec<u8>,
+    pub chunks: Vec<ChunkDescGpu>,
+    pub total_blocks: usize,
+}
+
+pub fn pack_batch<'a, I>(items: I) -> BatchPayload
+where
+    I: IntoIterator<Item = (&'a [u8], usize)>,
+{
+    let mut stream_bytes = Vec::new();
+    let mut chunks = Vec::new();
+    let mut total_blocks = 0usize;
+
+    for (stream, blocks) in items {
+        // Align each chunk to 4 bytes so ByteAddressBuffer loads stay 32-bit aligned
+        while stream_bytes.len() % 4 != 0 {
+            stream_bytes.push(0);
+        }
+        let offset = stream_bytes.len() as u32;
+        stream_bytes.extend_from_slice(stream);
+        chunks.push(ChunkDescGpu {
+            stream_offset: offset,
+            stream_len: stream.len() as u32,
+            blocks: blocks as u32,
+            out_block_offset: total_blocks as u32,
+        });
+        total_blocks += blocks;
+    }
+    while stream_bytes.len() % 4 != 0 {
+        stream_bytes.push(0);
+    }
+    if stream_bytes.is_empty() {
+        stream_bytes.resize(4, 0);
+    }
+
+    BatchPayload {
+        stream_bytes,
+        chunks,
+        total_blocks,
+    }
+}
+
+pub fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 0,
+        Width: size.max(256),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+    }
+}
+
+pub fn heap_props(ty: D3D12_HEAP_TYPE) -> D3D12_HEAP_PROPERTIES {
+    D3D12_HEAP_PROPERTIES {
+        Type: ty,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+        CreationNodeMask: 0,
+        VisibleNodeMask: 0,
+    }
+}
+
+pub fn transition_barrier(
+    res: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: ManuallyDrop::new(Some(res.clone())),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+    }
+}
+
+pub fn uav_barrier(res: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: ManuallyDrop::new(Some(res.clone())),
+            }),
+        },
+    }
+}
+
+pub unsafe fn drop_barriers(barriers: &mut [D3D12_RESOURCE_BARRIER]) {
+    for b in barriers.iter_mut() {
+        if b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+            let mut tr = ManuallyDrop::take(&mut b.Anonymous.Transition);
+            let _ = ManuallyDrop::take(&mut tr.pResource);
+        } else if b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV {
+            let mut uav = ManuallyDrop::take(&mut b.Anonymous.UAV);
+            let _ = ManuallyDrop::take(&mut uav.pResource);
+        }
+    }
+}
+
+pub unsafe fn cmd_barriers(cmd: &ID3D12GraphicsCommandList, mut barriers: Vec<D3D12_RESOURCE_BARRIER>) {
+    cmd.ResourceBarrier(&barriers);
+    drop_barriers(&mut barriers);
+}
+
+pub fn create_committed_buffer(
+    device: &ID3D12Device,
+    heap: D3D12_HEAP_TYPE,
+    size: u64,
+    flags: D3D12_RESOURCE_FLAGS,
+    initial_state: D3D12_RESOURCE_STATES,
+) -> ID3D12Resource {
+    let mut res: Option<ID3D12Resource> = None;
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap_props(heap),
+                D3D12_HEAP_FLAG_NONE,
+                &buffer_desc(size, flags),
+                initial_state,
+                None,
+                &mut res,
+            )
+            .expect("CreateCommittedResource failed");
+    }
+    res.unwrap()
+}
+
+pub unsafe fn upload_slice<T: Copy>(res: &ID3D12Resource, data: &[T]) {
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    let empty_range = D3D12_RANGE { Begin: 0, End: 0 };
+    res.Map(0, Some(&empty_range), Some(&mut ptr)).expect("Map failed");
+    copy_nonoverlapping(data.as_ptr() as *const u8, ptr as *mut u8, std::mem::size_of_val(data));
+    res.Unmap(0, None);
+}
+
+pub struct GpuContext {
+    pub adapter_name: String,
+    pub factory: IDXGIFactory6,
+    pub device: ID3D12Device,
+    pub queue: ID3D12CommandQueue,
+    pub timestamp_freq: u64,
+    pub fence: ID3D12Fence,
+    pub fence_value: u64,
+    pub fence_event: HANDLE,
+}
+
+impl GpuContext {
+    pub fn new(enable_debug: bool) -> Self {
+        unsafe {
+            if enable_debug {
+                let mut debug: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut debug).is_ok() {
+                    if let Some(d) = debug {
+                        d.EnableDebugLayer();
+                    }
+                }
+            }
+
+            let factory: IDXGIFactory6 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("CreateDXGIFactory2");
+
+            let mut chosen: Option<(IDXGIAdapter1, String)> = None;
+            let mut idx = 0u32;
+            while let Ok(adapter) =
+                factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(idx, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            {
+                let desc = adapter.GetDesc1().expect("GetDesc1");
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
+                    let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+                    let name = String::from_utf16_lossy(&desc.Description[..end]);
+                    chosen = Some((adapter, name));
+                    break;
+                }
+                idx += 1;
+            }
+
+            let (adapter, adapter_name) = chosen.expect("No hardware DXGI adapter found");
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                .expect("D3D12CreateDevice");
+            let device = device.unwrap();
+
+            // Check SM 6.6 + WaveOps support
+            let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    &mut opts1 as *mut _ as *mut c_void,
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>() as u32,
+                )
+                .expect("CheckFeatureSupport OPTIONS1");
+            assert!(opts1.WaveOps.as_bool(), "GPU does not support HLSL WaveOps");
+
+            let queue_desc = D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+                Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+                NodeMask: 0,
+            };
+            let queue: ID3D12CommandQueue =
+                device.CreateCommandQueue(&queue_desc).expect("CreateCommandQueue");
+            let timestamp_freq = queue.GetTimestampFrequency().expect("GetTimestampFrequency");
+            let fence: ID3D12Fence = device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("CreateFence");
+            let fence_event = CreateEventW(None, false, false, None).expect("CreateEventW");
+
+            Self {
+                adapter_name,
+                factory,
+                device,
+                queue,
+                timestamp_freq,
+                fence,
+                fence_value: 0,
+                fence_event,
+            }
+        }
+    }
+
+    pub fn signal_and_wait(&mut self) {
+        unsafe {
+            self.fence_value += 1;
+            self.queue
+                .Signal(&self.fence, self.fence_value)
+                .expect("Signal");
+            if self.fence.GetCompletedValue() < self.fence_value {
+                self.fence
+                    .SetEventOnCompletion(self.fence_value, self.fence_event)
+                    .expect("SetEventOnCompletion");
+                WaitForSingleObject(self.fence_event, INFINITE);
+            }
+        }
+    }
+}
+
+impl Drop for GpuContext {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.fence_event);
+        }
+    }
+}
+
+pub struct BcpackGpuDecoder {
+    root_sig: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    models_buf: ID3D12Resource,
+    window_buf: ID3D12Resource,
+    quads_buf: ID3D12Resource,
+
+    // Dynamic batch capacity
+    cap_stream_bytes: usize,
+    cap_chunks: usize,
+    cap_blocks: usize,
+
+    streams_upload: ID3D12Resource,
+    streams_default: ID3D12Resource,
+    chunks_upload: ID3D12Resource,
+    chunks_default: ID3D12Resource,
+    pub out_blocks_default: ID3D12Resource,
+    status_default: ID3D12Resource,
+
+    out_readback: ID3D12Resource,
+    status_readback: ID3D12Resource,
+    ts_query_heap: ID3D12QueryHeap,
+    ts_readback: ID3D12Resource,
+
+    cmd_alloc: ID3D12CommandAllocator,
+    cmd_list: ID3D12GraphicsCommandList,
+}
+
+impl BcpackGpuDecoder {
+    pub fn new(ctx: &mut GpuContext, window: &Window, quads: &QuadTable, max_chunks: usize, max_blocks: usize, max_stream_bytes: usize) -> Self {
+        unsafe {
+            // Root signature: 5 Root SRVs (t0..t4) + 2 Root UAVs (u0..u1)
+            let mut params = [D3D12_ROOT_PARAMETER1::default(); 7];
+            for i in 0..5 {
+                params[i] = D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: i as u32,
+                            RegisterSpace: 0,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                };
+            }
+            for i in 0..2 {
+                params[5 + i] = D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: i as u32,
+                            RegisterSpace: 0,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                };
+            }
+
+            let rs_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                    Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                        NumParameters: params.len() as u32,
+                        pParameters: params.as_ptr(),
+                        NumStaticSamplers: 0,
+                        pStaticSamplers: std::ptr::null(),
+                        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                    },
+                },
+            };
+
+            let mut blob = None;
+            let mut err_blob = None;
+            if let Err(e) = D3D12SerializeVersionedRootSignature(&rs_desc, &mut blob, Some(&mut err_blob)) {
+                if let Some(eb) = err_blob {
+                    let msg = std::slice::from_raw_parts(eb.GetBufferPointer() as *const u8, eb.GetBufferSize());
+                    panic!("RootSig serialize error: {}", String::from_utf8_lossy(msg));
+                }
+                panic!("RootSig serialize failed: {e:?}");
+            }
+            let blob = blob.unwrap();
+            let blob_slice = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+            let root_sig: ID3D12RootSignature = ctx
+                .device
+                .CreateRootSignature(0, blob_slice)
+                .expect("CreateRootSignature");
+
+            let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: ManuallyDrop::new(Some(root_sig.clone())),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: DECODE_CS_DXIL.as_ptr() as *const c_void,
+                    BytecodeLength: DECODE_CS_DXIL.len(),
+                },
+                NodeMask: 0,
+                CachedPSO: D3D12_CACHED_PIPELINE_STATE::default(),
+                Flags: D3D12_PIPELINE_STATE_FLAG_NONE,
+            };
+            let pso: ID3D12PipelineState = ctx
+                .device
+                .CreateComputePipelineState(&pso_desc)
+                .expect("CreateComputePipelineState (bcpack_decode.dxil)");
+
+            // Build static model tables (9 x 16 = 144)
+            let mut models = Vec::with_capacity(144);
+            for eab in 0..9 {
+                for q in 0..16 {
+                    let mut md = ModelDataGpu {
+                        thr: [0x10000; 10],
+                        base: [0; 10],
+                        freq: [0; 10],
+                        rf: [0; 10],
+                        rs: [0; 10],
+                        rn: [0; 10],
+                    };
+                    for k in 0..10 {
+                        if k >= 1 && k < eab + 2 {
+                            md.thr[k] = BASE_TABLE[eab][q][k] as u32;
+                        }
+                        md.base[k] = BASE_TABLE[eab][q][k] as u32;
+                        md.freq[k] = FREQ_TABLE[eab][q][k] as u32;
+                        md.rf[k] = RF_TABLE[eab][q][k] as u32;
+                        md.rs[k] = RS_TABLE[eab][q][k] as u32;
+                        md.rn[k] = RN_TABLE[eab][q][k] as u32;
+                    }
+                    models.push(md);
+                }
+            }
+
+            let mut win_packed = [0u32; 256];
+            for (s, f) in window.slots.iter().enumerate() {
+                let c0 = ((f[0] as u32) << 11) | ((f[1] as u32) << 5) | (f[2] as u32);
+                let c1 = ((f[3] as u32) << 11) | ((f[4] as u32) << 5) | (f[5] as u32);
+                win_packed[s] = c0 | (c1 << 16);
+            }
+
+            let mut quad_masks = [0u32; 1024];
+            for q in 0..4 {
+                quad_masks[q * 256..(q + 1) * 256].copy_from_slice(&quads.masks[q]);
+            }
+
+            let models_size = (models.len() * size_of::<ModelDataGpu>()) as u64;
+            let win_size = (win_packed.len() * size_of::<u32>()) as u64;
+            let quad_size = (quad_masks.len() * size_of::<u32>()) as u64;
+
+            let models_up = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, models_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let win_up = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, win_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let quad_up = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, quad_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            upload_slice(&models_up, &models);
+            upload_slice(&win_up, &win_packed);
+            upload_slice(&quad_up, &quad_masks);
+
+            let models_buf = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, models_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            let window_buf = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, win_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            let quads_buf = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, quad_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            let cmd_alloc: ID3D12CommandAllocator = ctx
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("CreateCommandAllocator");
+            let cmd_list: ID3D12GraphicsCommandList = ctx
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &cmd_alloc, None)
+                .expect("CreateCommandList");
+
+            cmd_list.CopyBufferRegion(&models_buf, 0, &models_up, 0, models_size);
+            cmd_list.CopyBufferRegion(&window_buf, 0, &win_up, 0, win_size);
+            cmd_list.CopyBufferRegion(&quads_buf, 0, &quad_up, 0, quad_size);
+            let mut barriers = [
+                transition_barrier(&models_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                transition_barrier(&window_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                transition_barrier(&quads_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            ];
+            cmd_list.ResourceBarrier(&barriers);
+            drop_barriers(&mut barriers);
+            cmd_list.Close().expect("Close");
+            let lists = [Some(cmd_list.cast::<ID3D12CommandList>().unwrap())];
+            ctx.queue.ExecuteCommandLists(&lists);
+            ctx.signal_and_wait();
+
+            let streams_upload = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, max_stream_bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let streams_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, max_stream_bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            let chunks_bytes = (max_chunks * size_of::<ChunkDescGpu>()) as u64;
+            let chunks_upload = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, chunks_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let chunks_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, chunks_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            let out_bytes = (max_blocks * 8) as u64;
+            let out_blocks_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, out_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            let out_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, out_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            let status_bytes = (max_chunks * size_of::<ChunkStatusGpu>()) as u64;
+            let status_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, status_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            let status_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, status_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            let q_desc = D3D12_QUERY_HEAP_DESC {
+                Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                Count: 2,
+                NodeMask: 0,
+            };
+            let mut ts_query_heap: Option<ID3D12QueryHeap> = None;
+            ctx.device
+                .CreateQueryHeap(&q_desc, &mut ts_query_heap)
+                .expect("CreateQueryHeap");
+            let ts_query_heap = ts_query_heap.unwrap();
+            let ts_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            Self {
+                root_sig,
+                pso,
+                models_buf,
+                window_buf,
+                quads_buf,
+                cap_stream_bytes: max_stream_bytes,
+                cap_chunks: max_chunks,
+                cap_blocks: max_blocks,
+                streams_upload,
+                streams_default,
+                chunks_upload,
+                chunks_default,
+                out_blocks_default,
+                status_default,
+                out_readback,
+                status_readback,
+                ts_query_heap,
+                ts_readback,
+                cmd_alloc,
+                cmd_list,
+            }
+        }
+    }
+
+    pub unsafe fn upload_batch(&self, batch: &BatchPayload) {
+        assert!(batch.stream_bytes.len() <= self.cap_stream_bytes, "stream buffer capacity exceeded");
+        assert!(batch.chunks.len() <= self.cap_chunks, "chunks capacity exceeded");
+        assert!(batch.total_blocks <= self.cap_blocks, "blocks capacity exceeded");
+        upload_slice(&self.streams_upload, &batch.stream_bytes);
+        upload_slice(&self.chunks_upload, &batch.chunks);
+    }
+
+    pub unsafe fn record_upload_and_dispatch(
+        &self,
+        cmd: &ID3D12GraphicsCommandList,
+        batch: &BatchPayload,
+        ts_heap: Option<&ID3D12QueryHeap>,
+        ts_start_idx: u32,
+        ts_end_idx: u32,
+    ) {
+        let s_len = batch.stream_bytes.len() as u64;
+        let c_len = (batch.chunks.len() * size_of::<ChunkDescGpu>()) as u64;
+
+        let mut b_pre = [
+            transition_barrier(&self.streams_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition_barrier(&self.chunks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+        ];
+        cmd.ResourceBarrier(&b_pre);
+        drop_barriers(&mut b_pre);
+        cmd.CopyBufferRegion(&self.streams_default, 0, &self.streams_upload, 0, s_len);
+        cmd.CopyBufferRegion(&self.chunks_default, 0, &self.chunks_upload, 0, c_len);
+        let mut b_post = [
+            transition_barrier(&self.streams_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition_barrier(&self.chunks_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        ];
+        cmd.ResourceBarrier(&b_post);
+        drop_barriers(&mut b_post);
+
+        cmd.SetComputeRootSignature(&self.root_sig);
+        cmd.SetPipelineState(&self.pso);
+        cmd.SetComputeRootShaderResourceView(0, self.models_buf.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(1, self.window_buf.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(2, self.quads_buf.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(3, self.streams_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(4, self.chunks_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(5, self.out_blocks_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(6, self.status_default.GetGPUVirtualAddress());
+
+        if let Some(qh) = ts_heap {
+            cmd.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, ts_start_idx);
+        }
+        cmd.Dispatch(batch.chunks.len() as u32, 1, 1);
+        if let Some(qh) = ts_heap {
+            cmd.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, ts_end_idx);
+        }
+        let mut b_uav = [uav_barrier(&self.out_blocks_default)];
+        cmd.ResourceBarrier(&b_uav);
+        drop_barriers(&mut b_uav);
+    }
+
+    /// Runs GPU decode, waits, and returns (decoded_bc1_bytes, statuses, kernel_gpu_ms, total_wall_ms).
+    pub fn decode_batch_and_readback(
+        &mut self,
+        ctx: &mut GpuContext,
+        batch: &BatchPayload,
+    ) -> (Vec<u8>, Vec<ChunkStatusGpu>, f64, f64) {
+        unsafe {
+            let t0 = std::time::Instant::now();
+            self.upload_batch(batch);
+
+            self.cmd_alloc.Reset().expect("cmd_alloc Reset");
+            self.cmd_list.Reset(&self.cmd_alloc, None).expect("cmd_list Reset");
+
+            self.record_upload_and_dispatch(&self.cmd_list, batch, Some(&self.ts_query_heap), 0, 1);
+
+            let out_bytes = (batch.total_blocks * 8) as u64;
+            let status_bytes = (batch.chunks.len() * size_of::<ChunkStatusGpu>()) as u64;
+            let mut b_to_copy = [
+                transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition_barrier(&self.status_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            ];
+            self.cmd_list.ResourceBarrier(&b_to_copy);
+            drop_barriers(&mut b_to_copy);
+            self.cmd_list.CopyBufferRegion(&self.out_readback, 0, &self.out_blocks_default, 0, out_bytes);
+            self.cmd_list.CopyBufferRegion(&self.status_readback, 0, &self.status_default, 0, status_bytes);
+            self.cmd_list.ResolveQueryData(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.ts_readback, 0);
+
+            let mut b_restore = [
+                transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                transition_barrier(&self.status_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ];
+            self.cmd_list.ResourceBarrier(&b_restore);
+            drop_barriers(&mut b_restore);
+            self.cmd_list.Close().expect("Close");
+
+            let lists = [Some(self.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+            ctx.queue.ExecuteCommandLists(&lists);
+            ctx.signal_and_wait();
+            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let r_out = D3D12_RANGE { Begin: 0, End: out_bytes as usize };
+            self.out_readback.Map(0, Some(&r_out), Some(&mut ptr)).expect("Map out");
+            let decoded = std::slice::from_raw_parts(ptr as *const u8, out_bytes as usize).to_vec();
+            self.out_readback.Unmap(0, None);
+
+            let r_st = D3D12_RANGE { Begin: 0, End: status_bytes as usize };
+            self.status_readback.Map(0, Some(&r_st), Some(&mut ptr)).expect("Map status");
+            let statuses = std::slice::from_raw_parts(ptr as *const ChunkStatusGpu, batch.chunks.len()).to_vec();
+            self.status_readback.Unmap(0, None);
+
+            let r_ts = D3D12_RANGE { Begin: 0, End: 16 };
+            self.ts_readback.Map(0, Some(&r_ts), Some(&mut ptr)).expect("Map ts");
+            let ts = std::slice::from_raw_parts(ptr as *const u64, 2);
+            let ticks = ts[1].saturating_sub(ts[0]);
+            self.ts_readback.Unmap(0, None);
+            let kernel_ms = (ticks as f64 / ctx.timestamp_freq as f64) * 1000.0;
+
+            (decoded, statuses, kernel_ms, total_ms)
+        }
+    }
+
+    /// Runs GPU compute dispatch only (no readback) to measure pure VRAM decompression speed.
+    pub fn bench_gpu_kernel_only(&mut self, ctx: &mut GpuContext, batch: &BatchPayload) -> (f64, f64) {
+        unsafe {
+            self.upload_batch(batch);
+            let t0 = std::time::Instant::now();
+            self.cmd_alloc.Reset().expect("cmd_alloc Reset");
+            self.cmd_list.Reset(&self.cmd_alloc, None).expect("cmd_list Reset");
+            self.record_upload_and_dispatch(&self.cmd_list, batch, Some(&self.ts_query_heap), 0, 1);
+            self.cmd_list.ResolveQueryData(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.ts_readback, 0);
+            self.cmd_list.Close().expect("Close");
+
+            let lists = [Some(self.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+            ctx.queue.ExecuteCommandLists(&lists);
+            ctx.signal_and_wait();
+            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let r_ts = D3D12_RANGE { Begin: 0, End: 16 };
+            self.ts_readback.Map(0, Some(&r_ts), Some(&mut ptr)).expect("Map ts");
+            let ts = std::slice::from_raw_parts(ptr as *const u64, 2);
+            let ticks = ts[1].saturating_sub(ts[0]);
+            self.ts_readback.Unmap(0, None);
+            let kernel_ms = (ticks as f64 / ctx.timestamp_freq as f64) * 1000.0;
+            (kernel_ms, wall_ms)
+        }
+    }
+}

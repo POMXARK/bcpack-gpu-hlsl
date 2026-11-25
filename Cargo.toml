@@ -1,0 +1,49 @@
+[package]
+name = "bcpack-gpu-hlsl"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Clean-room Xbox Series BCPack (MDU rANS) GPU Compute Shader decoder in DirectX 12 HLSL SM 6.6 (Wave32)"
+repository = "https://github.com/POMXARK/bcpack-gpu-hlsl"
+
+[lib]
+name = "bcpack_gpu_demo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bcpack-gpu-demo"
+path = "src/main.rs"
+
+[[bin]]
+name = "bcpack-demo-cpu"
+path = "src/bin/demo_cpu.rs"
+
+[[bin]]
+name = "bcpack-demo-gpu"
+path = "src/bin/demo_gpu.rs"
+
+[dependencies]
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "b1c3099a3402de8b76c9263a828791bd8bc0c930", default-features = false }
+rayon = "1.10"
+png = "0.18"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
