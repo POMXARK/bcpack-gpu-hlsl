@@ -480,7 +480,7 @@ fn zigzag(r: i32) -> u16 {
     }
 }
 
-fn best_model_for_fragment(ab: u8, syms: &[u16]) -> (u8, u8) {
+pub fn best_model_for_fragment(ab: u8, syms: &[u16]) -> (u8, u8) {
     let mut hist = [0u32; 512];
     let mut max_sym = 0u16;
     for &s in syms {

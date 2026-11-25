@@ -1,6 +1,6 @@
-# bcpack-gpu-hlsl — AI Agent & Code-Search Entrypoint (`v0.11.0`)
+# bcpack-gpu-hlsl — AI Agent & Code-Search Entrypoint (`v0.12.0`)
 
-> Open 4K AAA Streaming Benchmark, 12.41M Mesh-Shader Showcase, & 19-Test Verification Suite (`MIT OR Apache-2.0`), powered by the standalone hardware SDK [`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk) mounted as a Git submodule at `sdk/`.
+> Open 4K AAA Streaming Benchmark, 12.41M Mesh-Shader Showcase, & 21-Test Verification Suite (`MIT OR Apache-2.0`), powered by the standalone hardware SDK [`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk) (`BC1`, `BC3`, `BC4`, `BC5`, Full Multi-Mode `BC7 0..7`) mounted as a Git submodule at `sdk/`.
 
 ## Standalone Hardware SDK (`sdk/` -> `https://github.com/POMXARK/bcpack-gpu-sdk`)
 - C/C++ Zero-Copy Integration API: `sdk/include/bcpack_gpu.h`, `sdk/src/ffi.rs`, `sdk/examples/directstorage_hook.cpp`

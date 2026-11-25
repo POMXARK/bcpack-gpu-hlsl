@@ -1,7 +1,7 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
 [![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1%20%2B%20VRS%20Tier2-2f80ed)](sdk/shaders/bcpack_decode.hlsl)
-[![v0.11.0](https://img.shields.io/badge/v0.11.0-VRS%20Tier2%20%2B%20TAAU%20%7C%2019%2F19%20PASS-ff4081)](#whats-new-in-v0110--low-vram-scaling-taau-upscaler--hardware-vrs-tier-2)
+[![v0.12.0](https://img.shields.io/badge/v0.12.0-BC1%2F3%2F4%2F5%2F7%20(0..7)%20%7C%2021%2F21%20PASS-ff4081)](#verified-bit-exactness-bcpack-gpu-demo---verify--2121-pass)
 [![Standalone SDK](https://img.shields.io/badge/Hardware%20SDK-POMXARK%2Fbcpack--gpu--sdk-orange)](https://github.com/POMXARK/bcpack-gpu-sdk)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](sdk/shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](sdk/include/bcpack_gpu.h)
@@ -162,9 +162,9 @@ flowchart LR
 
 ---
 
-## Verified Bit-Exactness (`bcpack-gpu-demo --verify` — 19/19 PASS)
+## Verified Bit-Exactness (`bcpack-gpu-demo --verify` — 21/21 PASS)
 
-Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Queue** enabled (`v0.10.0` — **19/19 PASS**, `0` mismatches):
+Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Queue** enabled (`v0.12.0` — **21/21 PASS**, `0` mismatches):
 1. **PASS 1/18 — BC1 synthetic streams** (`5` chunks, `21,824` blocks, odd chunk count): `0` byte mismatches
 2. **PASS 2/18 — BC1 monolithic 512×512 textures** (`12` textures = `1.50 MiB`): `0` byte mismatches
 3. **PASS 3/18 — BC1 tiled 4K-block strips** (`48` tiles = `1.50 MiB`): `0` byte mismatches
@@ -183,7 +183,9 @@ Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Qu
 16. **PASS 16/18 — Two-Pass Hi-Z Occlusion Culling over 12.04M-Tri Skyline** (`159,171` meshlets, `45,585` frustum culled, `113,348` Hi-Z occluded = `8.53M` tris, `build=0.009 ms`, `cull=0.006 ms`, `0` mismatches, [`src/hiz_culling.rs`](src/hiz_culling.rs) + [`shaders/hiz_{build,cull}.hlsl`](shaders/hiz_cull.hlsl))
 17. **PASS 17/18 — 500 GPU-Skinned NPC Crowd Compute (4-Bone LBS)** (`500 × 1,024 = 512k` verts, `32,000` bones, `4,096` CPU-oracle samples verified, `max_err=7.63e-6`, `GPU=0.075 ms`, `0` mismatches, [`src/crowd_skinning.rs`](src/crowd_skinning.rs) + [`shaders/crowd_skin.hlsl`](shaders/crowd_skin.hlsl))
 18. **PASS 18/19 — Zero-Copy Shared-Device C-ABI (`bcpack_gpu_create_from_device` + `BcPackDecodeToBuffer` + GPU `Queue::Wait`):** Shares caller `ID3D12Device*`, decodes + Gfx10 `SW_64KB_D`-detiles directly into a caller GPU buffer (`D3D12_HEAP_TYPE_DEFAULT`), and syncs cross-queue via `BcPackGetComputeFence` with `0` byte mismatches ([`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`src/ffi.rs`](src/ffi.rs)).
-19. **PASS 19/19 — Direct 2D Texture C-ABI (`BcPackDecodeToTexture2D`):** Decodes + Gfx10-detiles directly into a caller `DXGI_FORMAT_BC1_UNORM` `Texture2D` subresource (Mip 0 `512×512 SW_64KB_D` + Mip 3 `64×64` with automatic `256B` row-pitch padding), `0` byte mismatches.
+19. **PASS 19/21 — Direct 2D Texture C-ABI (`BcPackDecodeToTexture2D`):** Decodes + Gfx10-detiles directly into a caller `DXGI_FORMAT_BCn_UNORM` `Texture2D` subresource (Mip 0 `512×512 SW_64KB_D` + Mip 3 `64×64` with automatic `256B` row-pitch padding), `0` byte mismatches.
+20. **PASS 20/21 — Full Multi-Mode `BC7` (`Modes 0..7` + Rotations + IndexSel + Dict + C-ABI `SW_64KB_D` `Texture2D`):** `5` chunks / `1,984` blocks (`9.163 ms`), bit-exact vs `bcpack::bc7::decode`, `0` byte mismatches ([`sdk/shaders/bcpack_bc7_rebuild.hlsl`](sdk/shaders/bcpack_bc7_rebuild.hlsl)).
+21. **PASS 21/21 — Full `BC3` + `BC4` + `BC5` GPU Decode + C-ABI:** `1,152` mixed blocks (`1.289 ms`), bit-exact vs `bcpack::bcn::decode`, `0` byte mismatches ([`sdk/shaders/bcpack_bcn_rans.hlsl`](sdk/shaders/bcpack_bcn_rans.hlsl), [`sdk/shaders/bcpack_bcn_rebuild.hlsl`](sdk/shaders/bcpack_bcn_rebuild.hlsl)).
 
 ---
 

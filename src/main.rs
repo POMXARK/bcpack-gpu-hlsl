@@ -1,11 +1,14 @@
 use bcpack::bc1::{self, QuadTable, Window};
-use bcpack::encode::synthetic_bc1;
+use bcpack::bc7 as bcp_bc7;
+use bcpack::bcn as bcp_bcn;
+use bcpack::encode::{synthetic_bc1, Fragment};
+use bcpack::format::{self as bcp_fmt, Mode as BcpMode};
 use bcpack::rans;
 use bcpack_demo::assets::{
-    encode_bc1_to_bcpack, generate_bc7_16lane_stream, generate_high_entropy_bc1_normal_map,
-    generate_mip_chain_bc1, generate_sharp_ui_bc1, load_or_generate_assets, swizzle_gfx10_cpu,
-    Bc7EntropyProfile, BC7_ALPHABET_BITS, NUM_BLOCKS, TEX_BC1_BYTES, TILE_BC1_BYTES, TILE_BLOCKS,
-    TILE_STRIPS,
+    best_model_for_fragment, encode_bc1_to_bcpack, generate_bc7_16lane_stream,
+    generate_high_entropy_bc1_normal_map, generate_mip_chain_bc1, generate_sharp_ui_bc1,
+    load_or_generate_assets, swizzle_gfx10_cpu, Bc7EntropyProfile, BC7_ALPHABET_BITS, NUM_BLOCKS,
+    TEX_BC1_BYTES, TILE_BC1_BYTES, TILE_BLOCKS, TILE_STRIPS,
 };
 use bcpack_demo::crowd_skinning::run_crowd_skinning_verify;
 use bcpack_demo::demo_scene::{run_demo, DemoConfig, DemoMode};
@@ -14,13 +17,15 @@ use bcpack_demo::ffi::{
     bcpack_gpu_create, bcpack_gpu_create_from_device, bcpack_gpu_destroy, BcPackDecodeAsync,
     BcPackDecodeToBuffer, BcPackDecodeToTexture2D, BcPackGetComputeFence, BcPackGetDirectFence,
     BcPackGetLastTimingMs, BcPackWaitDirectFence, BcPackWaitFence, BCPACK_FORMAT_BC1,
+    BCPACK_FORMAT_BC3, BCPACK_FORMAT_BC4, BCPACK_FORMAT_BC5, BCPACK_FORMAT_BC7,
     BCPACK_FORMAT_BC7_RANS, BCPACK_SWIZZLE_GFX10_4KB_S, BCPACK_SWIZZLE_GFX10_64KB_D,
     BCPACK_SWIZZLE_LINEAR,
 };
 use bcpack_demo::gltf_loader::run_aaa_2k_bcpack_verify;
 use bcpack_demo::gpu_decoder::{
-    cmd_barriers, create_committed_buffer, pack_batch, transition_barrier, Bc7RansGpuDecoder,
-    BcpackGpuDecoder, Gfx10DetileGpu, GpuContext,
+    cmd_barriers, create_committed_buffer, pack_batch, pack_bcn_batch, transition_barrier,
+    Bc7FullGpuDecoder, Bc7RansGpuDecoder, BcnGpuDecoder, BcpackGpuDecoder, Gfx10DetileGpu,
+    GpuContext,
 };
 use bcpack_demo::hiz_culling::run_hiz_12m_verify;
 use bcpack_demo::meshlets::{
@@ -91,7 +96,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         offset += byte_len;
     }
     println!(
-        "[verify] PASS 1/19 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 1/21 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
         cases.len(),
         cases.iter().map(|c| c.1).sum::<usize>(),
         gpu_ms
@@ -111,7 +116,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 2/19 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 2/21 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         assets.len(),
         tex_gpu_ms
     );
@@ -136,7 +141,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 3/19 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 3/21 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         total_tiles,
         tile_gpu_ms
     );
@@ -180,7 +185,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         row_off += *rows;
     }
     println!(
-        "[verify] PASS 4/19 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
+        "[verify] PASS 4/21 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
         bc7_cases.len(),
         total_sym_rows,
         bc7_gpu_ms
@@ -203,7 +208,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         let (detiled, det_ms) = detile.detile_and_readback(&mut ctx, &gpu_swizzled_out, w_blk as u32, h_blk as u32, tile_mode, 8);
         assert_eq!(detiled.as_slice(), linear_bc1.as_slice(), "FAIL Gfx10 detile mismatch on {name}");
         println!(
-            "[verify] PASS 5/19 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
+            "[verify] PASS 5/21 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
         );
     }
 
@@ -223,7 +228,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         m_off += byte_len;
     }
     println!(
-        "[verify] PASS 6/19 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 6/21 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
         mip_chain.len(),
         mip_ms
     );
@@ -294,27 +299,27 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         assert_eq!(BcPackGetLastTimingMs(ffi_ctx, &mut kms), 0);
         bcpack_gpu_destroy(ffi_ctx);
         println!(
-            "[verify] PASS 7/19 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
+            "[verify] PASS 7/21 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
         );
     }
 
     // 8) DXR 1.1 Hardware BVH + Inline RayQuery verification on RT Cores
     let rt_ms = run_rt_verify(&mut ctx);
     println!(
-        "[verify] PASS 8/19 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
+        "[verify] PASS 8/21 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
     );
 
     // 9) World Grid 32x32 Streaming + LRU VRAM Residency Manager verification
     let ws = run_world_stream_verify(&mut ctx, &mut gpu_dec, &assets);
     println!(
-        "[verify] PASS 9/19 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 9/21 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
         ws.frames, ws.verified_tiles, ws.total_evictions, ws.turn_burst_tiles, ws.peak_mbs, ws.gpu_ms
     );
 
     // 10) DX12 Ultimate Mesh Shaders (as_6_5 / ms_6_5) + GPU Frustum Culling + 4M+ Tris City verification
     let ms = run_mesh_shader_verify(&mut ctx);
     println!(
-        "[verify] PASS 10/19 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
+        "[verify] PASS 10/21 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
         ms.total_tris as f64 / 1e6,
         ms.total_work_items,
         ms.visible_meshlets,
@@ -326,14 +331,14 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 11) DXR 1.1 Scale (1,536-Instance TLAS) + 2-Pass A-Trous Bilateral RTGI Denoiser verification
     let gi = run_rtgi_verify(&mut ctx);
     println!(
-        "[verify] PASS 11/19 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
+        "[verify] PASS 11/21 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
         gi.tlas_instances, gi.tlas_ms, gi.raw_var, gi.denoised_var, gi.edge_jump
     );
 
     // 12) BCPack 8B Quantized Meshlet Geometry Vertex Compression -> GPU Async Decode verification
     let gb = run_geom_bcpack_verify(&mut ctx, &mut gpu_dec, &window, &quads);
     println!(
-        "[verify] PASS 12/19 BCPack 8B Meshlet Geometry ({} verts = {} KiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 12/21 BCPack 8B Meshlet Geometry ({} verts = {} KiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
         gb.vertices, gb.raw_bytes / 1024, gb.ratio, gb.gpu_ms
     );
 
@@ -341,7 +346,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     let aaa = run_aaa_2k_bcpack_verify(&mut ctx, &mut gpu_dec, assets_dir, &window, &quads);
     let ratio = aaa.raw_bytes as f64 / aaa.comp_bytes.max(1) as f64;
     println!(
-        "[verify] PASS 13/19 AAA glTF+4K PBR BCPack BC7/BC5 (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 13/21 AAA glTF+4K PBR BCPack BC7/BC5 (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
         aaa.real_assets,
         aaa.verts,
         aaa.tris,
@@ -357,7 +362,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 14) RAGE-Scale Virtual Descriptor Paging (1.25M Virtual -> 262,144 Physical ResourceDescriptorHeap[] SM 6.6)
     let dp = run_descriptor_paging_verify(&mut ctx);
     println!(
-        "[verify] PASS 14/19 Virtual Descriptor Paging ({:.2}M virt -> {} phys slots, {} ops, {} evictions, copy={:.2} ms, GPU={:.3} ms, {} samples, 0 mismatches)",
+        "[verify] PASS 14/21 Virtual Descriptor Paging ({:.2}M virt -> {} phys slots, {} ops, {} evictions, copy={:.2} ms, GPU={:.3} ms, {} samples, 0 mismatches)",
         dp.virtual_count as f64 / 1e6,
         dp.physical_slots,
         dp.accesses,
@@ -370,7 +375,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 15) 64x64 World Grid Supersonic Jet-Flight Streaming (4,096 sectors = 256 km^2, 512-tile 16 MiB bursts)
     let jf = run_jet_flight_verify(&mut ctx, &mut gpu_dec, &assets);
     println!(
-        "[verify] PASS 15/19 Jet-Flight 64x64 World Grid ({}x{} = {} sectors / {:.0} km^2, {}f, {}t streamed, {} evictions, max_burst={}t, peak={:.0} MB/s, GPU={}t={:.3} ms, 0 mismatches)",
+        "[verify] PASS 15/21 Jet-Flight 64x64 World Grid ({}x{} = {} sectors / {:.0} km^2, {}f, {}t streamed, {} evictions, max_burst={}t, peak={:.0} MB/s, GPU={}t={:.3} ms, 0 mismatches)",
         jf.grid_dim,
         jf.grid_dim,
         jf.total_sectors,
@@ -387,7 +392,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 16) Two-Pass Hi-Z Occlusion Culling over 12M+ Triangle City
     let hiz = run_hiz_12m_verify(&mut ctx);
     println!(
-        "[verify] PASS 16/19 Two-Pass Hi-Z Occlusion Culling ({:.2}M tris / {} meshlets, vis={} ({:.2}M tris), frustum_cull={}, hiz_occluded={} ({:.2}M tris), build={:.3} ms, cull={:.3} ms, 0 mismatches)",
+        "[verify] PASS 16/21 Two-Pass Hi-Z Occlusion Culling ({:.2}M tris / {} meshlets, vis={} ({:.2}M tris), frustum_cull={}, hiz_occluded={} ({:.2}M tris), build={:.3} ms, cull={:.3} ms, 0 mismatches)",
         hiz.total_tris as f64 / 1e6,
         hiz.total_work_items,
         hiz.visible_meshlets,
@@ -402,7 +407,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 17) 500 GPU-Skinned NPC Crowd Compute (512,000 verts, 32,000 bones)
     let crowd = run_crowd_skinning_verify(&mut ctx);
     println!(
-        "[verify] PASS 17/19 GPU Crowd Skinning ({} NPCs x 1024v = {}k verts, {} bones, {} samples checked, max_err={:.2e}, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 17/21 GPU Crowd Skinning ({} NPCs x 1024v = {}k verts, {} bones, {} samples checked, max_err={:.2e}, GPU={:.3} ms, 0 mismatches)",
         crowd.npc_count,
         crowd.total_verts / 1000,
         crowd.total_bones,
@@ -497,7 +502,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
 
         bcpack_gpu_destroy(shared_ctx);
         println!(
-            "[verify] PASS 18/19 Zero-Copy Shared-Device C-ABI (bcpack_gpu_create_from_device + BcPackDecodeToBuffer + GPU Queue::Wait, 128x128 SW_64KB_D, 0 byte mismatches)"
+            "[verify] PASS 18/21 Zero-Copy Shared-Device C-ABI (bcpack_gpu_create_from_device + BcPackDecodeToBuffer + GPU Queue::Wait, 128x128 SW_64KB_D, 0 byte mismatches)"
         );
     }
 
@@ -657,7 +662,325 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
 
         bcpack_gpu_destroy(shared_ctx);
         println!(
-            "[verify] PASS 19/19 Direct 2D Texture C-ABI (BcPackDecodeToTexture2D: Mip 0 512x512 SW_64KB_D + Mip 3 64x64 auto-padded 256B RowPitch, 0 byte mismatches)"
+            "[verify] PASS 19/21 Direct 2D Texture C-ABI (BcPackDecodeToTexture2D: Mip 0 512x512 SW_64KB_D + Mip 3 64x64 auto-padded 256B RowPitch, 0 byte mismatches)"
+        );
+    }
+
+    // 20) Full Multi-Mode BC7 (Modes 0..7) GPU Decode + C-ABI + Gfx10 SW_64KB_D Texture2D
+    {
+        let bc7_tbl = bcp_bc7::Tables::default_table();
+        let mut all_controls = Vec::new();
+        for mode in 0..8u8 {
+            let mut found = 0usize;
+            for rot in 0..=if matches!(mode, 4 | 5) { 3 } else { 0 } {
+                for sel in 0..=if mode == 4 { 1 } else { 0 } {
+                    let c = bcp_bc7::Control {
+                        mode,
+                        partition: (mode * 7 + rot * 3) & ((1u8 << bcp_bc7::PARTITION_BITS[mode as usize]) - 1),
+                        rotation: rot,
+                        index_selection: sel,
+                    };
+                    if let Some(code) = bc7_tbl.code_of(c) {
+                        all_controls.push(code);
+                        found += 1;
+                    }
+                }
+            }
+            assert!(found > 0, "missing BC7 mode {mode} control");
+        }
+
+        let encode_synth_bc7 = |seed: u64, n_blocks: usize| -> Vec<u8> {
+            let rows = n_blocks * 2;
+            let ab = bcp_fmt::Mode::Bc7.alphabet_bits();
+            let mut syms: [Vec<u16>; 16] = std::array::from_fn(|_| vec![0u16; rows]);
+            let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xD1B54A32D192ED03;
+            let mut next_u = || -> u32 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng >> 32) as u32
+            };
+            for i in 0..n_blocks {
+                let code = all_controls[(i + seed as usize) % all_controls.len()];
+                syms[15][2 * i] = (code & 31) as u16;
+                syms[15][2 * i + 1] = ((code >> 5) & 15) as u16;
+
+                let (ep_ref, ix_ref) = match i % 4 {
+                    0 => (0usize, 0usize),
+                    1 => ((i.min(12) + 1) & 255, ((i * 3) % 255).min(i).max(if i > 0 { 1 } else { 0 })),
+                    2 => ((i + 1 + (next_u() as usize % 20)).min(254), (i + 1 + (next_u() as usize % 20)).min(254)),
+                    _ => ((next_u() as usize) & 63, (next_u() as usize) & 63),
+                };
+                let (d, x) = bcp_fmt::reference_codes(ep_ref, ix_ref);
+                let (de, do_) = bcp_fmt::deinterleave(d);
+                let (xe, xo) = bcp_fmt::deinterleave(x);
+                syms[0][2 * i] = de;
+                syms[0][2 * i + 1] = do_;
+                syms[1][2 * i] = xe;
+                syms[1][2 * i + 1] = xo;
+
+                for l in 2..15 {
+                    let lim = 1u32 << ab[l];
+                    syms[l][2 * i] = (next_u() % lim) as u16;
+                    syms[l][2 * i + 1] = (next_u() % lim) as u16;
+                }
+            }
+            let lane_frags: Vec<Vec<Fragment>> = (0..16)
+                .map(|l| {
+                    let (z, q) = best_model_for_fragment(ab[l], &syms[l]);
+                    vec![Fragment { symbols: syms[l].clone(), q, z }]
+                })
+                .collect();
+            bcpack::encode::encode_lanes(ab, &lane_frags).expect("encode BC7 modes")
+        };
+
+        let chunk_counts = [64usize, 128, 256, 512, 1024]; // 1984 blocks, includes 1024-blk texture
+        let mut streams = Vec::with_capacity(chunk_counts.len());
+        let mut cpu_oracle = Vec::new();
+        for (idx, &blks) in chunk_counts.iter().enumerate() {
+            let st = encode_synth_bc7(77 + idx as u64, blks);
+            let cpu = bcp_bc7::decode(&st, blks * 16, bc7_tbl).expect("CPU BC7 decode");
+            assert_eq!(cpu.unknown_controls, 0);
+            cpu_oracle.extend_from_slice(&cpu.blocks);
+            streams.push((st, blks));
+        }
+
+        let mut bc7_full = Bc7FullGpuDecoder::new(&mut ctx, 16, 4096, 8 * 1024 * 1024);
+        let batch = pack_batch(streams.iter().map(|(s, blks)| (s.as_slice(), blks * 2)));
+        let (gpu_bc7, statuses, bc7_ms, _) = bc7_full.decode_batch_and_readback(&mut ctx, &batch);
+        assert!(statuses.iter().all(|s| s.code == 0), "BC7 full status err: {statuses:?}");
+        assert_eq!(gpu_bc7, cpu_oracle, "Full Multi-Mode BC7 (Modes 0..7) GPU mismatch!");
+
+        // C-ABI check: BcPackDecodeAsync + BcPackDecodeToTexture2D (BC7 128x128px = 32x32 blks = 1024 blks, SW_64KB_D)
+        unsafe {
+            use std::mem::ManuallyDrop;
+            use windows::core::Interface;
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC7_UNORM, DXGI_SAMPLE_DESC};
+
+            let shared_ctx = bcpack_gpu_create_from_device(ctx.device.as_raw(), std::ptr::null_mut(), 16, 4096, 8 * 1024 * 1024);
+            let mut host_out = vec![0u8; chunk_counts[4] * 16];
+            let mut fv = 0u64;
+            let rc = BcPackDecodeAsync(
+                shared_ctx,
+                streams[4].0.as_ptr(),
+                streams[4].0.len() as u32,
+                chunk_counts[4] as u32,
+                BCPACK_FORMAT_BC7,
+                BCPACK_SWIZZLE_LINEAR,
+                32,
+                32,
+                host_out.as_mut_ptr(),
+                host_out.len() as u32,
+                &mut fv,
+            );
+            assert_eq!(rc, 0, "C-ABI BcPackDecodeAsync BC7 failed: {rc}");
+            let off4: usize = chunk_counts[..4].iter().sum::<usize>() * 16;
+            assert_eq!(&host_out[..], &cpu_oracle[off4..off4 + chunk_counts[4] * 16], "C-ABI BC7 mismatch");
+
+            // Test Texture2D SW_64KB_D detile + row-pitch pad (256x256px = 64x64 blks = 4096 blks; row = 64*16=1024B)
+            let tex_stream = encode_synth_bc7(999, 4096);
+            let linear_bc7 = bcp_bc7::decode(&tex_stream, 4096 * 16, bc7_tbl).unwrap().blocks;
+            let (swz_st, swz_blks) = {
+                // CPU Gfx10 SW_64KB_D (16B: "xyxxyyxyxyxy", 64x64 tile) detile oracle
+                let mut expected_detiled = vec![0u8; 4096 * 16];
+                let pat = b"xyxxyyxyxyxy";
+                for i in 0..4096usize {
+                    let (mut lx, mut ly, mut xi, mut yi) = (0usize, 0usize, 0usize, 0usize);
+                    for (bit, &axis) in pat.iter().enumerate() {
+                        let v = (i >> bit) & 1;
+                        if axis == b'x' { lx |= v << xi; xi += 1; } else { ly |= v << yi; yi += 1; }
+                    }
+                    let lin = ly * 64 + lx;
+                    expected_detiled[lin * 16..lin * 16 + 16].copy_from_slice(&linear_bc7[i * 16..i * 16 + 16]);
+                }
+                let tex_desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Alignment: 0,
+                    Width: 256,
+                    Height: 256,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_BC7_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                    Flags: D3D12_RESOURCE_FLAG_NONE,
+                };
+                let heap_def = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+                    CreationNodeMask: 0,
+                    VisibleNodeMask: 0,
+                };
+                let mut tex_opt: Option<ID3D12Resource> = None;
+                ctx.device.CreateCommittedResource(&heap_def, D3D12_HEAP_FLAG_NONE, &tex_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut tex_opt).unwrap();
+                let tex = tex_opt.unwrap();
+
+                let mut df = 0u64;
+                let rc_t = BcPackDecodeToTexture2D(
+                    shared_ctx,
+                    tex_stream.as_ptr(),
+                    tex_stream.len() as u32,
+                    4096,
+                    BCPACK_FORMAT_BC7,
+                    BCPACK_SWIZZLE_GFX10_64KB_D,
+                    64,
+                    64,
+                    tex.as_raw(),
+                    0,
+                    0,
+                    0,
+                    &mut df,
+                );
+                assert_eq!(rc_t, 0, "BcPackDecodeToTexture2D BC7 SW_64KB_D failed: {rc_t}");
+                let rb = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, (4096 * 16) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+                let ca: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let cl: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &ca, None).unwrap();
+                let raw_df = BcPackGetDirectFence(shared_ctx);
+                let dfence: ID3D12Fence = (*ManuallyDrop::new(ID3D12Fence::from_raw(raw_df))).clone();
+                ctx.queue.Wait(&dfence, df).unwrap();
+                cmd_barriers(&cl, vec![transition_barrier(&tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let mut dloc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(rb.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_BC7_UNORM, Width: 256, Height: 256, Depth: 1, RowPitch: 1024 },
+                        },
+                    },
+                };
+                let mut sloc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(tex.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                cl.CopyTextureRegion(&dloc, 0, 0, 0, &sloc, None);
+                let _ = ManuallyDrop::take(&mut dloc.pResource);
+                let _ = ManuallyDrop::take(&mut sloc.pResource);
+                cmd_barriers(&cl, vec![transition_barrier(&tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                cl.Close().unwrap();
+                ctx.queue.ExecuteCommandLists(&[Some(cl.cast::<ID3D12CommandList>().unwrap())]);
+                ctx.signal_and_wait();
+                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                rb.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 4096 * 16 }), Some(&mut ptr)).unwrap();
+                let got = std::slice::from_raw_parts(ptr as *const u8, 4096 * 16).to_vec();
+                rb.Unmap(0, None);
+                assert_eq!(got, expected_detiled, "BcPackDecodeToTexture2D BC7 SW_64KB_D mismatch!");
+                (tex_stream.len(), 4096usize)
+            };
+            bcpack_gpu_destroy(shared_ctx);
+            let _ = (swz_st, swz_blks);
+        }
+
+        println!(
+            "[verify] PASS 20/21 Full Multi-Mode BC7 (Modes 0..7 + Rotations + Dict + Refs + C-ABI SW_64KB_D Texture2D, {} chunks / 1984 blks, GPU={:.3} ms, 0 byte mismatches)",
+            chunk_counts.len(),
+            bc7_ms
+        );
+    }
+
+    // 21) Full BC3 + BC4 + BC5 GPU Decode + C-ABI (12-lane rANS + Pair/Quad Rank + Dict + History)
+    {
+        let encode_synth_bcn = |mode: BcpMode, seed: u64, n_blocks: usize| -> Vec<u8> {
+            let per = mode.symbols_per_block();
+            let rows = n_blocks * per;
+            let ab = mode.alphabet_bits();
+            let mut syms: [Vec<u16>; 12] = std::array::from_fn(|_| vec![0u16; rows]);
+            let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xA0761D6478BD642F;
+            let mut next_u = || -> u32 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng >> 32) as u32
+            };
+            for i in 0..n_blocks {
+                let (ep_ref, ix_ref) = match i % 3 {
+                    0 => (0usize, 0usize),
+                    1 => ((i.min(10) + 1) & 255, i.min(10) + 1), // exercises dictionary on early blocks too
+                    _ => ((i.min(254) + 1) & 255, ((next_u() as usize) % 30)),
+                };
+                let (d, x) = bcp_fmt::reference_codes(ep_ref, ix_ref);
+                if per == 1 {
+                    syms[0][i] = d as u16;
+                    syms[1][i] = x as u16;
+                    for l in 2..12 {
+                        syms[l][i] = (next_u() % (1u32 << ab[l])) as u16;
+                    }
+                } else {
+                    let (de, do_) = bcp_fmt::deinterleave(d);
+                    let (xe, xo) = bcp_fmt::deinterleave(x);
+                    syms[0][2 * i] = de;
+                    syms[0][2 * i + 1] = do_;
+                    syms[1][2 * i] = xe;
+                    syms[1][2 * i + 1] = xo;
+                    for l in 2..12 {
+                        let lim = 1u32 << ab[l];
+                        syms[l][2 * i] = (next_u() % lim) as u16;
+                        syms[l][2 * i + 1] = (next_u() % lim) as u16;
+                    }
+                }
+            }
+            let lane_frags: Vec<Vec<Fragment>> = (0..12)
+                .map(|l| {
+                    let (z, q) = best_model_for_fragment(ab[l], &syms[l]);
+                    vec![Fragment { symbols: syms[l].clone(), q, z }]
+                })
+                .collect();
+            bcpack::encode::encode_lanes(ab, &lane_frags).expect("encode BCn")
+        };
+
+        let items = [
+            (BcpMode::Bc3, BCPACK_FORMAT_BC3, 256usize),
+            (BcpMode::Bc4, BCPACK_FORMAT_BC4, 512usize),
+            (BcpMode::Bc5, BCPACK_FORMAT_BC5, 384usize),
+        ];
+        let mut streams = Vec::new();
+        let mut cpu_all = Vec::new();
+        for (idx, &(m, _, blks)) in items.iter().enumerate() {
+            let st = encode_synth_bcn(m, 300 + idx as u64, blks);
+            let tbl = bcp_bcn::Tables::default_for(m).unwrap();
+            let cpu = bcp_bcn::decode(&st, blks * m.block_bytes(), tbl).expect("CPU BCn decode");
+            cpu_all.extend_from_slice(&cpu.blocks);
+            streams.push((st, m, blks, cpu.blocks));
+        }
+
+        let mut bcn_dec = BcnGpuDecoder::new(&mut ctx, 16, 4096, 2 * 1024 * 1024, 8 * 1024 * 1024);
+        let batch = pack_bcn_batch(streams.iter().map(|(s, m, blks, _)| (s.as_slice(), *m, *blks)));
+        let (gpu_bcn, statuses, bcn_ms, _) = bcn_dec.decode_batch_and_readback(&mut ctx, &batch);
+        assert!(statuses.iter().all(|s| s.code == 0), "BCn status err: {statuses:?}");
+        assert_eq!(gpu_bcn, cpu_all, "BC3/BC4/BC5 mixed GPU batch mismatch!");
+
+        // C-ABI check across BC3, BC4, BC5 via BcPackDecodeAsync
+        unsafe {
+            use windows::core::Interface;
+            let shared_ctx = bcpack_gpu_create_from_device(ctx.device.as_raw(), std::ptr::null_mut(), 16, 4096, 8 * 1024 * 1024);
+            for ((st, m, blks, expected), &(_, ffi_fmt, _)) in streams.iter().zip(items.iter()) {
+                let mut host_out = vec![0u8; blks * m.block_bytes()];
+                let mut fv = 0u64;
+                let rc = BcPackDecodeAsync(
+                    shared_ctx,
+                    st.as_ptr(),
+                    st.len() as u32,
+                    *blks as u32,
+                    ffi_fmt,
+                    BCPACK_SWIZZLE_LINEAR,
+                    0,
+                    0,
+                    host_out.as_mut_ptr(),
+                    host_out.len() as u32,
+                    &mut fv,
+                );
+                assert_eq!(rc, 0, "C-ABI BcPackDecodeAsync format {ffi_fmt} failed: {rc}");
+                assert_eq!(&host_out, expected, "C-ABI format {ffi_fmt} mismatch");
+            }
+            bcpack_gpu_destroy(shared_ctx);
+        }
+
+        println!(
+            "[verify] PASS 21/21 Full BC3 + BC4 + BC5 GPU Decode + C-ABI (1152 mixed blocks, GPU={:.3} ms, 0 byte mismatches)",
+            bcn_ms
         );
     }
 

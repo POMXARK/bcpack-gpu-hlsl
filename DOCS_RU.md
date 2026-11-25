@@ -1,4 +1,4 @@
-# bcpack-gpu-hlsl v0.11.0 — Оптимизация под 8 ГБ GPU (TAAU + VRS Tier 2) и модульный SDK `bcpack-gpu-sdk` (19/19 PASS)
+# bcpack-gpu-hlsl v0.12.0 — Full BC7 (Modes 0–7) + BC3/4/5, TAAU + VRS Tier 2 и субмодуль `sdk/` (21/21 PASS)
 
 > **Отдельный аппаратный SDK без демо-сцен:** [`bcpack_gpu.dll`](https://github.com/POMXARK/bcpack-gpu-sdk), [`bcpack_gpu.h`](sdk/include/bcpack_gpu.h), базовые Compute HLSL/DXIL-ядра и прекомпилированный **Vulkan 1.3 SPIR-V** вынесены в чистый репозиторий **[`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk)** и подключены сюда через Git-субмодуль [`sdk/`](sdk) (`git clone --recursive`).
 

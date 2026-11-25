@@ -3,7 +3,7 @@ members = [".", "sdk"]
 
 [package]
 name = "bcpack-gpu-hlsl"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Clean-room Xbox Series BCPack (MDU rANS) GPU Compute Shader decoder & 4K AAA streaming benchmark in DirectX 12 HLSL SM 6.6 (Wave32)"
@@ -32,7 +32,7 @@ path = "src/bin/demo_aaa.rs"
 
 [dependencies]
 bcpack-gpu-sdk = { path = "sdk" }
-bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "b1c3099a3402de8b76c9263a828791bd8bc0c930", default-features = false }
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "f5145dda7fa6d1a22b499d82f3e63029713b71b6", default-features = false }
 gltf = "1.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rayon = "1.10"
