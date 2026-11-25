@@ -93,6 +93,7 @@ pub struct AaaDemoConfig {
     pub no_crowd: bool,
     pub record_dir: Option<PathBuf>,
     pub record_frames: u32,
+    pub record_fps: f32,
     pub fps_cap: u32,
     pub sim_speed: f32,
     pub show_hud: Option<bool>,
@@ -122,6 +123,7 @@ impl Default for AaaDemoConfig {
             no_crowd: false,
             record_dir: None,
             record_frames: 120,
+            record_fps: 15.0,
             fps_cap: 0,
             sim_speed: 1.0,
             show_hud: None,
@@ -2796,9 +2798,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             let raw_dt_ms = (now - last_frame).as_secs_f64() * 1000.0;
             const RECORD_WARMUP: u32 = 24;
             let (dt, t_sec) = if cfg.record_dir.is_some() {
+                let rfps = cfg.record_fps.max(1.0);
+                if frame_count == RECORD_WARMUP {
+                    live_fps = rfps;
+                }
                 let rec_step = frame_count.saturating_sub(RECORD_WARMUP);
-                let rec_t = (rec_step as f32) / 15.0;
-                (1.0f32 / 15.0, rec_t)
+                let rec_t = (rec_step as f32) / rfps;
+                (1.0f32 / rfps, rec_t)
             } else {
                 let frame_dt = ((raw_dt_ms * 0.001) as f32).min(0.05);
                 sim_time += frame_dt * wstate.sim_speed;
@@ -2889,7 +2895,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             let hero_model = Mat4::translation(0.0, 0.0, 0.0).mul(&Mat4::rotate_y(2.42));
             let (cam_pos, cam_target) = if cfg.benchmark_run {
-                let p = (t_sec / cfg.benchmark_secs.max(5.0)).clamp(0.0, 1.0);
+                let p = (t_sec / cfg.benchmark_secs.max(2.0)).clamp(0.0, 1.0);
                 if p < 0.33 {
                     let s = p / 0.33;
                     let orbit_yaw = -1.45 + s * 0.45;

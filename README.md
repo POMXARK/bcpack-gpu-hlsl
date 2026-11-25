@@ -6,15 +6,48 @@
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
 
-**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor, `v0.8.0` Cinematic Open AAA 4K PBR Benchmark, & RAGE-Scale Streaming Stress Suite in DX12 HLSL SM 6.6 (Wave32) + Mesh Shaders (`as_6_5`/`ms_6_5`) + Hi-Z + DXR 1.1 Inline Ray Tracing & RTGI — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1), 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), `150.61 FPS` avg (60s `--benchmark-run`) @ 1080p HDR in the Open AAA 4K BC7/BC5 City (`12.41M` pre-cull tris, `500` GPU-skinned NPCs, active SFS saving `118.5 MiB` VRAM), `1.25M` Virtual `ResourceDescriptorHeap[]` Paging (`0.061 ms`), `64×64` (`256 km²`) `--jet-flight` streaming (`960 MB/s`) — 17/17 bit-exact PASS on an NVIDIA RTX 5080.**
+**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor, Zero-Copy DirectX 12 C-ABI (`bcpack_gpu.dll`), precompiled Vulkan 1.3 SPIR-V compute kernels (`dxc -spirv`), `1.25M` Virtual `ResourceDescriptorHeap[]` Paging (`0.064 ms`), & `v0.10.0` Open AAA 4K PBR Benchmark — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1), 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 432.6 GB/s AMD Gfx10 Swizzle->Linear detile, `150.61 FPS` avg (60s `--benchmark-run`) @ 1080p HDR (`12.41M` Mesh Shaders + Hi-Z, `500` GPU-skinned NPCs, active SFS saving `118.5 MiB` VRAM) — verified 19/19 bit-exact PASS (DX12 Debug Layer clean, 0 errors) on an NVIDIA RTX 5080.**
 
-> Clean-room implementation using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. Built on the format specification and CPU oracle from [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) and Microsoft's MIT-licensed [`microsoft/silicon-rans`](https://github.com/microsoft/silicon-rans).
+> Clean-room implementation (`MIT OR Apache-2.0`) using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. Built on the format specification and CPU oracle from [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) and Microsoft's MIT-licensed [`microsoft/silicon-rans`](https://github.com/microsoft/silicon-rans). AI/LLM full technical spec: [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md) & [`llms.txt`](llms.txt).
 
 ---
 
-## Open AAA Benchmark (`v0.8.0` — 4K BC7/BC5 + Active SFS + 12.41M Mesh-Shader City + 500 NPCs + DXR 1.1 + TAA)
+## What's New in `v0.10.0` — Zero-Copy C-ABI, Vulkan 1.3 SPIR-V & GPU Block-Reconstruction
 
-![v0.8.0 Live 3-Act Cinematic AAA Benchmark (4K BC7/BC5 + 12.41M Mesh-Shader City + 500 NPCs + DXR 1.1 + TAA)](media/aaa_showcase_v8.gif)
+1. **Zero-Copy Shared-Device & Direct 2D Texture C-ABI in `bcpack_gpu.dll` ([`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`src/ffi.rs`](src/ffi.rs)):**
+   - **`bcpack_gpu_create_from_device(d3d12_device, d3d12_compute_queue, ...)`:** Attaches directly to a translator/emulator's existing `ID3D12Device*` (preserving caller ownership, optional external Compute queue).
+   - **`BcPackDecodeToBuffer(...)` (`PASS 18/19`):** Decodes BCPack + Gfx10 detile directly into a caller-owned `D3D12_HEAP_TYPE_DEFAULT` GPU buffer with zero CPU readback.
+   - **`BcPackDecodeToTexture2D(...)` (`PASS 19/19`):** Runs BCPack decode (+ optional `SW_64KB_D` / `SW_4KB_S` detile) on the **Async Compute Queue**, handoffs purely on GPU (`Queue::Wait` via `BcPackGetComputeFence`), and uploads directly into any caller `DXGI_FORMAT_BC1_UNORM` 2D texture subresource/mip via `CopyTextureRegion` — automatically padding RowPitch to 256 bytes on small mip levels, signaling `BcPackGetDirectFence`.
+2. **HLSL SM 6.6 → Vulkan 1.3 SPIR-V Compute (`dxc -spirv`, [`shaders/spirv/*.spv`](shaders/compile_spirv.sh)):**
+   - All 7 core compute kernels precompiled using official Microsoft `DirectXShaderCompiler v1.9.2609` (`-spirv -fspv-target-env=vulkan1.3 -T cs_6_6 -E CSMain -O3`): `bcpack_decode.spv`, `bcpack_bc7_rans.spv`, `bc16_pack.spv`, `gfx10_detile.spv`, `hiz_build.spv`, `crowd_skin.spv`, and `bindless_paging.spv` — ready for Vulkan 1.3/1.4 & Linux/Proton layers (`OpenScarlett`; enable `VK_EXT_subgroup_size_control` for Wave32 on 64-wide GPUs).
+3. **GPU Block-Reconstruction & 16-Byte BC7/BC5 Packing:**
+   - Full GPU BC1 endpoint + quad reconstruction in [`shaders/bcpack_decode.hlsl`](shaders/bcpack_decode.hlsl) (`11.33 GB/s`, `0` mismatches).
+   - Verified 16-lane BC7 rANS entropy stage at **100% Wave32** (`32/32` lanes in [`shaders/bcpack_bc7_rans.hlsl`](shaders/bcpack_bc7_rans.hlsl), `6.02 GB/s equiv`) + GPU compute **16-byte block packer** ([`shaders/bc16_pack.hlsl`](shaders/bc16_pack.hlsl)) collapsing `8 × uint` symbol rows into `16B` BC7 Mode 6 / BC5 blocks on VRAM. Full multi-mode hardware BC7 (Modes 0–7) / BC3 / BC4 / BC6H GPU block-reconstruction pass planned to align with upstream [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs).
+
+---
+
+## Performance Optimizations & Hardware Workarounds Index (AI / Search Reference)
+
+| Optimization / Fix | Problem Solved (Search Keywords) | Solution Implemented | Verified Gain / Metric (RTX 5080) | Source File |
+|---|---|---|---|---|
+| **Zero-Barrier Wave32 rANS** | CPU `~40 MB/s` BCPack stall (`IDStorageQueueX`); 4,096+ LDS barriers/chunk | 2 chunks/warp (`24/32` BC1, **`32/32` BC7**), register 64B window + `WaveReadLaneAt`, 4-step branchless binary search | **`11.33 GB/s`** BC1 (**282×**), **`6.02 GB/s`** BC7 (**247×**), **`5 → 189 FPS`** live | [`bcpack_decode.hlsl`](shaders/bcpack_decode.hlsl), [`bcpack_bc7_rans.hlsl`](shaders/bcpack_bc7_rans.hlsl) |
+| **DXC 1.8 `-O3` Ballot Fix** | `WavePrefixCountBits` + `WaveActiveCountBits` miscompiles `stream_pos` at `-O3` | Replace with explicit `WaveActiveBallot` + `countbits(mask & ((1u << ll) - 1u))` | **0 byte mismatches** under full `-O3` (`PASS 1..7`) | [`bcpack_decode.hlsl`](shaders/bcpack_decode.hlsl) |
+| **Fused AMD Gfx10 Detile** | Xbox MDU outputs `SW_64KB_D` / `SW_4KB_S`; CPU detile bottlenecks PCIe | Inline Compute bit-permutation pass (`xyxxyyxyxyxyx` / `xyyxxyxyx`) before `CopyTextureRegion` | **`432.6 GB/s`** (`0.144 ms` / `64 MiB`) | [`gfx10_detile.hlsl`](shaders/gfx10_detile.hlsl) |
+| **Ping-Pong Async Compute + `bc16_pack`** | Direct queue serializes decode/render; 16-lane BC7 emits 32B/row | Double-buffered `COMPUTE` + `ID3D12Fence` overlap + GPU `Store2` 16B packer | **`101.8 → 189.4 FPS`** live, **`171.9 FPS` @ `32 MiB/f`** | [`gpu_decoder.rs`](src/gpu_decoder.rs), [`bc16_pack.hlsl`](shaders/bc16_pack.hlsl) |
+| **1.25M Descriptor Heap Paging** | NVIDIA ~1M `shader-visible` heap cap → `E_OUTOFMEMORY` crash (`d3d12_xs`) | SM 6.6 `ResourceDescriptorHeap[NonUniformResourceIndex(g_VirtToPhys[id])]` LRU via `CopyDescriptorsSimple` | **`1.25M → 262K` slots** in **`0.064 ms`** (`0` mismatches) | [`descriptor_paging.rs`](src/descriptor_paging.rs), [`bindless_paging.hlsl`](shaders/bindless_paging.hlsl) |
+| **Active GPU Sampler Feedback (SFS)** | Full 4K BC7/BC5 11-mip chains saturate VRAM (`204.67 MiB` pool) | Pixel-shader `InterlockedMin` into `g_SfsFeedback : u0` → LRU `ResourceMinLODClamp` | **`86.2 / 204.7 MiB`** (**`118.5 MiB` VRAM saved**) | [`aaa_pbr.hlsl`](shaders/aaa_pbr.hlsl), [`aaa_scene.rs`](src/aaa_scene.rs) |
+| **RTX 5080 `621.24` RT-Cache Fix** | Flickering **8×8 dark squares** under DXR 1.1 `RayQuery` + Async Compute | Isolated TLAS build + `uav_barrier_all()` + explicit fence flush before G-Buffer | **0 tile artifacts** across 9,000+ frames | [`aaa_scene.rs`](src/aaa_scene.rs) |
+| **Mesh Shaders + 6-Mip Hi-Z** | Boxy LOD geometry vs slow 12M-tri vertex shading | `as_6_5`/`ms_6_5` 1-draw dispatch + `R32_TYPELESS` 6-mip MAX depth pyramid | **`12.41M → 0.99M`** avg visible (`0.015 ms` Hi-Z) | [`aaa_meshlet_as.hlsl`](shaders/aaa_meshlet_as.hlsl), [`hiz_build.hlsl`](shaders/hiz_build.hlsl) |
+| **GPU Crowd Skinning (`500` NPCs)** | CPU skeletal animation stalls open-world crowd streaming | 4-bone LBS in Compute (`[numthreads(64,1,1)]`) + per-limb TAA motion vectors | **`0.075 ms`** for `512k` verts (`max_err=7.63e-6`) | [`crowd_skin.hlsl`](shaders/crowd_skin.hlsl), [`aaa_crowd.hlsl`](shaders/aaa_crowd.hlsl) |
+| **Textured DXR 1.1 + TAA/AgX/CAS** | Flat instance reflections, specular aliasing, RTGI noise shimmer | `RtInstMeta` (`t34`) ray-hit UV sampling + 4-pass A-Trous + YCoCg TAA + AgX Filmic | **`150.61 FPS` Avg** (`1080p` HDR, 60s benchmark) | [`aaa_pbr.hlsl`](shaders/aaa_pbr.hlsl), [`aaa_taa.hlsl`](shaders/aaa_taa.hlsl), [`aaa_composite.hlsl`](shaders/aaa_composite.hlsl) |
+| **Zero-Copy C-ABI & Vulkan SPIR-V** | Cross-process copies; Vulkan 1.3/Linux Proton shaders needed (`OpenScarlett`) | `bcpack_gpu_create_from_device`, `BcPackDecodeToTexture2D`, official DXC `-spirv` | **0 CPU readback**, 7 Vulkan 1.3 `.spv` kernels | [`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`compile_spirv.sh`](shaders/compile_spirv.sh) |
+
+---
+
+## Open AAA Benchmark (`v0.10.0` — 4K BC7/BC5 + Active SFS + 12.41M Mesh-Shader City + 500 NPCs + DXR 1.1 + TAA)
+
+![v0.10.0 High-FPS Live AAA Benchmark (50 FPS GIF / 60 FPS Source + Interactive HUD Sliders)](media/aaa_benchmark_60fps.gif)
+- **True 60.0 FPS (`960×540` MP4) Capture:** [`media/aaa_benchmark_60fps.mp4`](media/aaa_benchmark_60fps.mp4) | **3-Act 8s Overview GIF:** [`media/aaa_showcase_v8.gif`](media/aaa_showcase_v8.gif)
 
 ![v0.8.0 Cinematic AAA Benchmark: 4K BC7/BC5 + Modular Mesh-Shader City + 500 GPU-Skinned NPCs + DXR 1.1 + AgX + TAA](media/aaa_showcase_v8.png)
 

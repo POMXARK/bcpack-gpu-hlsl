@@ -62,6 +62,10 @@ fn main() {
                 cfg.record_frames = args[i + 1].parse().unwrap_or(120);
                 i += 1;
             }
+            "--record-fps" if i + 1 < args.len() => {
+                cfg.record_fps = args[i + 1].parse().unwrap_or(15.0);
+                i += 1;
+            }
             "--fps-cap" if i + 1 < args.len() => {
                 cfg.fps_cap = args[i + 1].parse().unwrap_or(0);
                 i += 1;

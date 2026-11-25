@@ -1,0 +1,32 @@
+# bcpack-gpu-hlsl — AI Agent & Code-Search Entrypoint (`v0.10.0`)
+
+> Clean-room Xbox Series X|S BCPack (MDU rANS) GPU Compute Decompressor, AMD Gfx10 Detiler, SM 6.6 Virtual Descriptor Heap Pager, Zero-Copy DirectX 12 C-ABI DLL, Vulkan 1.3 SPIR-V Kernels, & Open 4K AAA Streaming Benchmark (`MIT OR Apache-2.0`).
+
+## Search Keywords / Problems Solved
+- Xbox Series X|S `BCPack` / `IDStorageQueueX` / `dstorage` CPU decompression bottleneck (~40 MB/s -> 5 FPS)
+- NVIDIA DX12 `E_OUTOFMEMORY` on `D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE` (~1M descriptor limit) -> `ResourceDescriptorHeap[]` Virtual Paging (`1.25M` virtual IDs -> `262,144` physical slots in `0.064 ms`)
+- DXC 1.8 `-O3` bug with `WavePrefixCountBits` + `WaveActiveCountBits` in HLSL Wave32 -> `WaveActiveBallot` + `countbits` fix
+- NVIDIA RTX 5080 Driver `621.24` flickering 8x8 black squares under DXR 1.1 `RayQuery` + Async Compute -> TLAS rebuild `uav_barrier_all()` isolation fix
+- AMD Gfx10 / RDNA2 hardware swizzle `SW_64KB_D` / `SW_4KB_S` -> GPU Compute detile (`432.6 GB/s`)
+- Zero-copy DX12 C-ABI texture upload (`bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D`)
+- HLSL SM 6.6 -> Vulkan 1.3 SPIR-V (`dxc -spirv -fspv-target-env=vulkan1.3`, `VK_EXT_subgroup_size_control`)
+- GPU Sampler Feedback Streaming (`g_SfsFeedback` + `ResourceMinLODClamp` saving `118.5 MiB` VRAM live)
+- Hardware Mesh Shaders (`as_6_5`/`ms_6_5`) + 6-Mip Conservative Hi-Z Occlusion Culling (`12.41M -> 0.99M` tris)
+
+## Canonical Files for AI Agents
+- Full Technical Architecture, Register Bindings & Invariants: `docs/AI_ARCHITECTURE.md`
+- C/C++ Zero-Copy Integration API: `include/bcpack_gpu.h`, `src/ffi.rs`
+- Wave32 GPU BCPack Kernels: `shaders/bcpack_decode.hlsl`, `shaders/bcpack_bc7_rans.hlsl`, `shaders/bc16_pack.hlsl`
+- Gfx10 Swizzle -> Linear Detile: `shaders/gfx10_detile.hlsl`
+- Vulkan 1.3 SPIR-V Outputs & Build Script: `shaders/compile_spirv.sh`, `shaders/spirv/*.spv`
+- Virtual Descriptor Pager: `src/descriptor_paging.rs`, `shaders/bindless_paging.hlsl`
+- Hi-Z + Mesh Shaders + 500-NPC Crowd + Active SFS + TAA/AgX Showcase: `src/aaa_scene.rs`, `src/aaa_world.rs`, `shaders/aaa_*.hlsl`
+- Target Translation Layer Integration Notes: `docs/OUTREACH_PITCH.md`
+
+## Verified Hardware Results (NVIDIA GeForce RTX 5080, DX12 Debug Layer Clean — 0 Errors)
+- `bcpack-gpu-demo.exe --verify`: `19/19 PASS` (`0` byte/symbol mismatches vs `Ahmet-Dedeler/bcpack-rs`)
+- BC1 4K-Tiled Decode: `11,327.6 MB/s` (`5.650 ms` / `64 MiB`, `282.1x` vs 1T CPU)
+- BC7 16-Lane rANS (`32/32` Wave32): `6,024.0 MB/s equiv` (`5.312 ms` / `32 MiB`, `247.1x` vs 1T CPU)
+- Gfx10 `SW_64KB_D` Detile: `432.6 GB/s` (`0.144 ms` / `64 MiB`)
+- Virtual Descriptor Paging (`1.25M -> 262K`): `0.064 ms` (`65,536` verified pixel samples, `0` mismatches)
+- Live 60s Open AAA Benchmark (`1920x1080` HDR): `150.61 FPS Avg` (`1% Low 87.07 FPS`, `86.2 / 204.7 MiB` SFS VRAM)

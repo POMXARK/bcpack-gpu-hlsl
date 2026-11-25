@@ -1,10 +1,23 @@
-# bcpack-gpu-hlsl v0.8.0 — Кинематографичный AAA-бенчмарк: 4K BC7/BC5 + SFS + 12.41M Mesh Shaders + 500 NPC + DXR 1.1
+# bcpack-gpu-hlsl v0.10.0 — Zero-Copy C-ABI, Vulkan 1.3 SPIR-V и 4K AAA-бенчмарк (150.6 FPS, 19/19 PASS)
 
-![Живой 3-актный пролёт v0.8.0 AAA-бенчмарка: 4K BC7/BC5 + 12.41M Mesh Shaders + 500 NPC + DXR 1.1 + TAA](media/aaa_showcase_v8.gif)
+![Живой высококадровый прогон v0.10.0 AAA-бенчмарка (50 FPS GIF / 60 FPS исходник + HUD-ползунки FPS и Sim Speed)](media/aaa_benchmark_60fps.gif)
+- **Видео 60.0 FPS (MP4 `960×540`):** [`media/aaa_benchmark_60fps.mp4`](media/aaa_benchmark_60fps.mp4) | **Обзор 3 актов:** [`media/aaa_showcase_v8.gif`](media/aaa_showcase_v8.gif)
 
 ![Скриншот v0.8.0: 4K BC7/BC5 + модульные фасады Mesh Shaders (12.41M трис) + 500 NPC + DXR 1.1 + TAA + AgX](media/aaa_showcase_v8.png)
 
 ![Режим X-Ray v0.8.0: живой SFS-стриминг 4K Mip 0 (зелёный) и экономия VRAM в Mip 1+ (янтарный)](media/aaa_xray_v8.png)
+
+---
+
+## Что нового в v0.10.0 (Zero-Copy C-ABI, SPIR-V, GPU Block-Reconstruction & AI Index)
+
+1. **Zero-Copy API в `bcpack_gpu.dll` (`bcpack_gpu_create_from_device`, [`include/bcpack_gpu.h`](include/bcpack_gpu.h)):**
+   - Подключение к уже созданному `ID3D12Device*` эмулятора/транслятора (`bcpack_gpu_create_from_device`), декодирование напрямую в GPU-буфер (`BcPackDecodeToBuffer`, `PASS 18/19`) или **в любой мип/subresource 2D-текстуры `DXGI_FORMAT_BC1_UNORM`** (`BcPackDecodeToTexture2D`, `PASS 19/19`) с автоматическим выравниванием RowPitch до 256 байт и GPU-синхронизацией `Queue::Wait` без чтения на CPU.
+2. **HLSL SM 6.6 → SPIR-V / Vulkan 1.3 Compute (`dxc -spirv`, [`shaders/compile_spirv.sh`](shaders/compile_spirv.sh)):**
+   - Все 7 основных Compute-шейдеров скомпилированы официальным Microsoft `DirectXShaderCompiler v1.9.2609` (`shaders/spirv/*.spv`: `bcpack_decode.spv`, `bcpack_bc7_rans.spv`, `bc16_pack.spv`, `gfx10_detile.spv`, `hiz_build.spv`, `crowd_skin.spv`, `bindless_paging.spv`).
+3. **GPU Block-Reconstruction & 16B упаковка:**
+   - Полная реконструкция BC1-блоков на GPU ([`bcpack_decode.hlsl`](shaders/bcpack_decode.hlsl), `11.33 GB/s`), 16-lane BC7 rANS на `100%` Wave32 (`6.02 GB/s equiv`) и Compute-упаковщик 16-байтовых блоков BC7 Mode 6 / BC5 ([`bc16_pack.hlsl`](shaders/bc16_pack.hlsl)); в плане — полная мульти-режимная GPU-реконструкция BC7 (Modes 0–7) / BC3 / BC4 / BC6H под `bcpack-rs`.
+4. **Индекс оптимизаций для ИИ и поиска решений:** [`llms.txt`](llms.txt) + [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md) + таблица всех 11 оптимизаций и аппаратных фиксов в [`README.md`](README.md).
 
 ---
 
