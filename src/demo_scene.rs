@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_A, VK_C, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_LEFT, VK_M, VK_Q,
+    GetAsyncKeyState, VK_A, VK_C, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_F, VK_LEFT, VK_M, VK_Q,
     VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -195,12 +195,15 @@ pub struct DemoConfig {
     pub screenshot_path: Option<PathBuf>,
     pub screenshot_frames: u32,
     pub measure_frames: Option<u32>,
+    pub record_dir: Option<PathBuf>,
+    pub record_frames: u32,
 }
 
 struct WindowState {
     mode: DemoMode,
     use_gpu: bool,
     multi_core_cpu: bool,
+    sfs_enabled: bool,
     tiles_per_frame: usize,
     cam_mode: u8, // 0 = Chase, 1 = Free Drive, 2 = Helicopter
     should_quit: bool,
@@ -230,6 +233,8 @@ unsafe extern "system" fn wnd_proc(
                     PostQuitMessage(0);
                 } else if vk == VK_SPACE.0 && st.mode == DemoMode::Toggleable {
                     st.use_gpu = !st.use_gpu;
+                } else if vk == VK_F.0 {
+                    st.sfs_enabled = !st.sfs_enabled;
                 } else if vk == VK_M.0 && (st.mode == DemoMode::CpuOnly || !st.use_gpu) {
                     st.multi_core_cpu = !st.multi_core_cpu;
                 } else if vk == VK_C.0 {
@@ -420,7 +425,7 @@ pub fn run_demo(
         let max_tiles = 1024usize;
         let max_blocks = max_tiles * TILE_BLOCKS;
         let max_stream = max_tiles * 48 * 1024;
-        let gpu_dec = BcpackGpuDecoder::new(
+        let mut gpu_dec = BcpackGpuDecoder::new(
             &mut ctx,
             window_tbl,
             quads_tbl,
@@ -491,6 +496,7 @@ pub fn run_demo(
             mode: cfg.mode,
             use_gpu: init_use_gpu,
             multi_core_cpu: cfg.multi_core_cpu,
+            sfs_enabled: false,
             tiles_per_frame: init_tiles,
             cam_mode: 0,
             should_quit: false,
@@ -921,11 +927,6 @@ pub fn run_demo(
         let cmd_list: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &cmd_alloc, None).unwrap();
         cmd_list.Close().unwrap();
 
-        let mut ts_heap: Option<ID3D12QueryHeap> = None;
-        ctx.device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut ts_heap).unwrap();
-        let ts_heap = ts_heap.unwrap();
-        let ts_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-
         let ss_row_pitch = WIN_W * 4;
         let ss_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, (ss_row_pitch * WIN_H) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
@@ -946,21 +947,25 @@ pub fn run_demo(
 
         println!("================================================================");
         match cfg.mode {
-            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.2 (Dual-Chunk Wave32) on: {}", ctx.adapter_name),
-            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.2 (bcpack-rs) on: {}", ctx.adapter_name),
-            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.2 on: {}", ctx.adapter_name),
+            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.3 (Async Compute + Dual-Chunk Wave32) on: {}", ctx.adapter_name),
+            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.3 (bcpack-rs) on: {}", ctx.adapter_name),
+            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.3 on: {}", ctx.adapter_name),
         }
         println!("Controls:");
         if cfg.mode == DemoMode::Toggleable {
-            println!("  [SPACE]   Toggle GPU Compute (RTX 5080) <-> CPU (bcpack-rs)");
+            println!("  [SPACE]   Toggle GPU Async Compute (RTX 5080) <-> CPU (bcpack-rs)");
         }
         if cfg.mode != DemoMode::GpuOnly {
             println!("  [M]       Toggle CPU 1-Core <-> CPU Multi-Core");
         }
+        println!("  [F]       Toggle Sampler Feedback Streaming (SFS) distance LOD budgeting");
         println!("  [C]       Camera Mode: Chase Car / Free Drive (WASD+QE) / Heli Orbit");
         println!("  [UP/DOWN] Streamed 4K-tiles/frame (48..1024 = 1.5..32 MiB BC1/frame)");
         println!("  [ESC]     Exit");
         println!("================================================================");
+        if let Some(ref rdir) = cfg.record_dir {
+            std::fs::create_dir_all(rdir).expect("create record_dir");
+        }
 
         let mut msg = MSG::default();
         while !wstate.should_quit {
@@ -978,8 +983,36 @@ pub fn run_demo(
             let dt = last_frame_t.elapsed().as_secs_f32().min(0.1);
             last_frame_t = Instant::now();
 
-            let cur_tiles = wstate.tiles_per_frame;
-            let batch = &batches.iter().find(|(n, _)| *n == cur_tiles).unwrap().1;
+            let t_sec = if cfg.record_dir.is_some() {
+                0.4 + frame_count as f32 / 30.0
+            } else if cfg.screenshot_path.is_some() {
+                1.65f32
+            } else {
+                start_t.elapsed().as_secs_f32()
+            };
+            let hero_z = t_sec * 18.0;
+
+            let cur_tiles = if wstate.sfs_enabled {
+                // Emulated Sampler Feedback Streaming (SFS): vary active residency budget from highway landmark proximity
+                let span_phase = ((hero_z % 40.0) / 40.0 * std::f32::consts::TAU).cos() * 0.5 + 0.5;
+                let min_tiles = 48usize;
+                let target = min_tiles + (((wstate.tiles_per_frame - min_tiles) as f32) * (0.35 + 0.45 * span_phase)) as usize;
+                let snapped = (target / 2) * 2;
+                snapped.clamp(48, wstate.tiles_per_frame)
+            } else {
+                wstate.tiles_per_frame
+            };
+            let sfs_batch;
+            let batch = if let Some((_, b)) = batches.iter().find(|(n, _)| *n == cur_tiles) {
+                b
+            } else {
+                sfs_batch = pack_batch((0..cur_tiles).map(|i| {
+                    let tex_i = (i / TILE_STRIPS) % NUM_TEX;
+                    let strip = i % TILE_STRIPS;
+                    (assets[tex_i].bcpack_tiles[strip].as_slice(), TILE_BLOCKS)
+                }));
+                &sfs_batch
+            };
             let streamed_mb = (cur_tiles * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0);
 
             let mut decomp_ms = 0.0f64;
@@ -1013,16 +1046,13 @@ pub fn run_demo(
                 upload_slice(&cpu_upload_buf, &cpu_buf);
                 decomp_ms = t0.elapsed().as_secs_f64() * 1000.0;
             } else {
-                gpu_dec.upload_batch(batch);
+                // True DX12 Async Compute Queue decode + cross-queue ID3D12Fence sync with DIRECT queue
+                let compute_fence_val = gpu_dec.submit_async_compute(&mut ctx, batch);
+                ctx.direct_wait_for_compute(compute_fence_val);
             }
 
             cmd_alloc.Reset().unwrap();
             cmd_list.Reset(&cmd_alloc, None).unwrap();
-
-            if wstate.use_gpu {
-                gpu_dec.record_upload_and_dispatch(&cmd_list, batch, Some(&ts_heap), 0, 1);
-                cmd_list.ResolveQueryData(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &ts_readback, 0);
-            }
 
             // Copy all 48 decoded 4K tiles (12 textures x 4 strips) directly into the 12 DXGI_FORMAT_BC1_UNORM textures
             let mut to_copy = Vec::with_capacity(NUM_TEX + 1);
@@ -1030,7 +1060,7 @@ pub fn run_demo(
                 to_copy.push(transition_barrier(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
             }
             if wstate.use_gpu {
-                to_copy.push(transition_barrier(&gpu_dec.out_blocks_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                to_copy.push(transition_barrier(&gpu_dec.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
             }
             cmd_barriers(&cmd_list, to_copy);
 
@@ -1074,7 +1104,7 @@ pub fn run_demo(
                 to_srv.push(transition_barrier(t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
             }
             if wstate.use_gpu {
-                to_srv.push(transition_barrier(&gpu_dec.out_blocks_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+                to_srv.push(transition_barrier(&gpu_dec.out_blocks_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
             }
             cmd_barriers(&cmd_list, to_srv);
 
@@ -1104,13 +1134,6 @@ pub fn run_demo(
             let sc = RECT { left: 0, top: 0, right: WIN_W as i32, bottom: WIN_H as i32 };
             cmd_list.RSSetViewports(&[vp]);
             cmd_list.RSSetScissorRects(&[sc]);
-
-            let t_sec = if cfg.screenshot_path.is_some() {
-                1.65f32
-            } else {
-                start_t.elapsed().as_secs_f32()
-            };
-            let hero_z = t_sec * 18.0;
 
             // Camera selection
             let (eye, target) = match wstate.cam_mode {
@@ -1202,7 +1225,8 @@ pub fn run_demo(
             }
 
             let take_shot = cfg.screenshot_path.is_some() && frame_count + 1 >= cfg.screenshot_frames;
-            if take_shot {
+            let save_rec_frame = cfg.record_dir.is_some() && frame_count < cfg.record_frames;
+            if take_shot || save_rec_frame {
                 let mut b_cs = [transition_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)];
                 cmd_list.ResourceBarrier(&b_cs);
                 drop_barriers(&mut b_cs);
@@ -1245,12 +1269,7 @@ pub fn run_demo(
             ctx.signal_and_wait();
 
             if wstate.use_gpu {
-                let mut ptr: *mut c_void = std::ptr::null_mut();
-                let r_ts = D3D12_RANGE { Begin: 0, End: 16 };
-                ts_readback.Map(0, Some(&r_ts), Some(&mut ptr)).unwrap();
-                let ts = std::slice::from_raw_parts(ptr as *const u64, 2);
-                decomp_ms = (ts[1].saturating_sub(ts[0]) as f64 / ctx.timestamp_freq as f64) * 1000.0;
-                ts_readback.Unmap(0, None);
+                decomp_ms = gpu_dec.read_last_kernel_ms(&ctx);
             }
 
             let _ = swap_chain.Present(0, DXGI_PRESENT(0));
@@ -1274,6 +1293,25 @@ pub fn run_demo(
                 break;
             }
 
+            if save_rec_frame {
+                let out_path = cfg.record_dir.as_ref().unwrap().join(format!("frame_{:04}.png", frame_count - 1));
+                let mut ptr: *mut c_void = std::ptr::null_mut();
+                let rng = D3D12_RANGE { Begin: 0, End: (ss_row_pitch * WIN_H) as usize };
+                ss_readback.Map(0, Some(&rng), Some(&mut ptr)).unwrap();
+                let raw = std::slice::from_raw_parts(ptr as *const u8, (ss_row_pitch * WIN_H) as usize);
+                let file = File::create(&out_path).expect("create rec frame png");
+                let mut enc = png::Encoder::new(BufWriter::new(file), WIN_W, WIN_H);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                let mut writer = enc.write_header().unwrap();
+                writer.write_image_data(raw).unwrap();
+                ss_readback.Unmap(0, None);
+                if frame_count >= cfg.record_frames {
+                    println!("[record] Saved {} frames to {}", frame_count, cfg.record_dir.as_ref().unwrap().display());
+                    break;
+                }
+            }
+
             if let Some(target_n) = cfg.measure_frames {
                 if frame_count == 1 {
                     measure_start = Some(Instant::now());
@@ -1285,7 +1323,7 @@ pub fn run_demo(
                         let avg_fps = measured as f64 / secs;
                         let avg_dec = measure_decode_sum / measured as f64;
                         let mode_tag = if wstate.use_gpu {
-                            "NEW_GPU_RTX5080_V2"
+                            "NEW_GPU_RTX5080_ASYNC_V3"
                         } else if wstate.multi_core_cpu {
                             "OLD_CPU_MULTICORE"
                         } else {
@@ -1309,20 +1347,21 @@ pub fn run_demo(
                     0.0
                 };
                 let mode_str = if wstate.use_gpu {
-                    "NEW v0.2: GPU Dual-Chunk Wave32 (RTX 5080)"
+                    "NEW v0.3: GPU AsyncCompute"
                 } else if wstate.multi_core_cpu {
-                    "OLD: CPU Multi-Core (bcpack-rs)"
+                    "OLD: CPU Multi-Core"
                 } else {
-                    "OLD: CPU 1-Core (bcpack-rs)"
+                    "OLD: CPU 1-Core"
                 };
                 let cam_str = match wstate.cam_mode {
                     0 => "Chase",
                     1 => "Free(WASD)",
                     _ => "Orbit",
                 };
+                let sfs_str = if wstate.sfs_enabled { "ON" } else { "OFF" };
                 let title = format!(
-                    "{} | {:.1} FPS | {:.1} MB/frame ({}x4K tiles) | Decode: {:.2} ms ({:.0} MB/s) | Cam:[C]={} | [UP/DN]=Load [ESC]=Quit",
-                    mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, cam_str
+                    "{} | {:.1} FPS | {:.1} MB/f ({} tiles) | Dec: {:.2}ms ({:.0} MB/s) | SFS[F]:{} | Cam[C]:{}",
+                    mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, sfs_str, cam_str
                 );
                 let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
