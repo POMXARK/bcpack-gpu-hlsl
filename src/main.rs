@@ -8,6 +8,7 @@ use bcpack_gpu::assets::{
     TILE_STRIPS,
 };
 use bcpack_gpu::demo_scene::{run_demo, DemoConfig, DemoMode};
+use bcpack_gpu::descriptor_paging::run_descriptor_paging_verify;
 use bcpack_gpu::ffi::{
     bcpack_gpu_create, bcpack_gpu_destroy, BcPackDecodeAsync, BcPackGetLastTimingMs,
     BcPackWaitFence, BCPACK_FORMAT_BC1, BCPACK_FORMAT_BC7_RANS, BCPACK_SWIZZLE_GFX10_4KB_S,
@@ -23,7 +24,7 @@ use bcpack_gpu::meshlets::{
 };
 use bcpack_gpu::raytracing::run_rt_verify;
 use bcpack_gpu::rtgi::run_rtgi_verify;
-use bcpack_gpu::world_streaming::run_world_stream_verify;
+use bcpack_gpu::world_streaming::{run_jet_flight_verify, run_world_stream_verify};
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -53,8 +54,8 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         .map(|c| c.1)
         .sum::<usize>()
         .max(assets.len() * NUM_BLOCKS)
-        .max(256 * TILE_BLOCKS);
-    let max_chunks = cases.len().max(total_tiles).max(256);
+        .max(512 * TILE_BLOCKS);
+    let max_chunks = cases.len().max(total_tiles).max(512);
     let mut gpu_dec = BcpackGpuDecoder::new(&mut ctx, &window, &quads, max_chunks, max_blocks, 32 * 1024 * 1024);
 
     let mut synth_streams = Vec::new();
@@ -85,7 +86,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         offset += byte_len;
     }
     println!(
-        "[verify] PASS 1/13 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 1/15 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
         cases.len(),
         cases.iter().map(|c| c.1).sum::<usize>(),
         gpu_ms
@@ -105,7 +106,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 2/13 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 2/15 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         assets.len(),
         tex_gpu_ms
     );
@@ -130,7 +131,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 3/13 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 3/15 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         total_tiles,
         tile_gpu_ms
     );
@@ -174,7 +175,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         row_off += *rows;
     }
     println!(
-        "[verify] PASS 4/13 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
+        "[verify] PASS 4/15 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
         bc7_cases.len(),
         total_sym_rows,
         bc7_gpu_ms
@@ -197,7 +198,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         let (detiled, det_ms) = detile.detile_and_readback(&mut ctx, &gpu_swizzled_out, w_blk as u32, h_blk as u32, tile_mode, 8);
         assert_eq!(detiled.as_slice(), linear_bc1.as_slice(), "FAIL Gfx10 detile mismatch on {name}");
         println!(
-            "[verify] PASS 5/13 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
+            "[verify] PASS 5/15 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
         );
     }
 
@@ -217,7 +218,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         m_off += byte_len;
     }
     println!(
-        "[verify] PASS 6/13 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 6/15 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
         mip_chain.len(),
         mip_ms
     );
@@ -288,27 +289,27 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         assert_eq!(BcPackGetLastTimingMs(ffi_ctx, &mut kms), 0);
         bcpack_gpu_destroy(ffi_ctx);
         println!(
-            "[verify] PASS 7/13 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
+            "[verify] PASS 7/15 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
         );
     }
 
     // 8) DXR 1.1 Hardware BVH + Inline RayQuery verification on RT Cores
     let rt_ms = run_rt_verify(&mut ctx);
     println!(
-        "[verify] PASS 8/13 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
+        "[verify] PASS 8/15 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
     );
 
     // 9) World Grid 32x32 Streaming + LRU VRAM Residency Manager verification
     let ws = run_world_stream_verify(&mut ctx, &mut gpu_dec, &assets);
     println!(
-        "[verify] PASS 9/13 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 9/15 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
         ws.frames, ws.verified_tiles, ws.total_evictions, ws.turn_burst_tiles, ws.peak_mbs, ws.gpu_ms
     );
 
     // 10) DX12 Ultimate Mesh Shaders (as_6_5 / ms_6_5) + GPU Frustum Culling + 4M+ Tris City verification
     let ms = run_mesh_shader_verify(&mut ctx);
     println!(
-        "[verify] PASS 10/13 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
+        "[verify] PASS 10/15 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
         ms.total_tris as f64 / 1e6,
         ms.total_work_items,
         ms.visible_meshlets,
@@ -320,14 +321,14 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 11) DXR 1.1 Scale (1,536-Instance TLAS) + 2-Pass A-Trous Bilateral RTGI Denoiser verification
     let gi = run_rtgi_verify(&mut ctx);
     println!(
-        "[verify] PASS 11/13 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
+        "[verify] PASS 11/15 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
         gi.tlas_instances, gi.tlas_ms, gi.raw_var, gi.denoised_var, gi.edge_jump
     );
 
     // 12) BCPack 8B Quantized Meshlet Geometry Vertex Compression -> GPU Async Decode verification
     let gb = run_geom_bcpack_verify(&mut ctx, &mut gpu_dec, &window, &quads);
     println!(
-        "[verify] PASS 12/13 BCPack 8B Meshlet Geometry ({} verts = {} KiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 12/15 BCPack 8B Meshlet Geometry ({} verts = {} KiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
         gb.vertices, gb.raw_bytes / 1024, gb.ratio, gb.gpu_ms
     );
 
@@ -335,7 +336,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     let aaa = run_aaa_2k_bcpack_verify(&mut ctx, &mut gpu_dec, assets_dir, &window, &quads);
     let ratio = aaa.raw_bytes as f64 / aaa.comp_bytes.max(1) as f64;
     println!(
-        "[verify] PASS 13/13 AAA glTF+2K PBR BCPack (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 13/15 AAA glTF+2K PBR BCPack (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
         aaa.real_assets,
         aaa.verts,
         aaa.tris,
@@ -347,7 +348,72 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         ratio,
         aaa.gpu_ms
     );
+
+    // 14) RAGE-Scale Virtual Descriptor Paging (1.25M Virtual -> 262,144 Physical ResourceDescriptorHeap[] SM 6.6)
+    let dp = run_descriptor_paging_verify(&mut ctx);
+    println!(
+        "[verify] PASS 14/15 Virtual Descriptor Paging ({:.2}M virt -> {} phys slots, {} ops, {} evictions, copy={:.2} ms, GPU={:.3} ms, {} samples, 0 mismatches)",
+        dp.virtual_count as f64 / 1e6,
+        dp.physical_slots,
+        dp.accesses,
+        dp.evictions,
+        dp.copy_ms,
+        dp.gpu_ms,
+        dp.verified_samples
+    );
+
+    // 15) 64x64 World Grid Supersonic Jet-Flight Streaming (4,096 sectors = 256 km^2, 512-tile 16 MiB bursts)
+    let jf = run_jet_flight_verify(&mut ctx, &mut gpu_dec, &assets);
+    println!(
+        "[verify] PASS 15/15 Jet-Flight 64x64 World Grid ({}x{} = {} sectors / {:.0} km^2, {}f, {}t streamed, {} evictions, max_burst={}t, peak={:.0} MB/s, GPU={}t={:.3} ms, 0 mismatches)",
+        jf.grid_dim,
+        jf.grid_dim,
+        jf.total_sectors,
+        jf.area_km2,
+        jf.frames,
+        jf.total_streamed_tiles,
+        jf.total_evictions,
+        jf.max_turn_burst_tiles,
+        jf.peak_mbs,
+        jf.verified_tiles,
+        jf.gpu_ms
+    );
+
     let _ = (BCPACK_SWIZZLE_GFX10_4KB_S,);
+}
+
+fn run_jet_flight_suite(assets_dir: &PathBuf) {
+    let window = Window::default_table();
+    let quads = QuadTable::default_table();
+    let assets = load_or_generate_assets(assets_dir, &window, &quads, false);
+    let mut ctx = GpuContext::new(false);
+    let mut gpu_dec = BcpackGpuDecoder::new(&mut ctx, &window, &quads, 512, 512 * TILE_BLOCKS, 32 * 1024 * 1024);
+
+    let dp = run_descriptor_paging_verify(&mut ctx);
+    println!(
+        "[jet-flight] Virtual Descriptor Paging: {:.2}M virt -> {} phys slots (ResourceDescriptorHeap[] SM 6.6), {} ops, {} evictions, CopyDescriptors={:.2} ms, GPU={:.3} ms, {} verified samples",
+        dp.virtual_count as f64 / 1e6,
+        dp.physical_slots,
+        dp.accesses,
+        dp.evictions,
+        dp.copy_ms,
+        dp.gpu_ms,
+        dp.verified_samples
+    );
+    let jf = run_jet_flight_verify(&mut ctx, &mut gpu_dec, &assets);
+    println!(
+        "[jet-flight] 64x64 Streaming: {} sectors ({:.0} km^2), {} frames Mach 1/2 sweep, {} tiles streamed ({:.1} MiB), {} LRU evictions, max_burst={}t ({:.1} MiB), peak={:.1} MB/s, GPU 512-tile decode={:.3} ms",
+        jf.total_sectors,
+        jf.area_km2,
+        jf.frames,
+        jf.total_streamed_tiles,
+        (jf.total_streamed_tiles * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0),
+        jf.total_evictions,
+        jf.max_turn_burst_tiles,
+        (jf.max_turn_burst_tiles * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0),
+        jf.peak_mbs,
+        jf.gpu_ms
+    );
 }
 
 fn bench_suite(
@@ -657,6 +723,7 @@ fn main() {
     let do_verify = args.iter().any(|a| a == "--verify");
     let do_bench = args.iter().any(|a| a == "--bench");
     let do_demo = args.iter().any(|a| a == "--demo");
+    let do_jet_flight = args.iter().any(|a| a == "--jet-flight");
     let regen_assets = args.iter().any(|a| a == "--regen-assets");
     let enable_debug = args.iter().any(|a| a == "--debug");
     let start_rt_enabled = !args.iter().any(|a| a == "--no-rt");
@@ -705,13 +772,16 @@ fn main() {
         }
     }
 
-    if !do_verify && !do_bench && !do_demo {
-        println!("Usage: bcpack-gpu-demo [--verify] [--bench] [--demo] [--chunks N] [--world-stream] [--vram-cap-mb N] [--measure-frames N] [--assets-dir <dir>] [--screenshot <out.png> --frames <N>] [--record-dir <dir> --record-frames <N>] [--regen-assets]");
+    if !do_verify && !do_bench && !do_demo && !do_jet_flight {
+        println!("Usage: bcpack-gpu-demo [--verify] [--bench] [--jet-flight] [--demo] [--chunks N] [--world-stream] [--vram-cap-mb N] [--measure-frames N] [--assets-dir <dir>] [--screenshot <out.png> --frames <N>] [--record-dir <dir> --record-frames <N>] [--regen-assets]");
         return;
     }
 
     if do_verify {
         run_verify(&assets_dir, regen_assets);
+    }
+    if do_jet_flight {
+        run_jet_flight_suite(&assets_dir);
     }
     if do_bench {
         run_bench(&assets_dir);

@@ -1,6 +1,7 @@
 pub mod aaa_scene;
 pub mod assets;
 pub mod demo_scene;
+pub mod descriptor_paging;
 pub mod ffi;
 pub mod gltf_loader;
 pub mod gpu_decoder;

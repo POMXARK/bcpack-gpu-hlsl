@@ -3,6 +3,7 @@ use crate::gpu_decoder::{pack_batch, BcpackGpuDecoder, GpuContext};
 use std::collections::{HashMap, VecDeque};
 
 pub const GRID_DIM: i32 = 32;
+pub const JET_GRID_DIM: i32 = 64;
 pub const SECTOR_SIZE_M: f32 = 250.0;
 pub const LOD0_RADIUS_M: f32 = 250.0;
 pub const LOD1_RADIUS_M: f32 = 800.0;
@@ -157,6 +158,7 @@ pub struct WorldStreamStep {
 }
 
 pub struct WorldStreamManager {
+    grid_dim: i32,
     cap_bytes: usize,
     resident_bytes: usize,
     residents: HashMap<(i32, i32), ResidentSector>,
@@ -178,8 +180,8 @@ fn sector_hash(gx: i32, gz: i32, tile_i: usize) -> u32 {
 }
 
 #[inline]
-fn toroidal_dist_sq(key: (i32, i32), world_pos: [f32; 3]) -> f32 {
-    let world_span = GRID_DIM as f32 * SECTOR_SIZE_M;
+fn toroidal_dist_sq(key: (i32, i32), world_pos: [f32; 3], grid_dim: i32) -> f32 {
+    let world_span = grid_dim as f32 * SECTOR_SIZE_M;
     let sx = key.0 as f32 * SECTOR_SIZE_M + SECTOR_SIZE_M * 0.5;
     let sz = key.1 as f32 * SECTOR_SIZE_M + SECTOR_SIZE_M * 0.5;
     let wx = world_pos[0].rem_euclid(world_span);
@@ -204,8 +206,13 @@ struct Candidate {
 
 impl WorldStreamManager {
     pub fn new(cap_bytes: usize) -> Self {
+        Self::with_grid_dim(cap_bytes, GRID_DIM)
+    }
+
+    pub fn with_grid_dim(cap_bytes: usize, grid_dim: i32) -> Self {
         let cap_bytes = cap_bytes.max(PAGE_BYTES * 32);
         Self {
+            grid_dim: grid_dim.max(8),
             cap_bytes,
             resident_bytes: 0,
             residents: HashMap::with_capacity(512),
@@ -230,7 +237,7 @@ impl WorldStreamManager {
         let mut best_stale: Option<(u64, f32, (i32, i32))> = None;
         for (&k, v) in &self.residents {
             if v.last_used_frame < frame_idx {
-                let dsq = toroidal_dist_sq(k, world_pos);
+                let dsq = toroidal_dist_sq(k, world_pos, self.grid_dim);
                 let replace = match best_stale {
                     None => true,
                     Some((bf, bdsq, _)) => {
@@ -249,7 +256,7 @@ impl WorldStreamManager {
             let req_dsq = req_dist * req_dist;
             let mut best_same: Option<(u8, f32, (i32, i32))> = None;
             for (&k, v) in &self.residents {
-                let dsq = toroidal_dist_sq(k, world_pos);
+                let dsq = toroidal_dist_sq(k, world_pos, self.grid_dim);
                 let lower_pri = v.lod < req_lod || (v.lod == req_lod && dsq > req_dsq + 1.0);
                 if lower_pri {
                     let r = v.lod.priority_rank();
@@ -322,7 +329,7 @@ impl WorldStreamManager {
                     1.0
                 };
                 let in_frustum = dot > 0.25 || dist < SECTOR_SIZE_M * 0.9;
-                let key = (sx.rem_euclid(GRID_DIM), sz.rem_euclid(GRID_DIM));
+                let key = (sx.rem_euclid(self.grid_dim), sz.rem_euclid(self.grid_dim));
                 candidates.push(Candidate {
                     key,
                     target_lod,
@@ -579,6 +586,100 @@ pub fn run_world_stream_verify(
         total_streamed_tiles,
         total_evictions: mgr.total_evictions,
         turn_burst_tiles,
+        peak_mbs: mgr.peak_mbs,
+        verified_tiles: collected_tiles.len(),
+        gpu_ms,
+    }
+}
+
+pub struct JetFlightVerifyStats {
+    pub grid_dim: i32,
+    pub total_sectors: usize,
+    pub area_km2: f64,
+    pub frames: usize,
+    pub total_streamed_tiles: usize,
+    pub total_evictions: u64,
+    pub max_turn_burst_tiles: usize,
+    pub peak_mbs: f64,
+    pub verified_tiles: usize,
+    pub gpu_ms: f64,
+}
+
+pub fn run_jet_flight_verify(
+    ctx: &mut GpuContext,
+    gpu_dec: &mut BcpackGpuDecoder,
+    assets: &[TextureAsset],
+) -> JetFlightVerifyStats {
+    let cap_bytes = 64 * 1024 * 1024; // 64 MiB VRAM residency cap across 64x64 grid (256 km^2)
+    let mut mgr = WorldStreamManager::with_grid_dim(cap_bytes, JET_GRID_DIM);
+
+    let mut pos = [1250.0f32, 85.0, 1250.0];
+    let mut fwd = [0.0f32, 0.0, 1.0];
+    let mut total_streamed_tiles = 0usize;
+    let mut max_turn_burst_tiles = 0usize;
+    let mut collected_tiles: Vec<(usize, usize)> = Vec::new();
+
+    for frame in 1u64..=360 {
+        if frame <= 180 {
+            // Mach 1 cruise (~340 m/s = 5.67 m/frame @ 60 FPS -> scaled burst 24 m/frame to cross 34+ sectors)
+            pos[2] += 24.0;
+            fwd = [0.0, 0.0, 1.0];
+        } else if frame == 181 {
+            // High-G Mach 2 180-deg supersonic reversal
+            fwd = [0.7071, 0.0, -0.7071];
+            pos[0] += 420.0;
+            pos[2] -= 180.0;
+        } else {
+            pos[0] += 26.0;
+            pos[2] -= 26.0;
+        }
+
+        let step = mgr.update(pos, fwd, frame, 1.0 / 60.0, 512);
+        assert!(
+            step.resident_bytes <= step.cap_bytes,
+            "Jet-flight VRAM overflow at frame {frame}: {} > {}",
+            step.resident_bytes,
+            step.cap_bytes
+        );
+
+        total_streamed_tiles += step.tiles_to_decode.len();
+        max_turn_burst_tiles = max_turn_burst_tiles.max(step.tiles_to_decode.len());
+        for &pair in &step.tiles_to_decode {
+            if collected_tiles.len() < 512 {
+                collected_tiles.push(pair);
+            }
+        }
+    }
+
+    assert!(mgr.total_evictions > 0, "Expected 64x64 jet-flight LRU evictions > 0");
+    assert!(total_streamed_tiles >= 512, "Expected >= 512 streamed tiles");
+    assert_eq!(collected_tiles.len(), 512, "Expected full 512-tile burst for GPU verification");
+
+    let batch = pack_batch(
+        collected_tiles
+            .iter()
+            .map(|&(ti, st)| (assets[ti].bcpack_tiles[st].as_slice(), TILE_BLOCKS)),
+    );
+    let (gpu_out, statuses, gpu_ms, _) = gpu_dec.decode_batch_and_readback(ctx, &batch);
+    for (idx, &(ti, st)) in collected_tiles.iter().enumerate() {
+        assert_eq!(statuses[idx].code, 0, "GPU status error on jet-flight tile {idx}");
+        let got = &gpu_out[idx * TILE_BC1_BYTES..(idx + 1) * TILE_BC1_BYTES];
+        let exp = &assets[ti].expected_bc1[st * TILE_BC1_BYTES..(st + 1) * TILE_BC1_BYTES];
+        if got != exp {
+            let mm = got.iter().zip(exp.iter()).position(|(a, b)| a != b).unwrap();
+            panic!("FAIL jet-flight tile {idx} (tex={ti}, strip={st}): mismatch at byte {mm}");
+        }
+    }
+
+    let side_km = (JET_GRID_DIM as f64 * SECTOR_SIZE_M as f64) / 1000.0;
+    JetFlightVerifyStats {
+        grid_dim: JET_GRID_DIM,
+        total_sectors: (JET_GRID_DIM * JET_GRID_DIM) as usize,
+        area_km2: side_km * side_km,
+        frames: 360,
+        total_streamed_tiles,
+        total_evictions: mgr.total_evictions,
+        max_turn_burst_tiles,
         peak_mbs: mgr.peak_mbs,
         verified_tiles: collected_tiles.len(),
         gpu_ms,
