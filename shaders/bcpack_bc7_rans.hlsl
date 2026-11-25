@@ -1,10 +1,10 @@
 // Clean-room Xbox Series BCPack (BC7 16-lane rANS) Compute Shader decoder (HLSL SM 6.6)
-// v0.3.0 Dual-Chunk Wave32 Kernel (100% warp utilization: 32/32 active threads):
-// - Threads 0..15 decode Chunk A (16 lanes); Threads 16..31 decode Chunk B (16 lanes)
-// - Coalesced 64-byte groupshared stream window cache per chunk
-// - Transposed per-lane groupshared model cache loaded once per fragment (HDR1)
-// - WaveActiveBallot + countbits branch-free 8-byte/clock feeder per half-warp
-// - Coalesced parallel 16 x uint16 symbol emission per block-cycle (8 uints written by lanes 0..7)
+// v0.4.0 Zero-Barrier Wave32 Kernel (100% warp utilization = 32/32 active threads):
+// - 0 GroupMemoryBarrierWithGroupSync() calls in the entire shader
+// - Register-resident 64B stream window + WaveReadLaneAt byte reads
+// - WaveReadLaneAt packed 16 x uint16 parallel symbol emission
+// - 4-step branchless binary search + fused decode_and_advance
+// - Reduced per-cycle wave votes
 
 struct ModelData {
     uint bf[10];     // low16 = base, high16 = freq
@@ -40,27 +40,30 @@ static const uint BC7_ALPHABET_BITS[16] = {
     6u, 4u, 5u, 7u, 7u, 7u, 7u, 4u
 };
 
-groupshared uint stream_cache[2][16];
 groupshared uint lane_bf[10][32];
 groupshared uint lane_rfrsn[10][32];
-groupshared uint emit_syms[2][16];
 
-uint load_cached_byte(uint sub, uint abs_addr, uint buf_base) {
-    uint rel = abs_addr - buf_base;
-    uint word = stream_cache[sub][rel >> 2u];
-    return (word >> ((rel & 3u) * 8u)) & 0xFFu;
-}
+// 4-step binary search over [0, nseg) + fused rANS state advance (returns uint2(sym, next_p0))
+uint2 decode_and_advance(uint lm, uint nseg, uint x) {
+    uint cf = x & 0xFFFFu;
+    uint lo = 0u;
+    uint hi = nseg;
 
-uint inverse_fast(uint lm, uint nseg, uint cf) {
-    uint seg = 0u;
-    [unroll]
-    for (uint k = 1u; k < 10u; ++k) {
-        uint b = lane_bf[k][lm] & 0xFFFFu;
-        if (k < nseg && cf >= b) {
-            seg = k;
-        }
-    }
-    uint base_s = lane_bf[seg][lm] & 0xFFFFu;
+    uint mid = (lo + hi) >> 1u;
+    if (cf >= (lane_bf[mid][lm] & 0xFFFFu)) lo = mid; else hi = mid;
+
+    mid = (lo + hi) >> 1u;
+    if (mid > lo && cf >= (lane_bf[mid][lm] & 0xFFFFu)) lo = mid; else hi = mid;
+
+    mid = (lo + hi) >> 1u;
+    if (mid > lo && cf >= (lane_bf[mid][lm] & 0xFFFFu)) lo = mid; else hi = mid;
+
+    mid = (lo + hi) >> 1u;
+    if (mid > lo && cf >= (lane_bf[mid][lm] & 0xFFFFu)) lo = mid;
+
+    uint seg = lo;
+    uint bf_s = lane_bf[seg][lm];
+    uint base_s = bf_s & 0xFFFFu;
     uint r_s = lane_rfrsn[seg][lm];
     uint rf_s = r_s & 0xFFFFu;
     uint rs_s = (r_s >> 16u) & 31u;
@@ -69,19 +72,18 @@ uint inverse_fast(uint lm, uint nseg, uint cf) {
     uint base_x = (1u << seg) >> 1u;
     uint dist = (cf - base_s + rn_s) & 0xFFFFu;
     uint steps = (((dist * rf_s) >> 15u) >> rs_s) & 0x1FFu;
-    return (base_x + steps) & 0x1FFu;
-}
+    uint sym = (base_x + steps) & 0x1FFu;
 
-uint advance_state(uint lm, uint x, uint sym) {
-    uint seg = (sym == 0u) ? 0u : (firstbithigh(sym) + 1u);
-    uint st = (seg == 0u) ? 0u : (1u << (seg - 1u));
-    uint bf_s = lane_bf[seg][lm];
-    uint base_s = bf_s & 0xFFFFu;
-    uint fa = bf_s >> 16u;
-    uint cfa = (base_s + fa * (sym - st)) & 0xFFFFu;
+    uint seg2 = (sym == 0u) ? 0u : (firstbithigh(sym) + 1u);
+    uint bf_a = (seg2 == seg) ? bf_s : lane_bf[seg2][lm];
+    uint st2 = (seg2 == 0u) ? 0u : (1u << (seg2 - 1u));
+    uint base_a = bf_a & 0xFFFFu;
+    uint fa = bf_a >> 16u;
+    uint cfa = (base_a + fa * (sym - st2)) & 0xFFFFu;
     uint f = (cfa == 0u) ? ((fa - 1u) & 0xFFFFu) : fa;
     uint c = (cfa == 0u) ? 1u : cfa;
-    return f * (x >> 16u) + (x & 0xFFFFu) - c;
+    uint next_p0 = f * (x >> 16u) + (x & 0xFFFFu) - c;
+    return uint2(sym, next_p0);
 }
 
 bool is_legal_end_state(uint s) {
@@ -109,6 +111,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
     uint ib = 0u;
     bool ib_full = false;
     uint sym = 0u;
+    uint next_p0 = 0u;
     bool sym_full = false;
     uint slot_sym = 0u;
     uint in_rem = 0u;
@@ -129,6 +132,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
     uint slots = 0u;
     uint stream_pos = 0u;
     uint buf_base = 0xFFFFFFFFu;
+    uint cache_word = 0u;
     uint sym_idx = 0u;
     uint cycle = 0u;
     uint max_cycles = WaveActiveMax(half_active ? (64u * (16u * desc.blocks + desc.stream_len) + 1000u) : 1u);
@@ -137,15 +141,11 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
     while (cycle < max_cycles) {
         bool active_tick = !half_done_latch;
 
-        // Coalesced 64-byte stream cache refill per active half-warp
+        // Register-resident 64-byte stream cache refill (0 barriers!)
         uint cur_abs = desc.stream_offset + stream_pos;
-        bool need_refill = active_tick && (buf_base == 0xFFFFFFFFu || (cur_abs + 8u) > (buf_base + 64u));
-        if (WaveActiveAnyTrue(need_refill)) {
-            if (need_refill) {
-                buf_base = cur_abs & ~3u;
-                stream_cache[sub][ll] = g_Streams.Load(buf_base + ll * 4u);
-            }
-            GroupMemoryBarrierWithGroupSync();
+        if (active_tick && (buf_base == 0xFFFFFFFFu || (cur_abs + 8u) > (buf_base + 64u))) {
+            buf_base = cur_abs & ~3u;
+            cache_word = g_Streams.Load(buf_base + ll * 4u);
         }
 
         // ---------------- Phase 0: forward update, feed (max 8 bytes/clock per half), hand-off ----------------
@@ -167,12 +167,15 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
         uint valid_half = (WaveActiveBallot(valid).x >> half_shift) & 0xFFFFu;
         stream_pos += countbits(valid_half);
 
-        uint fetched = valid ? load_cached_byte(sub, desc.stream_offset + byte_idx, buf_base) : 0u;
+        uint safe_rel = valid ? (desc.stream_offset + byte_idx - buf_base) : 0u;
+        uint word = WaveReadLaneAt(cache_word, half_shift + ((safe_rel >> 2u) & 15u));
+        uint fetched = valid ? ((word >> ((safe_rel & 3u) * 8u)) & 0xFFu) : 0u;
+
         bool stall = active_tick && lane_running && ((need_byte && !valid) || blocked_out);
 
         if (active_tick && lane_running && !stall) {
             if (state == PROC || state == DRAIN) {
-                p0 = sym_full ? advance_state(lm, p1, sym) : p1;
+                p0 = sym_full ? next_p0 : p1;
             }
             if (valid) {
                 ib = fetched;
@@ -187,7 +190,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
         }
         slots |= (WaveActiveBallot(handoff).x >> half_shift) & 0xFFFFu;
 
-        // ---------------- Phase 1: header FSM, renorm, decode ----------------
+        // ---------------- Phase 1: header FSM, renorm, fused decode+advance ----------------
         if (active_tick && lane_running && !stall) {
             if (state == IDLE) {
                 if (go) {
@@ -215,9 +218,9 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
             } else if (state == HDR1) {
                 if (ib_full) {
                     ib_full = false;
-                    uint mid = eab * 16u + q;
+                    uint mid_id = eab * 16u + q;
                     nseg = eab + 2u;
-                    ModelData m = g_Models[mid];
+                    ModelData m = g_Models[mid_id];
                     [unroll]
                     for (uint k = 0u; k < 10u; ++k) {
                         lane_bf[k][lm] = m.bf[k];
@@ -243,7 +246,9 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
                 bool nsf = (x > RANS_L) && (out_rem > 0u);
                 if (nsf) {
                     out_rem -= 1u;
-                    sym = inverse_fast(lm, nseg, x & 0xFFFFu);
+                    uint2 da = decode_and_advance(lm, nseg, x);
+                    sym = da.x;
+                    next_p0 = da.y;
                 }
                 p1 = x;
                 sym_full = nsf;
@@ -264,7 +269,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
                     } else {
                         done = true;
                         state = IDLE;
-                        final_state = nsf ? advance_state(lm, x, sym) : x;
+                        final_state = nsf ? next_p0 : x;
                     }
                 }
             } else { // DRAIN
@@ -272,7 +277,9 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
                 bool nsf = (x > RANS_L) && (out_rem > 0u);
                 if (nsf) {
                     out_rem -= 1u;
-                    sym = inverse_fast(lm, nseg, x & 0xFFFFu);
+                    uint2 da = decode_and_advance(lm, nseg, x);
+                    sym = da.x;
+                    next_p0 = da.y;
                 }
                 p1 = x;
                 sym_full = nsf;
@@ -286,7 +293,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
                     } else {
                         state = IDLE;
                         done = true;
-                        final_state = nsf ? advance_state(lm, x, sym) : x;
+                        final_state = nsf ? next_p0 : x;
                     }
                 }
             }
@@ -296,16 +303,12 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
         uint active_mask = (ballot_active >> half_shift) & 0xFFFFu;
         bool half_emit = active_tick && (slots != 0u) && ((slots & active_mask) == active_mask);
 
-        // ---------------- Lockstep 16-lane symbol emission ----------------
+        // ---------------- Lockstep 16-lane symbol emission via WaveReadLaneAt (0 barriers!) ----------------
         if (WaveActiveAnyTrue(half_emit)) {
-            if (half_emit && lane_running) {
-                emit_syms[sub][ll] = slot_sym;
-            }
-            GroupMemoryBarrierWithGroupSync();
+            uint s_lo = WaveReadLaneAt(slot_sym, half_shift + ((ll & 7u) * 2u)) & 0xFFFFu;
+            uint s_hi = WaveReadLaneAt(slot_sym, half_shift + ((ll & 7u) * 2u + 1u)) & 0xFFFFu;
 
             if (half_emit && ll < 8u && sym_idx < desc.blocks) {
-                uint s_lo = emit_syms[sub][ll * 2u] & 0xFFFFu;
-                uint s_hi = emit_syms[sub][ll * 2u + 1u] & 0xFFFFu;
                 g_OutSyms[(desc.out_block_offset + sym_idx) * 8u + ll] = s_lo | (s_hi << 16u);
             }
 
@@ -317,28 +320,31 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
 
         cycle += 1u;
 
-        // Per-half completion check
+        // Per-half completion check (deferred error ballots)
         uint ballot_rem = WaveActiveBallot(active_tick && lane_running && !(done && !sym_full)).x;
         uint rem_half = (ballot_rem >> half_shift) & 0xFFFFu;
-        uint ballot_bad_end = WaveActiveBallot(active_tick && lane_running && !is_legal_end_state(final_state)).x;
-        uint ballot_bad_hdr = WaveActiveBallot(active_tick && bad_hdr).x;
+        bool just_done = active_tick && (rem_half == 0u);
 
-        if (active_tick && rem_half == 0u) {
-            uint err = (((ballot_bad_hdr >> half_shift) & 0xFFFFu) != 0u)
-                ? 1u
-                : ((((ballot_bad_end >> half_shift) & 0xFFFFu) != 0u) ? 2u : 0u);
-            if (ll == 0u) {
-                g_Status[chunk_id] = uint4(err, stream_pos, cycle, sym_idx);
+        if (WaveActiveAnyTrue(just_done)) {
+            uint ballot_bad_end = WaveActiveBallot(active_tick && lane_running && !is_legal_end_state(final_state)).x;
+            uint ballot_bad_hdr = WaveActiveBallot(active_tick && bad_hdr).x;
+            if (just_done) {
+                uint err = (((ballot_bad_hdr >> half_shift) & 0xFFFFu) != 0u)
+                    ? 1u
+                    : ((((ballot_bad_end >> half_shift) & 0xFFFFu) != 0u) ? 2u : 0u);
+                if (ll == 0u) {
+                    g_Status[chunk_id] = uint4(err, stream_pos, cycle, sym_idx);
+                }
+                half_done_latch = true;
             }
-            half_done_latch = true;
-        }
-
-        if (WaveActiveAllTrue(half_done_latch)) {
-            break;
+            if (WaveActiveAllTrue(half_done_latch)) {
+                break;
+            }
         }
 
         // Amortized bad-header & deadlock guard every 64 cycles
         if ((cycle & 63u) == 0u) {
+            uint ballot_bad_hdr = WaveActiveBallot(active_tick && bad_hdr).x;
             uint st_val = (active_tick && lane_running) ? state : 0u;
             uint st_sum0 = WaveActiveSum((sub == 0u) ? st_val : 0u);
             uint st_sum1 = WaveActiveSum((sub == 1u) ? st_val : 0u);

@@ -504,7 +504,7 @@ pub fn run_demo(
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *wstate as *mut WindowState) as isize);
         let _ = ShowWindow(hwnd, SW_SHOW);
 
-        // SwapChain
+        // SwapChain (3 backbuffers for non-blocking Ping-Pong overlap)
         let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: WIN_W,
             Height: WIN_H,
@@ -512,7 +512,7 @@ pub fn run_demo(
             Stereo: false.into(),
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
+            BufferCount: 3,
             Scaling: DXGI_SCALING_STRETCH,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
@@ -528,7 +528,7 @@ pub fn run_demo(
             .device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: 2,
+                NumDescriptors: 3,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                 NodeMask: 0,
             })
@@ -555,9 +555,9 @@ pub fn run_demo(
         let rtv_inc = ctx.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         let srv_inc = ctx.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-        let mut backbuffers = Vec::with_capacity(2);
+        let mut backbuffers = Vec::with_capacity(3);
         let rtv_base = rtv_heap.GetCPUDescriptorHandleForHeapStart();
-        for i in 0..2u32 {
+        for i in 0..3u32 {
             let bb: ID3D12Resource = swap_chain.GetBuffer(i).unwrap();
             let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: rtv_base.ptr + (i * rtv_inc) as usize,
@@ -657,11 +657,11 @@ pub fn run_demo(
             D3D12_RESOURCE_STATE_GENERIC_READ,
         );
 
-        // Per-draw constant buffer ring (MAX_DRAWS x 512 bytes)
+        // Double-buffered per-draw constant buffer ring (2 x MAX_DRAWS x 512 bytes)
         let cb_upload = create_committed_buffer(
             &ctx.device,
             D3D12_HEAP_TYPE_UPLOAD,
-            (MAX_DRAWS * CB_STRIDE) as u64,
+            (2 * MAX_DRAWS * CB_STRIDE) as u64,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_GENERIC_READ,
         );
@@ -923,9 +923,20 @@ pub fn run_demo(
             Format: DXGI_FORMAT_R16_UINT,
         };
 
-        let cmd_alloc: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-        let cmd_list: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &cmd_alloc, None).unwrap();
-        cmd_list.Close().unwrap();
+        let frame_allocs: [ID3D12CommandAllocator; 2] = [
+            ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(),
+            ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(),
+        ];
+        let frame_cmds: [ID3D12GraphicsCommandList; 2] = [
+            ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &frame_allocs[0], None).unwrap(),
+            ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &frame_allocs[1], None).unwrap(),
+        ];
+        frame_cmds[0].Close().unwrap();
+        frame_cmds[1].Close().unwrap();
+
+        let mut frame_fences = [0u64; 2];
+        let mut pending_compute_fences: [Option<u64>; 2] = [None, None];
+        let mut last_gpu_decode_ms = 0.0f64;
 
         let ss_row_pitch = WIN_W * 4;
         let ss_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, (ss_row_pitch * WIN_H) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -947,9 +958,9 @@ pub fn run_demo(
 
         println!("================================================================");
         match cfg.mode {
-            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.3 (Async Compute + Dual-Chunk Wave32) on: {}", ctx.adapter_name),
-            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.3 (bcpack-rs) on: {}", ctx.adapter_name),
-            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.3 on: {}", ctx.adapter_name),
+            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.4 (Zero-Barrier + Ping-Pong Async Compute) on: {}", ctx.adapter_name),
+            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.4 (bcpack-rs) on: {}", ctx.adapter_name),
+            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.4 on: {}", ctx.adapter_name),
         }
         println!("Controls:");
         if cfg.mode == DemoMode::Toggleable {
@@ -1015,8 +1026,20 @@ pub fn run_demo(
             };
             let streamed_mb = (cur_tiles * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0);
 
+            let cur_slot = (frame_count as usize) & 1;
+            let next_slot = 1 - cur_slot;
+
+            // Wait only for 2-frames-old Direct work on cur_slot (0 CPU wait in steady state!)
+            ctx.wait_direct_cpu(frame_fences[cur_slot]);
+            if last_gpu_decode_ms == 0.0 || pending_compute_fences[cur_slot].is_some() {
+                if frame_count >= 2 && wstate.use_gpu {
+                    last_gpu_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, cur_slot);
+                }
+            }
+
             let mut decomp_ms = 0.0f64;
             if !wstate.use_gpu {
+                pending_compute_fences = [None, None];
                 let t0 = Instant::now();
                 let decoded_list: Vec<Vec<u8>> = if wstate.multi_core_cpu {
                     (0..cur_tiles)
@@ -1046,13 +1069,27 @@ pub fn run_demo(
                 upload_slice(&cpu_upload_buf, &cpu_buf);
                 decomp_ms = t0.elapsed().as_secs_f64() * 1000.0;
             } else {
-                // True DX12 Async Compute Queue decode + cross-queue ID3D12Fence sync with DIRECT queue
-                let compute_fence_val = gpu_dec.submit_async_compute(&mut ctx, batch);
-                ctx.direct_wait_for_compute(compute_fence_val);
+                // Overlapped Ping-Pong Async Compute:
+                // 1) Ensure cur_slot has a submitted decode job
+                let cur_cf = match pending_compute_fences[cur_slot].take() {
+                    Some(v) => v,
+                    None => gpu_dec.submit_slot_async_compute(&mut ctx, cur_slot, batch),
+                };
+                // 2) Kick next frame's decode onto next_slot asynchronously BEFORE waiting on Direct!
+                let kick_next = cfg.screenshot_path.is_none()
+                    && (cfg.record_dir.is_none() || frame_count + 1 < cfg.record_frames);
+                if kick_next && pending_compute_fences[next_slot].is_none() {
+                    let nf = gpu_dec.submit_slot_async_compute(&mut ctx, next_slot, batch);
+                    pending_compute_fences[next_slot] = Some(nf);
+                }
+                // GPU-side queue sync only (zero CPU stall!)
+                ctx.direct_wait_for_compute(cur_cf);
             }
 
+            let cmd_alloc = &frame_allocs[cur_slot];
+            let cmd_list = &frame_cmds[cur_slot];
             cmd_alloc.Reset().unwrap();
-            cmd_list.Reset(&cmd_alloc, None).unwrap();
+            cmd_list.Reset(cmd_alloc, None).unwrap();
 
             // Copy all 48 decoded 4K tiles (12 textures x 4 strips) directly into the 12 DXGI_FORMAT_BC1_UNORM textures
             let mut to_copy = Vec::with_capacity(NUM_TEX + 1);
@@ -1060,12 +1097,12 @@ pub fn run_demo(
                 to_copy.push(transition_barrier(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
             }
             if wstate.use_gpu {
-                to_copy.push(transition_barrier(&gpu_dec.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                to_copy.push(transition_barrier(gpu_dec.out_buffer(cur_slot), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
             }
-            cmd_barriers(&cmd_list, to_copy);
+            cmd_barriers(cmd_list, to_copy);
 
             let src_res = if wstate.use_gpu {
-                &gpu_dec.out_blocks_default
+                gpu_dec.out_buffer(cur_slot)
             } else {
                 &cpu_upload_buf
             };
@@ -1104,9 +1141,9 @@ pub fn run_demo(
                 to_srv.push(transition_barrier(t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
             }
             if wstate.use_gpu {
-                to_srv.push(transition_barrier(&gpu_dec.out_blocks_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
+                to_srv.push(transition_barrier(gpu_dec.out_buffer(cur_slot), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
             }
-            cmd_barriers(&cmd_list, to_srv);
+            cmd_barriers(cmd_list, to_srv);
 
             let bb_idx = swap_chain.GetCurrentBackBufferIndex();
             let bb = &backbuffers[bb_idx as usize];
@@ -1215,12 +1252,13 @@ pub fn run_demo(
                     point_lights,
                     light_colors: lcols,
                 };
+                let cb_off = cur_slot * MAX_DRAWS * CB_STRIDE + di * CB_STRIDE;
                 copy_nonoverlapping(
                     &dc as *const DrawConstants as *const u8,
-                    cb_base_ptr.add(di * CB_STRIDE),
+                    cb_base_ptr.add(cb_off),
                     size_of::<DrawConstants>(),
                 );
-                cmd_list.SetGraphicsRootConstantBufferView(0, cb_gpu_va + (di * CB_STRIDE) as u64);
+                cmd_list.SetGraphicsRootConstantBufferView(0, cb_gpu_va + cb_off as u64);
                 cmd_list.DrawIndexedInstanced(obj.mesh.index_count, 1, obj.mesh.index_offset, 0, 0);
             }
 
@@ -1266,13 +1304,23 @@ pub fn run_demo(
             cmd_list.Close().unwrap();
             let lists = [Some(cmd_list.cast::<ID3D12CommandList>().unwrap())];
             ctx.queue.ExecuteCommandLists(&lists);
-            ctx.signal_and_wait();
+            let _ = swap_chain.Present(0, DXGI_PRESENT(0));
 
-            if wstate.use_gpu {
-                decomp_ms = gpu_dec.read_last_kernel_ms(&ctx);
+            if take_shot || save_rec_frame || !wstate.use_gpu {
+                ctx.signal_and_wait();
+                if wstate.use_gpu {
+                    decomp_ms = gpu_dec.read_slot_kernel_ms(&ctx, cur_slot);
+                    last_gpu_decode_ms = decomp_ms;
+                }
+            } else {
+                frame_fences[cur_slot] = ctx.signal_direct_async();
+                decomp_ms = if last_gpu_decode_ms > 0.0 {
+                    last_gpu_decode_ms
+                } else {
+                    gpu_dec.read_slot_kernel_ms(&ctx, cur_slot)
+                };
             }
 
-            let _ = swap_chain.Present(0, DXGI_PRESENT(0));
             frame_count += 1;
             fps_accum += 1;
 
@@ -1323,7 +1371,7 @@ pub fn run_demo(
                         let avg_fps = measured as f64 / secs;
                         let avg_dec = measure_decode_sum / measured as f64;
                         let mode_tag = if wstate.use_gpu {
-                            "NEW_GPU_RTX5080_ASYNC_V3"
+                            "NEW_GPU_RTX5080_PINGPONG_V4"
                         } else if wstate.multi_core_cpu {
                             "OLD_CPU_MULTICORE"
                         } else {
@@ -1347,7 +1395,7 @@ pub fn run_demo(
                     0.0
                 };
                 let mode_str = if wstate.use_gpu {
-                    "NEW v0.3: GPU AsyncCompute"
+                    "NEW v0.4: GPU Zero-Barrier + PingPong Async"
                 } else if wstate.multi_core_cpu {
                     "OLD: CPU Multi-Core"
                 } else {
@@ -1369,5 +1417,8 @@ pub fn run_demo(
                 last_title_t = Instant::now();
             }
         }
+        // Drain both GPU queues before dropping resources
+        ctx.signal_and_wait();
+        ctx.signal_and_wait_compute();
     }
 }

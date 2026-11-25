@@ -205,83 +205,88 @@ pub unsafe extern "C" fn BcPackDecodeAsync(
             BCPACK_SWIZZLE_GFX10_4KB_S => 1u32,
             _ => return -6,
         };
-        state.bc1_dec.upload_batch(&batch);
-        state.bc1_dec.cmd_alloc.Reset().unwrap();
-        state.bc1_dec.cmd_list.Reset(&state.bc1_dec.cmd_alloc, None).unwrap();
-
-        state.bc1_dec.cmd_list.EndQuery(&state.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
-        state.bc1_dec.record_upload_and_dispatch(&state.bc1_dec.cmd_list, &batch, None, 0, 0);
-        cmd_barriers(
-            &state.bc1_dec.cmd_list,
-            vec![
-                transition_barrier(&state.bc1_dec.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            ],
-        );
-        state.detile.record_detile(
-            &state.bc1_dec.cmd_list,
-            state.bc1_dec.out_blocks_default.GetGPUVirtualAddress(),
-            state.detile_out_default.GetGPUVirtualAddress(),
-            width_blocks,
-            height_blocks,
-            tile_mode,
-            8,
-            0,
-            0,
-            num_blocks,
-        );
-        state.bc1_dec.cmd_list.EndQuery(&state.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
-
-        if !out_host_buffer.is_null() {
+        state.bc1_dec.upload_batch_slot(0, &batch);
+        {
+            let slot0 = &state.bc1_dec.slots[0];
+            slot0.cmd_alloc.Reset().unwrap();
+            slot0.cmd_list.Reset(&slot0.cmd_alloc, None).unwrap();
+            slot0.cmd_list.EndQuery(&state.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        }
+        state.bc1_dec.record_slot_upload_and_dispatch(0, &state.bc1_dec.slots[0].cmd_list, &batch, None, 0, 0);
+        {
+            let slot0 = &state.bc1_dec.slots[0];
             cmd_barriers(
-                &state.bc1_dec.cmd_list,
+                &slot0.cmd_list,
                 vec![
-                    transition_barrier(&state.bc1_dec.out_blocks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                    transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition_barrier(&slot0.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
                 ],
             );
-            state.bc1_dec.cmd_list.CopyBufferRegion(&state.detile_readback, 0, &state.detile_out_default, 0, expected_bytes as u64);
-            state.bc1_dec.cmd_list.ResolveQueryData(&state.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &state.ts_readback, 0);
-            cmd_barriers(
-                &state.bc1_dec.cmd_list,
-                vec![transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)],
+            state.detile.record_detile(
+                &slot0.cmd_list,
+                slot0.out_blocks_default.GetGPUVirtualAddress(),
+                state.detile_out_default.GetGPUVirtualAddress(),
+                width_blocks,
+                height_blocks,
+                tile_mode,
+                8,
+                0,
+                0,
+                num_blocks,
             );
-            state.bc1_dec.cmd_list.Close().unwrap();
-            let lists = [Some(state.bc1_dec.cmd_list.cast::<ID3D12CommandList>().unwrap())];
-            state.ctx.compute_queue.ExecuteCommandLists(&lists);
-            state.ctx.signal_and_wait_compute();
+            slot0.cmd_list.EndQuery(&state.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
 
-            let mut ptr: *mut c_void = std::ptr::null_mut();
-            state.detile_readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: expected_bytes }), Some(&mut ptr)).unwrap();
-            copy_nonoverlapping(ptr as *const u8, out_host_buffer, expected_bytes);
-            state.detile_readback.Unmap(0, None);
+            if !out_host_buffer.is_null() {
+                cmd_barriers(
+                    &slot0.cmd_list,
+                    vec![
+                        transition_barrier(&slot0.out_blocks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                        transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    ],
+                );
+                slot0.cmd_list.CopyBufferRegion(&state.detile_readback, 0, &state.detile_out_default, 0, expected_bytes as u64);
+                slot0.cmd_list.ResolveQueryData(&state.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &state.ts_readback, 0);
+                cmd_barriers(
+                    &slot0.cmd_list,
+                    vec![transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)],
+                );
+                slot0.cmd_list.Close().unwrap();
+                let lists = [Some(slot0.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+                state.ctx.compute_queue.ExecuteCommandLists(&lists);
+                state.ctx.signal_and_wait_compute();
 
-            state.ts_readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut ptr)).unwrap();
-            let ts = std::slice::from_raw_parts(ptr as *const u64, 2);
-            state.last_kernel_ms = (ts[1].saturating_sub(ts[0]) as f64 / state.ctx.compute_timestamp_freq as f64) * 1000.0;
-            state.ts_readback.Unmap(0, None);
+                let mut ptr: *mut c_void = std::ptr::null_mut();
+                state.detile_readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: expected_bytes }), Some(&mut ptr)).unwrap();
+                copy_nonoverlapping(ptr as *const u8, out_host_buffer, expected_bytes);
+                state.detile_readback.Unmap(0, None);
 
-            if !out_fence_value.is_null() {
-                *out_fence_value = state.ctx.compute_fence_value;
+                state.ts_readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut ptr)).unwrap();
+                let ts = std::slice::from_raw_parts(ptr as *const u64, 2);
+                state.last_kernel_ms = (ts[1].saturating_sub(ts[0]) as f64 / state.ctx.compute_timestamp_freq as f64) * 1000.0;
+                state.ts_readback.Unmap(0, None);
+
+                if !out_fence_value.is_null() {
+                    *out_fence_value = state.ctx.compute_fence_value;
+                }
+                0
+            } else {
+                slot0.cmd_list.ResolveQueryData(&state.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &state.ts_readback, 0);
+                cmd_barriers(
+                    &slot0.cmd_list,
+                    vec![
+                        transition_barrier(&slot0.out_blocks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                        transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+                    ],
+                );
+                slot0.cmd_list.Close().unwrap();
+                let lists = [Some(slot0.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+                state.ctx.compute_queue.ExecuteCommandLists(&lists);
+                let fence_val = state.ctx.signal_compute();
+                if !out_fence_value.is_null() {
+                    *out_fence_value = fence_val;
+                }
+                0
             }
-            0
-        } else {
-            state.bc1_dec.cmd_list.ResolveQueryData(&state.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &state.ts_readback, 0);
-            cmd_barriers(
-                &state.bc1_dec.cmd_list,
-                vec![
-                    transition_barrier(&state.bc1_dec.out_blocks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                    transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
-                ],
-            );
-            state.bc1_dec.cmd_list.Close().unwrap();
-            let lists = [Some(state.bc1_dec.cmd_list.cast::<ID3D12CommandList>().unwrap())];
-            state.ctx.compute_queue.ExecuteCommandLists(&lists);
-            let fence_val = state.ctx.signal_compute();
-            if !out_fence_value.is_null() {
-                *out_fence_value = fence_val;
-            }
-            0
         }
     }));
     res.unwrap_or(-99)
