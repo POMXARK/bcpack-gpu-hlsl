@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32G32B32_FLOAT};
 
 pub const RT_VERIFY_CS_DXIL: &[u8] = include_bytes!("../shaders/rt_verify.dxil");
-pub const MAX_RT_INSTANCES: usize = 256;
+pub const MAX_RT_INSTANCES: usize = 2048;
 
 #[derive(Clone, Copy)]
 pub struct RtInstanceInput {

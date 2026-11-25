@@ -8,6 +8,7 @@ fn main() {
     let mut chunks = 256usize;
     let enable_debug = args.iter().any(|a| a == "--debug");
     let start_rt_enabled = !args.iter().any(|a| a == "--no-rt");
+    let start_rtgi_enabled = start_rt_enabled && !args.iter().any(|a| a == "--no-rtgi");
     let start_world_stream = args.iter().any(|a| a == "--world-stream");
     let start_mesh_shaders = !args.iter().any(|a| a == "--no-mesh-shaders");
     let mut vram_cap_mb = 32usize;
@@ -47,6 +48,7 @@ fn main() {
             multi_core_cpu: false,
             enable_debug,
             start_rt_enabled,
+            start_rtgi_enabled,
             start_world_stream,
             start_mesh_shaders,
             vram_cap_mb,

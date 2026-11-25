@@ -1,5 +1,4 @@
-// Clean-room Coastal Highway scene shader + DXR 1.1 Hardware Inline Ray Tracing (RayQuery SM 6.6)
-// Computes hardware ray-traced sun shadows + glossy reflections on wet asphalt, ocean & sports cars.
+// Clean-room Coastal Highway scene shader + DXR 1.1 Inline Ray Tracing (Shadows, Reflections, 1-spp Diffuse RTGI)
 
 cbuffer DrawCB : register(b0) {
     float4x4 g_MVP;
@@ -8,9 +7,9 @@ cbuffer DrawCB : register(b0) {
     float    g_Emissive;
     float    g_Time;
     float    g_UvScale;
-    float4   g_CameraPos;    // xyz = camera world pos, w = rt_enabled (1.0 = ON, 0.0 = OFF)
-    float4   g_PointLights[4]; // xyz = world pos, w = intensity
-    float4   g_LightColors[4]; // rgb = color, a = specular power
+    float4   g_CameraPos;    // xyz = camera world pos, w = bitflags (1=RT, 2=RTGI)
+    float4   g_PointLights[4];
+    float4   g_LightColors[4];
 };
 
 Texture2D                       g_Textures[12] : register(t0);
@@ -29,6 +28,12 @@ struct PSIn {
     float3 worldN   : NORMAL;
     float2 uv       : TEXCOORD0;
     float3 worldPos : TEXCOORD1;
+};
+
+struct GBufferOut {
+    float4 directHDR   : SV_Target0;
+    float4 rawRTGI     : SV_Target1;
+    float4 normalDepth : SV_Target2;
 };
 
 PSIn VSMain(VSIn input) {
@@ -55,18 +60,57 @@ float3 eval_sunset_env(float3 dir) {
     return lerp(float3(0.18, 0.06, 0.20), col, h);
 }
 
-float4 PSMain(PSIn input) : SV_Target {
+float ign(float2 xy, float frame) {
+    float2 p = xy + 5.588238 * fmod(frame, 64.0);
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+float3 trace_diffuse_rtgi(float3 worldPos, float3 N, float2 screenXY) {
+    float3 upVec = (abs(N.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    float3 T = normalize(cross(upVec, N));
+    float3 B = cross(N, T);
+    float f = floor(g_Time * 60.0);
+    float r1 = ign(screenXY, f);
+    float r2 = ign(screenXY + float2(17.0, 31.0), f);
+    float phi = 6.2831853 * r1;
+    float cosTheta = sqrt(r2);
+    float sinTheta = sqrt(max(1.0 - r2, 0.0));
+    float3 giRaw = T * (cos(phi) * sinTheta) + B * (sin(phi) * sinTheta) + N * cosTheta;
+    float3 giDir = (dot(giRaw, giRaw) > 1e-6) ? normalize(giRaw) : float3(0.0, 1.0, 0.0);
+
+    RayDesc gRay;
+    gRay.Origin = worldPos + N * 0.08;
+    gRay.Direction = giDir;
+    gRay.TMin = 0.08;
+    gRay.TMax = 55.0;
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> gq;
+    gq.TraceRayInline(g_SceneTlas, RAY_FLAG_NONE, 0xFFu, gRay);
+    while (gq.Proceed()) {}
+
+    if (gq.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        float4 hd = g_InstColors[gq.CommittedInstanceID()];
+        float fade = saturate(1.0 - gq.CommittedRayT() / 55.0);
+        return hd.rgb * (0.45 + hd.a * 2.4) * fade;
+    }
+    return eval_sunset_env(giDir) * 0.38;
+}
+
+GBufferOut PSMain(PSIn input) {
     float3 albedo = g_Textures[g_TexIndex].Sample(g_Sampler, input.uv).rgb;
     float3 N = (dot(input.worldN, input.worldN) > 1e-6) ? normalize(input.worldN) : float3(0.0, 1.0, 0.0);
     float3 toCam = g_CameraPos.xyz - input.worldPos;
-    float3 V = (dot(toCam, toCam) > 1e-6) ? normalize(toCam) : float3(0.0, 0.0, -1.0);
+    float camDist = length(toCam);
+    float3 V = (camDist > 1e-4) ? (toCam / camDist) : float3(0.0, 0.0, -1.0);
 
     float3 sunDir = normalize(float3(0.08, 0.24, 0.96));
     float ndl = max(dot(N, sunDir), 0.0);
 
+    uint rtBits = (uint)(g_CameraPos.w + 0.25);
+    bool rtEnabled = (rtBits & 1u) != 0u;
+    bool rtgiEnabled = (rtBits & 2u) != 0u;
+
     // 1. Hardware DXR 1.1 Inline RT Sun Shadow
     float sunVis = 1.0;
-    bool rtEnabled = (g_CameraPos.w > 0.5);
     if (rtEnabled && ndl > 0.02) {
         RayDesc sRay;
         sRay.Origin = input.worldPos + N * 0.08;
@@ -90,7 +134,7 @@ float4 PSMain(PSIn input) : SV_Target {
 
     float3 lit = albedo * (ambient + sunColor * ndl) + sunColor * spec;
 
-    // 2. Dynamic point lights (streetlamps + hero car headlights/taillights)
+    // 2. Dynamic point lights
     [unroll]
     for (int i = 0; i < 4; ++i) {
         float3 toL = g_PointLights[i].xyz - input.worldPos;
@@ -103,12 +147,11 @@ float4 PSMain(PSIn input) : SV_Target {
         lit += (albedo * diff + pspec) * g_LightColors[i].rgb * att;
     }
 
-    // 3. Hardware DXR 1.1 Inline RT Reflections on wet highway, ocean, glass skyscrapers & glossy car paint
+    // 3. Hardware DXR 1.1 Inline RT Reflections
     bool isGlossy = (g_TexIndex == 0u || g_TexIndex == 1u || g_TexIndex == 4u || g_TexIndex == 8u || g_TexIndex == 9u || g_TexIndex == 10u);
     if (rtEnabled && isGlossy) {
         float3 rN = N;
         if (g_TexIndex == 0u) {
-            // Subtle micro-puddle ripple normal on wet highway asphalt
             float rip = sin(input.worldPos.x * 2.2 + input.worldPos.z * 0.9) * cos(input.worldPos.z * 1.4);
             rN = normalize(N + float3(rip * 0.035, 0.0, rip * 0.025));
         } else if (g_TexIndex == 4u) {
@@ -147,5 +190,16 @@ float4 PSMain(PSIn input) : SV_Target {
     float fog = saturate((dist - 40.0) / 115.0);
     float3 fogColor = float3(0.68, 0.28, 0.42);
     float3 finalCol = lerp(lit, fogColor, fog * 0.72);
-    return float4(finalCol, 1.0);
+
+    // 4. 1-spp Cosine-Weighted Diffuse RTGI Bounce
+    float3 gi = float3(0.0, 0.0, 0.0);
+    if (rtgiEnabled && camDist < 160.0) {
+        gi = trace_diffuse_rtgi(input.worldPos, N, input.pos.xy) * albedo * 0.55 * (1.0 - fog * 0.72);
+    }
+
+    GBufferOut o;
+    o.directHDR = float4(finalCol, 1.0);
+    o.rawRTGI = float4(gi, 1.0);
+    o.normalDepth = float4(N, camDist);
+    return o;
 }

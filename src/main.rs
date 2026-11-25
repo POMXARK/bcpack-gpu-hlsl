@@ -18,6 +18,7 @@ use bcpack_gpu::gpu_decoder::{
 };
 use bcpack_gpu::meshlets::run_mesh_shader_verify;
 use bcpack_gpu::raytracing::run_rt_verify;
+use bcpack_gpu::rtgi::run_rtgi_verify;
 use bcpack_gpu::world_streaming::run_world_stream_verify;
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
@@ -80,7 +81,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         offset += byte_len;
     }
     println!(
-        "[verify] PASS 1/10 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 1/11 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
         cases.len(),
         cases.iter().map(|c| c.1).sum::<usize>(),
         gpu_ms
@@ -100,7 +101,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 2/10 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 2/11 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         assets.len(),
         tex_gpu_ms
     );
@@ -125,7 +126,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 3/10 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 3/11 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         total_tiles,
         tile_gpu_ms
     );
@@ -169,7 +170,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         row_off += *rows;
     }
     println!(
-        "[verify] PASS 4/10 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
+        "[verify] PASS 4/11 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
         bc7_cases.len(),
         total_sym_rows,
         bc7_gpu_ms
@@ -192,7 +193,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         let (detiled, det_ms) = detile.detile_and_readback(&mut ctx, &gpu_swizzled_out, w_blk as u32, h_blk as u32, tile_mode, 8);
         assert_eq!(detiled.as_slice(), linear_bc1.as_slice(), "FAIL Gfx10 detile mismatch on {name}");
         println!(
-            "[verify] PASS 5/10 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
+            "[verify] PASS 5/11 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
         );
     }
 
@@ -212,7 +213,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         m_off += byte_len;
     }
     println!(
-        "[verify] PASS 6/10 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 6/11 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
         mip_chain.len(),
         mip_ms
     );
@@ -283,33 +284,40 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         assert_eq!(BcPackGetLastTimingMs(ffi_ctx, &mut kms), 0);
         bcpack_gpu_destroy(ffi_ctx);
         println!(
-            "[verify] PASS 7/10 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
+            "[verify] PASS 7/11 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
         );
     }
 
     // 8) DXR 1.1 Hardware BVH + Inline RayQuery verification on RT Cores
     let rt_ms = run_rt_verify(&mut ctx);
     println!(
-        "[verify] PASS 8/10 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
+        "[verify] PASS 8/11 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
     );
 
     // 9) World Grid 32x32 Streaming + LRU VRAM Residency Manager verification
     let ws = run_world_stream_verify(&mut ctx, &mut gpu_dec, &assets);
     println!(
-        "[verify] PASS 9/10 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 9/11 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
         ws.frames, ws.verified_tiles, ws.total_evictions, ws.turn_burst_tiles, ws.peak_mbs, ws.gpu_ms
     );
 
     // 10) DX12 Ultimate Mesh Shaders (as_6_5 / ms_6_5) + GPU Frustum Culling + 4M+ Tris City verification
     let ms = run_mesh_shader_verify(&mut ctx);
     println!(
-        "[verify] PASS 10/10 Hardware Mesh Shaders (4.5M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
+        "[verify] PASS 10/11 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
         ms.total_tris as f64 / 1e6,
         ms.total_work_items,
         ms.visible_meshlets,
         ms.culled_meshlets,
         ms.visible_tris as f64 / 1e6,
         ms.lit_pixels
+    );
+
+    // 11) DXR 1.1 Scale (1,536-Instance TLAS) + 2-Pass A-Trous Bilateral RTGI Denoiser verification
+    let gi = run_rtgi_verify(&mut ctx);
+    println!(
+        "[verify] PASS 11/11 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
+        gi.tlas_instances, gi.tlas_ms, gi.raw_var, gi.denoised_var, gi.edge_jump
     );
     let _ = (BCPACK_SWIZZLE_GFX10_4KB_S,);
 }
@@ -600,6 +608,7 @@ fn main() {
     let regen_assets = args.iter().any(|a| a == "--regen-assets");
     let enable_debug = args.iter().any(|a| a == "--debug");
     let start_rt_enabled = !args.iter().any(|a| a == "--no-rt");
+    let start_rtgi_enabled = start_rt_enabled && !args.iter().any(|a| a == "--no-rtgi");
     let start_world_stream = args.iter().any(|a| a == "--world-stream");
     let start_mesh_shaders = !args.iter().any(|a| a == "--no-mesh-shaders");
     let mut vram_cap_mb = 32usize;
@@ -667,6 +676,7 @@ fn main() {
                 multi_core_cpu: true,
                 enable_debug,
                 start_rt_enabled,
+                start_rtgi_enabled,
                 start_world_stream,
                 start_mesh_shaders,
                 vram_cap_mb,

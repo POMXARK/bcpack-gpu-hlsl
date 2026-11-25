@@ -5,4 +5,5 @@ pub mod gpu_decoder;
 pub mod meshlets;
 pub mod meshes;
 pub mod raytracing;
+pub mod rtgi;
 pub mod world_streaming;

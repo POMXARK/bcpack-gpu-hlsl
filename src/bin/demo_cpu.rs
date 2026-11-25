@@ -48,6 +48,7 @@ fn main() {
             multi_core_cpu: multi_core,
             enable_debug: false,
             start_rt_enabled: false,
+            start_rtgi_enabled: false,
             start_world_stream,
             start_mesh_shaders: false,
             vram_cap_mb,

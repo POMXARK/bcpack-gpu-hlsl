@@ -782,8 +782,10 @@ impl MeshletPipeline {
                 .ok()?;
 
             let mut rt_formats = D3D12_RT_FORMAT_ARRAY::default();
-            rt_formats.NumRenderTargets = 1;
-            rt_formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            rt_formats.NumRenderTargets = 3;
+            rt_formats.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            rt_formats.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            rt_formats.RTFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
             let blend = D3D12_BLEND_DESC {
                 RenderTarget: [D3D12_RENDER_TARGET_BLEND_DESC {
@@ -1059,7 +1061,7 @@ pub fn run_mesh_shader_verify(ctx: &mut GpuContext) -> MeshShaderVerifyStats {
             .device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: 1,
+                NumDescriptors: 3,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                 NodeMask: 0,
             })
@@ -1089,25 +1091,36 @@ pub fn run_mesh_shader_verify(ctx: &mut GpuContext) -> MeshShaderVerifyStats {
             Height: rt_h,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             ..Default::default()
         };
-        let mut rt_res: Option<ID3D12Resource> = None;
-        ctx.device
-            .CreateCommittedResource(
-                &heap_props(D3D12_HEAP_TYPE_DEFAULT),
-                D3D12_HEAP_FLAG_NONE,
-                &rt_tex_desc,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
+        let rtv_inc = ctx.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        let rtv_base = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        let mut rts: Vec<ID3D12Resource> = Vec::with_capacity(3);
+        for i in 0..3usize {
+            let mut rt_res: Option<ID3D12Resource> = None;
+            ctx.device
+                .CreateCommittedResource(
+                    &heap_props(D3D12_HEAP_TYPE_DEFAULT),
+                    D3D12_HEAP_FLAG_NONE,
+                    &rt_tex_desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut rt_res,
+                )
+                .unwrap();
+            let res = rt_res.unwrap();
+            ctx.device.CreateRenderTargetView(
+                &res,
                 None,
-                &mut rt_res,
-            )
-            .unwrap();
-        let rt_res = rt_res.unwrap();
-        ctx.device.CreateRenderTargetView(&rt_res, None, rtv_heap.GetCPUDescriptorHandleForHeapStart());
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv_base.ptr + i * rtv_inc as usize },
+            );
+            rts.push(res);
+        }
+        let rt_res = rts[0].clone();
 
         let ds_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -1221,7 +1234,7 @@ pub fn run_mesh_shader_verify(ctx: &mut GpuContext) -> MeshShaderVerifyStats {
         );
         upload_slice(&dummy_colors, &[[1.0f32, 0.5, 0.8, 0.2]]);
 
-        let rb_pitch = rt_w * 4;
+        let rb_pitch = rt_w * 8;
         let rt_rb = create_committed_buffer(
             &ctx.device,
             D3D12_HEAP_TYPE_READBACK,
@@ -1245,11 +1258,17 @@ pub fn run_mesh_shader_verify(ctx: &mut GpuContext) -> MeshShaderVerifyStats {
         cmd.ResourceBarrier(&b_tlas);
         drop_barriers(&mut b_tlas);
 
-        let rtv_h = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        let rtvs = [
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv_base.ptr },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv_base.ptr + rtv_inc as usize },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv_base.ptr + 2 * rtv_inc as usize },
+        ];
         let dsv_h = dsv_heap.GetCPUDescriptorHandleForHeapStart();
-        cmd.ClearRenderTargetView(rtv_h, &[0.0, 0.0, 0.0, 0.0], None);
+        cmd.ClearRenderTargetView(rtvs[0], &[0.0, 0.0, 0.0, 0.0], None);
+        cmd.ClearRenderTargetView(rtvs[1], &[0.0, 0.0, 0.0, 0.0], None);
+        cmd.ClearRenderTargetView(rtvs[2], &[0.0, 0.0, 0.0, 9999.0], None);
         cmd.ClearDepthStencilView(dsv_h, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, &[]);
-        cmd.OMSetRenderTargets(1, Some(&rtv_h), false, Some(&dsv_h));
+        cmd.OMSetRenderTargets(3, Some(rtvs.as_ptr()), false, Some(&dsv_h));
 
         let vp_rect = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: rt_w as f32, Height: rt_h as f32, MinDepth: 0.0, MaxDepth: 1.0 };
         let sc_rect = RECT { left: 0, top: 0, right: rt_w as i32, bottom: rt_h as i32 };
@@ -1293,7 +1312,7 @@ pub fn run_mesh_shader_verify(ctx: &mut GpuContext) -> MeshShaderVerifyStats {
                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                     Offset: 0,
                     Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
                         Width: rt_w,
                         Height: rt_h,
                         Depth: 1,
@@ -1330,8 +1349,11 @@ pub fn run_mesh_shader_verify(ctx: &mut GpuContext) -> MeshShaderVerifyStats {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rng = D3D12_RANGE { Begin: 0, End: (rb_pitch * rt_h) as usize };
         rt_rb.Map(0, Some(&rng), Some(&mut ptr)).unwrap();
-        let pixels = std::slice::from_raw_parts(ptr as *const u8, (rb_pitch * rt_h) as usize);
-        let lit_pixels = pixels.chunks_exact(4).filter(|px| px[3] > 0 && (px[0] > 0 || px[1] > 0 || px[2] > 0)).count();
+        let pixels_f16 = std::slice::from_raw_parts(ptr as *const u16, (rt_w * rt_h * 4) as usize);
+        let lit_pixels = pixels_f16
+            .chunks_exact(4)
+            .filter(|px| (px[0] & 0x7FFF) != 0 || (px[1] & 0x7FFF) != 0 || (px[2] & 0x7FFF) != 0)
+            .count();
         rt_rb.Unmap(0, None);
         assert!(lit_pixels > 500, "Expected > 500 rendered city pixels, got {lit_pixels}");
 
