@@ -31,14 +31,16 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SHIFT,
+    VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetWindowLongPtrW, IsWindow, LoadCursorW, PeekMessageW, PostQuitMessage, RegisterClassExW,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
-    WM_DESTROY, WM_KEYDOWN, WM_QUIT, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GetClientRect, GetWindowLongPtrW, IsWindow, LoadCursorW, PeekMessageW, PostQuitMessage,
+    RegisterClassExW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE,
+    WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 pub const AAA_SKY_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_sky_vs.dxil");
@@ -89,6 +91,11 @@ pub struct AaaDemoConfig {
     pub benchmark_secs: f32,
     pub no_city: bool,
     pub no_crowd: bool,
+    pub record_dir: Option<PathBuf>,
+    pub record_frames: u32,
+    pub fps_cap: u32,
+    pub sim_speed: f32,
+    pub show_hud: Option<bool>,
 }
 
 impl Default for AaaDemoConfig {
@@ -113,6 +120,11 @@ impl Default for AaaDemoConfig {
             benchmark_secs: 60.0,
             no_city: false,
             no_crowd: false,
+            record_dir: None,
+            record_frames: 120,
+            fps_cap: 0,
+            sim_speed: 1.0,
+            show_hud: None,
         }
     }
 }
@@ -157,8 +169,58 @@ struct WindowState {
     vsync_enabled: bool,
     sfs_enabled: bool,
     cam_mode: u32, // 0=Showroom 3/4 Orbit, 1=Chase Drive, 2=Free Cam
+    fps_cap: u32,  // 0 = MAX/VSync, 15..=300 = capped FPS
+    sim_speed: f32,
+    saved_sim_speed: f32,
+    hud_visible: bool,
+    drag_slider: u8, // 0 = none, 1 = FPS cap, 2 = Sim speed
     flush_requested: bool,
     should_quit: bool,
+}
+
+const HUD_TRACK_X0: f32 = 0.032;
+const HUD_TRACK_X1: f32 = 0.296;
+
+#[inline]
+fn fps_to_norm(fps_cap: u32) -> f32 {
+    if fps_cap == 0 {
+        1.0
+    } else {
+        (((fps_cap.clamp(15, 300) - 15) as f32) / 285.0) * 0.96
+    }
+}
+
+#[inline]
+fn norm_to_fps(n: f32) -> u32 {
+    if n >= 0.96 {
+        0
+    } else {
+        15 + ((n.clamp(0.0, 0.96) / 0.96) * 285.0).round() as u32
+    }
+}
+
+#[inline]
+fn sim_to_norm(speed: f32) -> f32 {
+    let s = speed.clamp(0.0, 4.0);
+    if s <= 1.0 {
+        s * 0.40
+    } else {
+        0.40 + ((s - 1.0) / 3.0) * 0.60
+    }
+}
+
+#[inline]
+fn norm_to_sim(n: f32) -> f32 {
+    let t = n.clamp(0.0, 1.0);
+    if t < 0.015 {
+        0.0
+    } else if (t - 0.40).abs() < 0.015 {
+        1.0
+    } else if t <= 0.40 {
+        (t / 0.40).clamp(0.0, 1.0)
+    } else {
+        (1.0 + ((t - 0.40) / 0.60) * 3.0).clamp(1.0, 4.0)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -330,17 +392,100 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         PostQuitMessage(0);
         return LRESULT(0);
     }
+    if !ptr.is_null() && (msg == WM_LBUTTONDOWN || msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP) {
+        let st = &mut *ptr;
+        let mx = (lparam.0 & 0xFFFF) as i16 as f32;
+        let my = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        let mut rc = RECT::default();
+        if GetClientRect(hwnd, &mut rc).is_ok() {
+            let cw = (rc.right - rc.left).max(1) as f32;
+            let ch = (rc.bottom - rc.top).max(1) as f32;
+            let u = mx / cw;
+            let v = my / ch;
+            let norm = ((u - HUD_TRACK_X0) / (HUD_TRACK_X1 - HUD_TRACK_X0)).clamp(0.0, 1.0);
+            if msg == WM_LBUTTONDOWN && st.hud_visible {
+                if (0.022..=0.306).contains(&u) && (0.845..=0.898).contains(&v) {
+                    st.drag_slider = 1;
+                    SetCapture(hwnd);
+                    st.fps_cap = norm_to_fps(norm);
+                    if st.fps_cap > 0 {
+                        st.vsync_enabled = false;
+                    }
+                    return LRESULT(0);
+                } else if (0.022..=0.306).contains(&u) && (0.912..=0.965).contains(&v) {
+                    st.drag_slider = 2;
+                    SetCapture(hwnd);
+                    st.sim_speed = norm_to_sim(norm);
+                    return LRESULT(0);
+                }
+            } else if msg == WM_MOUSEMOVE && st.drag_slider != 0 {
+                if st.drag_slider == 1 {
+                    st.fps_cap = norm_to_fps(norm);
+                    if st.fps_cap > 0 {
+                        st.vsync_enabled = false;
+                    }
+                } else if st.drag_slider == 2 {
+                    st.sim_speed = norm_to_sim(norm);
+                }
+                return LRESULT(0);
+            } else if msg == WM_LBUTTONUP && st.drag_slider != 0 {
+                st.drag_slider = 0;
+                let _ = ReleaseCapture();
+                return LRESULT(0);
+            }
+        }
+    }
     if !ptr.is_null() && msg == WM_KEYDOWN {
         let st = &mut *ptr;
+        const FPS_STEPS: [u32; 10] = [15, 30, 45, 60, 90, 120, 144, 180, 240, 0];
         match wparam.0 as u32 {
             x if x == VK_SPACE.0 as u32 => st.use_gpu = !st.use_gpu,
             x if x == b'T' as u32 => st.flush_requested = true,
             x if x == b'V' as u32 => st.xray_enabled = !st.xray_enabled,
-            x if x == b'L' as u32 => st.vsync_enabled = !st.vsync_enabled,
+            x if x == b'L' as u32 => {
+                st.vsync_enabled = !st.vsync_enabled;
+                if st.vsync_enabled {
+                    st.fps_cap = 0;
+                }
+            }
             x if x == b'F' as u32 => st.sfs_enabled = !st.sfs_enabled,
             x if x == b'R' as u32 => st.rt_enabled = !st.rt_enabled,
             x if x == b'G' as u32 => st.rtgi_enabled = !st.rtgi_enabled,
             x if x == b'C' as u32 => st.cam_mode = (st.cam_mode + 1) % 3,
+            x if x == b'H' as u32 => st.hud_visible = !st.hud_visible,
+            x if x == b'P' as u32 => {
+                if st.sim_speed > 0.005 {
+                    st.saved_sim_speed = st.sim_speed;
+                    st.sim_speed = 0.0;
+                } else {
+                    st.sim_speed = st.saved_sim_speed.max(0.25);
+                }
+            }
+            0xDB => {
+                // '[' decrease FPS cap
+                let next = if st.fps_cap == 0 {
+                    FPS_STEPS[FPS_STEPS.len() - 2]
+                } else {
+                    FPS_STEPS.iter().rev().copied().find(|&f| f != 0 && f < st.fps_cap).unwrap_or(15)
+                };
+                st.fps_cap = next;
+                st.vsync_enabled = false;
+            }
+            0xDD => {
+                // ']' increase FPS cap
+                let next = if st.fps_cap == 0 {
+                    0
+                } else {
+                    FPS_STEPS.iter().copied().find(|&f| f == 0 || f > st.fps_cap).unwrap_or(0)
+                };
+                st.fps_cap = next;
+                if st.fps_cap > 0 {
+                    st.vsync_enabled = false;
+                }
+            }
+            0xBD => st.sim_speed = (st.sim_speed - 0.25).clamp(0.0, 4.0), // '-' slower sim
+            0xBB => st.sim_speed = (st.sim_speed + 0.25).clamp(0.0, 4.0), // '=' faster sim
+            x if x == b'0' as u32 => st.sim_speed = 1.0,
             x if x == VK_ESCAPE.0 as u32 => {
                 st.should_quit = true;
                 let _ = DestroyWindow(hwnd);
@@ -1404,7 +1549,7 @@ impl AaaPostPipeline {
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 12 },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
@@ -1521,6 +1666,7 @@ impl AaaPostPipeline {
         frame_idx: u32,
         sun_screen_dir: [f32; 2],
         time: f32,
+        hud: [f32; 8],
     ) {
         let srv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let gpu_base = main_srv_heap.GetGPUDescriptorHandleForHeapStart();
@@ -1722,8 +1868,12 @@ impl AaaPostPipeline {
 
         cmd.SetGraphicsRootSignature(&self.comp_root_sig);
         cmd.SetPipelineState(&self.comp_pso);
-        let comp_cb = [0.12f32, 0.35f32, 1.0f32, time];
-        cmd.SetGraphicsRoot32BitConstants(0, 4, comp_cb.as_ptr() as *const c_void, 0);
+        let comp_cb = [
+            0.12f32, 0.35f32, 1.0f32, time,
+            hud[0], hud[1], hud[2], hud[3],
+            hud[4], hud[5], hud[6], hud[7],
+        ];
+        cmd.SetGraphicsRoot32BitConstants(0, 12, comp_cb.as_ptr() as *const c_void, 0);
         cmd.SetGraphicsRootDescriptorTable(1, gpu_at(101 + cur * 3));
         cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmd.DrawInstanced(3, 1, 0, 0);
@@ -1873,14 +2023,20 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         )
         .expect("CreateWindowExW");
 
+        let hud_default = !cfg.benchmark_run && cfg.screenshot_path.is_none() && cfg.record_dir.is_none();
         let mut wstate = Box::new(WindowState {
             use_gpu: !cfg.start_cpu,
             rt_enabled: !cfg.no_rt,
             rtgi_enabled: !cfg.no_rt && !cfg.no_rtgi,
             xray_enabled: cfg.xray_mode,
-            vsync_enabled: cfg.vsync,
+            vsync_enabled: if cfg.fps_cap > 0 { false } else { cfg.vsync },
             sfs_enabled: cfg.vram_budget_mb > 0,
             cam_mode: 0,
+            fps_cap: cfg.fps_cap,
+            sim_speed: cfg.sim_speed.clamp(0.0, 4.0),
+            saved_sim_speed: 1.0,
+            hud_visible: cfg.show_hud.unwrap_or(hud_default),
+            drag_slider: 0,
             flush_requested: false,
             should_quit: false,
         });
@@ -2596,7 +2752,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             pack.total_bcpack_bytes as f64 / (1024.0 * 1024.0),
             cfg.vram_budget_mb
         );
-        println!("  Controls: [T] Flush VRAM Wave | [V] X-Ray SFS Heatmap | [F] SFS Budget ON/OFF | [L] VSync | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Camera | [ESC] Quit");
+        println!("  Controls: [H] HUD Sliders (FPS Cap + Sim Speed) | [/] FPS | -/= Sim | [P] Pause | [T] Flush | [V] X-Ray | [F] SFS | [L] VSync | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Cam | [ESC] Quit");
 
         let mut frame_fences = [0u64; 2];
         let mut frame_count: u32 = 0;
@@ -2606,6 +2762,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let mut last_frame = start_time;
         let mut last_title = start_time;
         let mut fps_accum = 0u32;
+        let mut live_fps = if wstate.vsync_enabled { 60.0f32 } else { 120.0f32 };
+        let mut sim_time = 0.0f32;
         let mut last_decode_ms = 0.0f64;
         let mut prev_vp_unjittered: Option<Mat4> = None;
         let mut prev_traffic_mats: Option<Vec<Mat4>> = None;
@@ -2615,6 +2773,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let mut bench_sum_vis_tris = 0u64;
         let mut bench_sum_hiz_tris = 0u64;
         let mut bench_flushed = false;
+
+        if let Some(ref dir) = cfg.record_dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
 
         'main_loop: loop {
             let mut msg = MSG::default();
@@ -2632,15 +2794,23 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             let now = Instant::now();
             let raw_dt_ms = (now - last_frame).as_secs_f64() * 1000.0;
-            let dt = ((raw_dt_ms * 0.001) as f32).min(0.05);
+            const RECORD_WARMUP: u32 = 24;
+            let (dt, wall_sec, t_sec) = if cfg.record_dir.is_some() {
+                let rec_step = frame_count.saturating_sub(RECORD_WARMUP);
+                let rec_t = (rec_step as f32) / 15.0;
+                (1.0f32 / 15.0, rec_t, rec_t)
+            } else {
+                let frame_dt = ((raw_dt_ms * 0.001) as f32).min(0.05);
+                sim_time += frame_dt * wstate.sim_speed;
+                (frame_dt, (now - start_time).as_secs_f32(), sim_time)
+            };
             last_frame = now;
-            let t_sec = (now - start_time).as_secs_f32();
             residency.tick_timers(dt);
 
             if cfg.benchmark_run && frame_count > 4 {
                 bench_frame_ms.push(raw_dt_ms);
             }
-            if cfg.benchmark_run && !bench_flushed && t_sec >= cfg.benchmark_secs * 0.75 {
+            if cfg.benchmark_run && cfg.record_dir.is_none() && !bench_flushed && wall_sec >= cfg.benchmark_secs * 0.75 {
                 wstate.flush_requested = true;
                 bench_flushed = true;
             }
@@ -2719,7 +2889,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             let hero_model = Mat4::translation(0.0, 0.0, 0.0).mul(&Mat4::rotate_y(2.42));
             let (cam_pos, cam_target) = if cfg.benchmark_run {
-                let p = (t_sec / cfg.benchmark_secs.max(5.0)).clamp(0.0, 1.0);
+                let p = (wall_sec / cfg.benchmark_secs.max(5.0)).clamp(0.0, 1.0);
                 if p < 0.33 {
                     let s = p / 0.33;
                     let orbit_yaw = -1.45 + s * 0.45;
@@ -3245,6 +3415,16 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             };
             cmd_barriers(cmd, vec![transition_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
 
+            let hud_cb = [
+                if wstate.hud_visible { 1.0f32 } else { 0.0f32 },
+                fps_to_norm(wstate.fps_cap),
+                wstate.fps_cap as f32,
+                live_fps,
+                sim_to_norm(wstate.sim_speed),
+                wstate.sim_speed,
+                wstate.drag_slider as f32,
+                if wstate.vsync_enabled { 1.0f32 } else { 0.0f32 },
+            ];
             post.run_post_and_composite(
                 cmd,
                 &main_srv_heap,
@@ -3255,12 +3435,19 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 frame_count,
                 sun_screen_dir,
                 t_sec,
+                hud_cb,
             );
 
             prev_vp_unjittered = Some(vp_unjit);
             prev_traffic_mats = Some(cur_traffic_xfs);
 
-            let take_shot = cfg.screenshot_path.is_some() && frame_count + 1 >= cfg.screenshot_frames;
+            let rec_frame_idx: Option<u32> = if cfg.record_dir.is_some() && frame_count >= 24 {
+                Some(frame_count - 24)
+            } else {
+                None
+            };
+            let take_shot = (cfg.screenshot_path.is_some() && frame_count + 1 >= cfg.screenshot_frames)
+                || rec_frame_idx.is_some();
             if take_shot {
                 cmd_barriers(cmd, vec![transition_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                 let mut dst = D3D12_TEXTURE_COPY_LOCATION {
@@ -3329,41 +3516,83 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             }
 
             if take_shot {
-                let out_path = cfg.screenshot_path.as_ref().unwrap();
-                let mut ptr: *mut c_void = std::ptr::null_mut();
-                let rng = D3D12_RANGE { Begin: 0, End: (ss_row_pitch * SWAP_H) as usize };
-                ss_readback.Map(0, Some(&rng), Some(&mut ptr)).unwrap();
-                let raw = std::slice::from_raw_parts(ptr as *const u8, (ss_row_pitch * SWAP_H) as usize);
-                let file = File::create(out_path).expect("create screenshot");
-                let mut enc = png::Encoder::new(BufWriter::new(file), SWAP_W, SWAP_H);
-                enc.set_color(png::ColorType::Rgba);
-                enc.set_depth(png::BitDepth::Eight);
-                let mut writer = enc.write_header().unwrap();
-                writer.write_image_data(raw).unwrap();
-                ss_readback.Unmap(0, None);
-                let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
-                let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
-                println!(
-                    "[aaa-screenshot] Saved {} ({}x{}, mip0={}/{} tex [{}/{} tiles], VRAM={:.1}/{:.1} MiB, saved={:.1} MiB, evict={}, xray={})",
-                    out_path.display(),
-                    SWAP_W,
-                    SWAP_H,
-                    residency.num_mip0_full(),
-                    pack.textures.len(),
-                    residency.total_mip0_resident(),
-                    residency.total_mip0_tiles(),
-                    cur_mib,
-                    tot_mib,
-                    (tot_mib - cur_mib).max(0.0),
-                    residency.total_evictions,
-                    wstate.xray_enabled
-                );
-                break;
+                if let Some(ri) = rec_frame_idx {
+                    let dir = cfg.record_dir.as_ref().unwrap();
+                    let mut ptr: *mut c_void = std::ptr::null_mut();
+                    let rng = D3D12_RANGE { Begin: 0, End: (ss_row_pitch * SWAP_H) as usize };
+                    ss_readback.Map(0, Some(&rng), Some(&mut ptr)).unwrap();
+                    let raw = std::slice::from_raw_parts(ptr as *const u8, (ss_row_pitch * SWAP_H) as usize);
+                    let dw = (SWAP_W / 2) as usize;
+                    let dh = (SWAP_H / 2) as usize;
+                    let pitch = ss_row_pitch as usize;
+                    let mut down = vec![0u8; dw * dh * 4];
+                    for y in 0..dh {
+                        let r0 = (y * 2) * pitch;
+                        let r1 = (y * 2 + 1) * pitch;
+                        for x in 0..dw {
+                            let c0 = x * 2 * 4;
+                            let c1 = (x * 2 + 1) * 4;
+                            let dst_o = (y * dw + x) * 4;
+                            for ch in 0..4 {
+                                let sum = raw[r0 + c0 + ch] as u32
+                                    + raw[r0 + c1 + ch] as u32
+                                    + raw[r1 + c0 + ch] as u32
+                                    + raw[r1 + c1 + ch] as u32;
+                                down[dst_o + ch] = (sum >> 2) as u8;
+                            }
+                        }
+                    }
+                    ss_readback.Unmap(0, None);
+                    let out_path = dir.join(format!("frame_{:04}.png", ri));
+                    let file = File::create(&out_path).expect("create record frame");
+                    let mut enc = png::Encoder::new(BufWriter::new(file), dw as u32, dh as u32);
+                    enc.set_color(png::ColorType::Rgba);
+                    enc.set_depth(png::BitDepth::Eight);
+                    enc.set_compression(png::Compression::Fast);
+                    let mut writer = enc.write_header().unwrap();
+                    writer.write_image_data(&down).unwrap();
+                    if ri + 1 >= cfg.record_frames {
+                        println!("[aaa-record] Saved {} frames to {}", cfg.record_frames, dir.display());
+                        break;
+                    }
+                } else {
+                    let out_path = cfg.screenshot_path.as_ref().unwrap();
+                    let mut ptr: *mut c_void = std::ptr::null_mut();
+                    let rng = D3D12_RANGE { Begin: 0, End: (ss_row_pitch * SWAP_H) as usize };
+                    ss_readback.Map(0, Some(&rng), Some(&mut ptr)).unwrap();
+                    let raw = std::slice::from_raw_parts(ptr as *const u8, (ss_row_pitch * SWAP_H) as usize);
+                    let file = File::create(out_path).expect("create screenshot");
+                    let mut enc = png::Encoder::new(BufWriter::new(file), SWAP_W, SWAP_H);
+                    enc.set_color(png::ColorType::Rgba);
+                    enc.set_depth(png::BitDepth::Eight);
+                    let mut writer = enc.write_header().unwrap();
+                    writer.write_image_data(raw).unwrap();
+                    ss_readback.Unmap(0, None);
+                    let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
+                    let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
+                    println!(
+                        "[aaa-screenshot] Saved {} ({}x{}, mip0={}/{} tex [{}/{} tiles], VRAM={:.1}/{:.1} MiB, saved={:.1} MiB, evict={}, xray={})",
+                        out_path.display(),
+                        SWAP_W,
+                        SWAP_H,
+                        residency.num_mip0_full(),
+                        pack.textures.len(),
+                        residency.total_mip0_resident(),
+                        residency.total_mip0_tiles(),
+                        cur_mib,
+                        tot_mib,
+                        (tot_mib - cur_mib).max(0.0),
+                        residency.total_evictions,
+                        wstate.xray_enabled
+                    );
+                    break;
+                }
             }
 
             if (now - last_title).as_secs_f64() >= 0.35 {
                 let secs = (now - last_title).as_secs_f64();
                 let fps_val = fps_accum as f64 / secs;
+                live_fps = fps_val as f32;
                 fps_accum = 0;
                 last_title = now;
                 let mode_str = if wstate.use_gpu { "GPU Async" } else { "CPU 1T" };
@@ -3371,6 +3600,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     0 => "Showroom",
                     1 => "Chase",
                     _ => "FreeCam",
+                };
+                let cap_str = if wstate.fps_cap > 0 {
+                    format!("{}", wstate.fps_cap)
+                } else if wstate.vsync_enabled {
+                    "VSync".to_string()
+                } else {
+                    "MAX".to_string()
                 };
                 let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
                 let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
@@ -3386,9 +3622,11 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     String::new()
                 };
                 let title = format!(
-                    "BCPack AAA v0.8.0 | {} | {:.1} FPS | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} VSync[L]:{} | {}",
+                    "BCPack AAA v0.8.0 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x) | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
                     mode_str,
                     fps_val,
+                    cap_str,
+                    wstate.sim_speed,
                     city_str,
                     if crowd_renderer.is_some() { CROWD_NPCS } else { 0 },
                     if wstate.sfs_enabled { "ON" } else { "OFF" },
@@ -3400,14 +3638,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     if wstate.rt_enabled { "ON" } else { "OFF" },
                     if wstate.rtgi_enabled { "ON" } else { "OFF" },
                     if wstate.xray_enabled { "ON" } else { "OFF" },
-                    if wstate.vsync_enabled { "ON" } else { "OFF" },
                     cam_str,
                 );
                 let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
             }
 
-            if cfg.benchmark_run && t_sec >= cfg.benchmark_secs {
+            if cfg.benchmark_run && cfg.record_dir.is_none() && wall_sec >= cfg.benchmark_secs {
                 let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
                 let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
                 let saved_mib = (tot_mib - cur_mib).max(0.0);
@@ -3418,7 +3655,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let p999_ms = bench_frame_ms[((n as f64 * 0.999) as usize).min(n - 1)];
                 let pre_tris = meshlet_city.as_ref().map(|c| c.total_tris).unwrap_or(0);
                 let fc = frame_count.max(1) as f64;
-                println!("=== BCPack AAA Benchmark v0.8.0 Summary ({:.1}s, {}x{}) ===", t_sec, render_w, render_h);
+                println!("=== BCPack AAA Benchmark v0.8.0 Summary ({:.1}s, {}x{}) ===", wall_sec, render_w, render_h);
                 println!("  Frames: {} | Average FPS: {:.2} ({:.2} ms) | 1% Low: {:.2} FPS ({:.2} ms) | 0.1% Low: {:.2} FPS ({:.2} ms)",
                     frame_count, 1000.0 / avg_ms.max(0.01), avg_ms, 1000.0 / p99_ms.max(0.01), p99_ms, 1000.0 / p999_ms.max(0.01), p999_ms);
                 println!("  GPU BCPack Peak Throughput (Live 64K BC7/BC5 Tiles): {:.2} GB/s", bench_peak_gbps);
@@ -3430,6 +3667,18 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     if crowd_renderer.is_some() { CROWD_NPCS } else { 0 },
                     crowd_renderer.as_ref().map(|c| c.verts_total()).unwrap_or(0));
                 break;
+            }
+
+            if wstate.fps_cap > 0 && cfg.record_dir.is_none() {
+                let target = std::time::Duration::from_secs_f64(1.0 / (wstate.fps_cap as f64));
+                while now.elapsed() < target {
+                    let rem = target.saturating_sub(now.elapsed());
+                    if rem > std::time::Duration::from_millis(2) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
             }
 
             if let Some(target_n) = cfg.measure_frames {

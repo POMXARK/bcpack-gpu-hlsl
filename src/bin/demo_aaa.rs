@@ -54,6 +54,24 @@ fn main() {
             }
             "--no-city" => cfg.no_city = true,
             "--no-crowd" => cfg.no_crowd = true,
+            "--record-dir" if i + 1 < args.len() => {
+                cfg.record_dir = Some(PathBuf::from(&args[i + 1]));
+                i += 1;
+            }
+            "--record-frames" if i + 1 < args.len() => {
+                cfg.record_frames = args[i + 1].parse().unwrap_or(120);
+                i += 1;
+            }
+            "--fps-cap" if i + 1 < args.len() => {
+                cfg.fps_cap = args[i + 1].parse().unwrap_or(0);
+                i += 1;
+            }
+            "--sim-speed" if i + 1 < args.len() => {
+                cfg.sim_speed = args[i + 1].parse::<f32>().unwrap_or(1.0).clamp(0.0, 4.0);
+                i += 1;
+            }
+            "--show-hud" => cfg.show_hud = Some(true),
+            "--no-hud" => cfg.show_hud = Some(false),
             other => {
                 eprintln!("Unknown flag '{other}'");
                 std::process::exit(2);

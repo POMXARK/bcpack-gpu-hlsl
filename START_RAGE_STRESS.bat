@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 echo =======================================================================
-echo   BCPack GPU v0.7.0 RAGE Stress Suite (17/17 Verify + 12M Hi-Z + 500 NPC)
+echo   BCPack GPU v0.8.0 RAGE Stress Suite (17/17 Verify + 12M Hi-Z + 500 NPC)
 echo =======================================================================
 bcpack-gpu-demo.exe --verify --assets-dir "%~dp0assets"
 if errorlevel 1 exit /b 1
