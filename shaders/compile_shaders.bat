@@ -30,4 +30,11 @@ echo Using DXC: "%DXC%"
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0rtgi_denoise.dxil" "%~dp0rtgi_denoise.hlsl" || exit /b 1
 "%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0rtgi_comp_vs.dxil" "%~dp0rtgi_composite.hlsl" || exit /b 1
 "%DXC%" -T ps_6_0 -E PSMain -O3 -Fo "%~dp0rtgi_comp_ps.dxil" "%~dp0rtgi_composite.hlsl" || exit /b 1
+"%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0aaa_sky_vs.dxil" "%~dp0aaa_sky.hlsl" || exit /b 1
+"%DXC%" -T ps_6_0 -E PSMain -O3 -Fo "%~dp0aaa_sky_ps.dxil" "%~dp0aaa_sky.hlsl" || exit /b 1
+"%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0aaa_pbr_vs.dxil" "%~dp0aaa_pbr.hlsl" || exit /b 1
+"%DXC%" -T ps_6_5 -E PSMain -HV 2021 -O3 -Fo "%~dp0aaa_pbr_ps.dxil" "%~dp0aaa_pbr.hlsl" || exit /b 1
+"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_bloom.dxil" "%~dp0aaa_bloom.hlsl" || exit /b 1
+"%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0aaa_comp_vs.dxil" "%~dp0aaa_composite.hlsl" || exit /b 1
+"%DXC%" -T ps_6_0 -E PSMain -O3 -Fo "%~dp0aaa_comp_ps.dxil" "%~dp0aaa_composite.hlsl" || exit /b 1
 echo Shaders compiled successfully.

@@ -23,6 +23,10 @@ path = "src/bin/demo_cpu.rs"
 name = "bcpack-demo-gpu"
 path = "src/bin/demo_gpu.rs"
 
+[[bin]]
+name = "bcpack-aaa-demo"
+path = "src/bin/demo_aaa.rs"
+
 [dependencies]
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "b1c3099a3402de8b76c9263a828791bd8bc0c930", default-features = false }
 gltf = "1.4"

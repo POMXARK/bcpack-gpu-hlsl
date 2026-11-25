@@ -1,3 +1,4 @@
+pub mod aaa_scene;
 pub mod assets;
 pub mod demo_scene;
 pub mod ffi;

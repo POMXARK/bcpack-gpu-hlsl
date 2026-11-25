@@ -12,6 +12,25 @@
 
 ---
 
+## Open AAA Showcase (`v0.7.0` — Real glTF PBR + 2K Poly Haven + HDRI IBL + DXR 1.1)
+
+![v0.7.0 Open AAA Showcase: CarConcept glTF + 2K Poly Haven PBR + Sunset HDRI IBL + DXR 1.1](media/aaa_showcase_v7.png)
+
+![v0.7.0 Live BCPack X-Ray Streaming Wave: Clay Wireframe -> Cyan Active Wavefront -> Green Resident Tiles](media/aaa_xray_v7.png)
+
+A dedicated photorealistic showroom binary (**`bcpack-aaa-demo.exe`** / [`src/aaa_scene.rs`](src/aaa_scene.rs)) replacing synthetic textures with open-source CC-BY 4.0 & CC0 2K PBR assets converted directly into `.bcpack` 4K-block tiles:
+- **Real Open AAA Assets ([`tools/fetch_aaa_assets.py`](tools/fetch_aaa_assets.py)):** Khronos [`CarConcept.glb`](https://github.com/KhronosGroup/glTF-Sample-Assets) (`162,766` verts, `213,347` tris, `109` submeshes including `5` smoked glass parts, `14` PBR textures) + **9× Poly Haven CC0 2K PBR maps** (`asphalt_pit_lane`, `brick_pavement`, `concrete_wall_008` Albedo / DirectX Normal / ARM) + **`2048×1024` FP16 Sunset HDRI** (`belfast_sunset_puresky`) — totaling **`23` live BC1 textures / `728` 4K-tiles (`22.75 MiB BC1` ← `14.52 MiB BCPack`, `1.57x` ratio)**.
+- **Full PBR + DXR 1.1 + HDR Post Pipeline:** Cook-Torrance GGX BRDF ([`shaders/aaa_pbr.hlsl`](shaders/aaa_pbr.hlsl)), tangent-space normal mapping, wet asphalt puddle specular mask, equirectangular HDRI IBL ([`shaders/aaa_sky.hlsl`](shaders/aaa_sky.hlsl)), hardware DXR 1.1 Inline `RayQuery` shadows/reflections/1-spp diffuse RTGI, 2-pass A-Trous denoiser, 3-dispatch half-res HDR Bloom ([`shaders/aaa_bloom.hlsl`](shaders/aaa_bloom.hlsl)), and ACES Filmic composite ([`shaders/aaa_composite.hlsl`](shaders/aaa_composite.hlsl)).
+- **Interactive Streaming Controls:**
+  - **`[T]` Flush VRAM Wave:** Flushes all `728` tiles back to matte clay fallback geometry and re-streams the entire `22.75 MiB` 2K PBR texture set into VRAM in real time.
+  - **`[V]` X-Ray Tile Heatmap:** Overlays live 4K BCPack strip residency directly onto world UVs (**Magenta wireframe** = unstreamed clay, **Electric Cyan** = active decompressing wavefront, **Emerald Green** = resident tiles).
+  - **`[SPACE]` GPU Async vs 1T CPU**, **`[R]` DXR 1.1**, **`[G]` RTGI**, **`[C]` Camera Mode** (`Showroom 3/4 Orbit` / `Chase` / `FreeCam`).
+- **Measured on NVIDIA RTX 5080:**
+  - **`--flush-bench` (Full `22.75 MiB` / `728` 4K-tiles Flush → Residency):** GPU Async Compute (`3` batches) **`14.492 ms` kernel (`1.65 GB/s`) / `28.804 ms` wall (`0.83 GB/s`)** vs 1-Core CPU **`629.270 ms` (`37.9 MB/s`)** → **`43.4×` kernel speedup (`21.8×` wall speedup)**.
+  - **Live Showcase FPS (DXR 1.1 + RTGI + Bloom + ACES):** **`278.21 FPS` @ `1280×720`** (`--measure-frames 60 --debug`, DX12 Debug Layer clean, `0` errors) and **`235.18 FPS` @ `2560×1440`** (`--1440p --measure-frames 60`).
+
+---
+
 ## Live 3D Open-World Stress Demo (`v0.6.0` — 4.01M Tris + 1,536-TLAS RTGI + 32×32 LRU Streaming)
 
 ![v0.6.0 Open-World City: 4.01M Tris Mesh Shaders + 1536-TLAS DXR 1.1 Shadows, Reflections & Denoised RTGI](media/city_rtgi_v6.png)
@@ -154,6 +173,11 @@ target\release\bcpack-demo-gpu.exe
 
 REM 3. Unified toggleable demo ([SPACE] GPU <-> CPU, [R] DXR 1.1, [G] RTGI, [N] MeshShaders, [F] WorldStream, [C] Camera)
 target\release\bcpack-gpu-demo.exe --demo
+
+REM 4. Open AAA Showcase (downloads CC-BY / CC0 2K assets into gitignored aaa_assets/ and launches Showroom)
+python tools\fetch_aaa_assets.py
+target\release\bcpack-aaa-demo.exe --aaa-dir aaa_assets
+target\release\bcpack-aaa-demo.exe --aaa-dir aaa_assets --flush-bench
 ```
 
 Precompiled `bcpack_gpu.dll`, `bcpack_gpu.dll.lib`, and [`include/bcpack_gpu.h`](include/bcpack_gpu.h) are built in `target\release\` (and attached to the GitHub Release) for C/C++ integration into `IDStorageQueueX` wrappers:
@@ -167,7 +191,7 @@ BcPackDecodeAsync(ctx, stream, stream_len, num_blocks,
 BcPackWaitFence(ctx, fence, UINT32_MAX);
 ```
 
-To recompile all 14 HLSL shaders yourself (requires Windows 10/11 SDK `dxc.exe`):
+To recompile all 21 HLSL shader outputs yourself (requires Windows 10/11 SDK `dxc.exe`):
 ```bat
 shaders\compile_shaders.bat
 ```

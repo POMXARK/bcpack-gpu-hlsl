@@ -1,0 +1,2671 @@
+use crate::assets::{TILE_BC1_BYTES, TILE_BLOCKS};
+use crate::gltf_loader::{
+    find_aaa_assets_dir, load_glb_as_bcpack, load_hdr_fp16, load_png_as_bcpack, BcpackTexture2D,
+    LoadedGlbModel, PbrSubmesh, PbrVertex,
+};
+use crate::gpu_decoder::{
+    cmd_barriers, create_committed_buffer, dump_d3d12_info_queue, heap_props, pack_batch,
+    transition_barrier, uav_barrier, upload_slice, BcpackGpuDecoder, GpuContext,
+};
+use crate::raytracing::{supports_dxr_1_1, MAX_RT_INSTANCES};
+use crate::rtgi::RTGI_DENOISE_CS_DXIL;
+use bcpack::bc1::{self, QuadTable, Window};
+use png;
+use std::ffi::c_void;
+use std::fs::File;
+use std::io::BufWriter;
+use std::mem::{size_of, ManuallyDrop};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+use windows::core::{w, Interface, PCWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::Graphics::Dxgi::{
+    IDXGISwapChain3, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetWindowLongPtrW,
+    LoadCursorW, PeekMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
+    SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WM_DESTROY, WM_KEYDOWN,
+    WM_QUIT, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+};
+
+pub const AAA_SKY_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_sky_vs.dxil");
+pub const AAA_SKY_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_sky_ps.dxil");
+pub const AAA_PBR_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_pbr_vs.dxil");
+pub const AAA_PBR_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_pbr_ps.dxil");
+pub const AAA_BLOOM_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_bloom.dxil");
+pub const AAA_COMP_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_vs.dxil");
+pub const AAA_COMP_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_ps.dxil");
+
+const WIN_W: u32 = 1280;
+const WIN_H: u32 = 720;
+const TEX_SLOT_CAP: usize = 32;
+const SRV_TABLE_STRIDE: usize = 35; // t0..t31 textures, t32 envHdr, t33 tlas, t34 instColors
+const MAX_BATCH_TILES: usize = 256;
+
+#[derive(Clone, Debug)]
+pub struct AaaDemoConfig {
+    pub aaa_dir: Option<PathBuf>,
+    pub render_1440p: bool,
+    pub start_cpu: bool,
+    pub flush_bench: bool,
+    pub enable_debug: bool,
+    pub xray_mode: bool,
+    pub tiles_per_frame: usize,
+    pub measure_frames: Option<u32>,
+    pub flush_at_frame: Option<u32>,
+    pub screenshot_path: Option<PathBuf>,
+    pub screenshot_frames: u32,
+}
+
+impl Default for AaaDemoConfig {
+    fn default() -> Self {
+        Self {
+            aaa_dir: None,
+            render_1440p: false,
+            start_cpu: false,
+            flush_bench: false,
+            enable_debug: false,
+            xray_mode: false,
+            tiles_per_frame: 256,
+            measure_frames: None,
+            flush_at_frame: None,
+            screenshot_path: None,
+            screenshot_frames: 24,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SkyConstants {
+    inv_view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    time: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AaaDrawCB {
+    mvp: [f32; 16],
+    model: [f32; 16],
+    camera_pos: [f32; 4],
+    base_color: [f32; 4],
+    mat_params: [f32; 4],
+    emissive_time: [f32; 4],
+    tex_indices: [u32; 4],
+    tile_states: [f32; 4],
+}
+
+struct WindowState {
+    use_gpu: bool,
+    rt_enabled: bool,
+    rtgi_enabled: bool,
+    xray_enabled: bool,
+    cam_mode: u32, // 0=Showroom 3/4 Orbit, 1=Chase Drive, 2=Free Cam
+    flush_requested: bool,
+    should_quit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Mat4([f32; 16]);
+
+impl Mat4 {
+    #[allow(dead_code)]
+    fn identity() -> Self {
+        Self([
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ])
+    }
+
+    fn mul(&self, rhs: &Self) -> Self {
+        let mut r = [0.0f32; 16];
+        for c in 0..4 {
+            for row in 0..4 {
+                r[c * 4 + row] = (0..4).map(|k| self.0[k * 4 + row] * rhs.0[c * 4 + k]).sum();
+            }
+        }
+        Self(r)
+    }
+
+    fn translation(x: f32, y: f32, z: f32) -> Self {
+        Self([
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            x, y, z, 1.0,
+        ])
+    }
+
+    fn scale(x: f32, y: f32, z: f32) -> Self {
+        Self([
+            x, 0.0, 0.0, 0.0,
+            0.0, y, 0.0, 0.0,
+            0.0, 0.0, z, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ])
+    }
+
+    fn rotate_y(rad: f32) -> Self {
+        let c = rad.cos();
+        let s = rad.sin();
+        Self([
+            c, 0.0, -s, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            s, 0.0, c, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ])
+    }
+
+    fn look_at_rh(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> Self {
+        let f = norm3([eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]]);
+        let r = norm3(cross3(up, f));
+        let u = cross3(f, r);
+        Self([
+            r[0], u[0], f[0], 0.0,
+            r[1], u[1], f[1], 0.0,
+            r[2], u[2], f[2], 0.0,
+            -dot3(r, eye), -dot3(u, eye), -dot3(f, eye), 1.0,
+        ])
+    }
+
+    fn perspective_rh(fov_y_rad: f32, aspect: f32, zn: f32, zf: f32) -> Self {
+        let ys = 1.0 / (fov_y_rad * 0.5).tan();
+        let xs = ys / aspect;
+        let q = zf / (zn - zf);
+        Self([
+            xs, 0.0, 0.0, 0.0,
+            0.0, ys, 0.0, 0.0,
+            0.0, 0.0, q, -1.0,
+            0.0, 0.0, zn * q, 0.0,
+        ])
+    }
+
+    fn inverse(&self) -> Self {
+        let m = &self.0;
+        let mut inv = [0.0f32; 16];
+        inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
+            + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+        inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
+            - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+        inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
+            + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+        inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
+            - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+        inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
+            - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+        inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
+            + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+        inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
+            - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+        inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
+            + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+        inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
+            + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+        inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
+            - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+        inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
+            + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+        inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
+            - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+        inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
+            - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+        inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
+            + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+        inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
+            - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+        inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
+            + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+        let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+        let idet = if det.abs() > 1e-8 { 1.0 / det } else { 1.0 };
+        for v in &mut inv {
+            *v *= idet;
+        }
+        Self(inv)
+    }
+
+    fn to_3x4(&self) -> [f32; 12] {
+        let m = &self.0;
+        [
+            m[0], m[4], m[8], m[12],
+            m[1], m[5], m[9], m[13],
+            m[2], m[6], m[10], m[14],
+        ]
+    }
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn norm3(a: [f32; 3]) -> [f32; 3] {
+    let l = dot3(a, a).sqrt();
+    if l > 1e-6 {
+        [a[0] / l, a[1] / l, a[2] / l]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_DESTROY {
+        PostQuitMessage(0);
+        return LRESULT(0);
+    }
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+    if !ptr.is_null() && msg == WM_KEYDOWN {
+        let st = &mut *ptr;
+        match wparam.0 as u32 {
+            x if x == VK_SPACE.0 as u32 => st.use_gpu = !st.use_gpu,
+            x if x == b'T' as u32 => st.flush_requested = true,
+            x if x == b'V' as u32 => st.xray_enabled = !st.xray_enabled,
+            x if x == b'R' as u32 => st.rt_enabled = !st.rt_enabled,
+            x if x == b'G' as u32 => st.rtgi_enabled = !st.rtgi_enabled,
+            x if x == b'C' as u32 => st.cam_mode = (st.cam_mode + 1) % 3,
+            x if x == VK_ESCAPE.0 as u32 => {
+                st.should_quit = true;
+                PostQuitMessage(0);
+            }
+            _ => {}
+        }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn build_unit_box_pbr() -> (Vec<PbrVertex>, Vec<u32>) {
+    let faces: [([f32; 3], [f32; 4], [[f32; 3]; 4]); 6] = [
+        ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [[-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]]),
+        ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0, 1.0], [[0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [0.5, 0.5, -0.5]]),
+        ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 1.0], [[0.5, -0.5, 0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5]]),
+        ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0], [[-0.5, -0.5, -0.5], [-0.5, -0.5, 0.5], [-0.5, 0.5, 0.5], [-0.5, 0.5, -0.5]]),
+        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0], [[-0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5]]),
+        ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0, 1.0], [[-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, -0.5, 0.5], [-0.5, -0.5, 0.5]]),
+    ];
+    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let mut verts = Vec::with_capacity(24);
+    let mut inds = Vec::with_capacity(36);
+    for (fi, (n, t, corners)) in faces.iter().enumerate() {
+        let base = (fi * 4) as u32;
+        for (ci, pos) in corners.iter().enumerate() {
+            verts.push(PbrVertex {
+                pos: *pos,
+                normal: *n,
+                tangent: *t,
+                uv: uvs[ci],
+            });
+        }
+        inds.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    (verts, inds)
+}
+
+fn build_plane_pbr() -> (Vec<PbrVertex>, Vec<u32>) {
+    let n = [0.0, 1.0, 0.0];
+    let t = [1.0, 0.0, 0.0, 1.0];
+    let verts = vec![
+        PbrVertex { pos: [-0.5, 0.0, -0.5], normal: n, tangent: t, uv: [0.0, 0.0] },
+        PbrVertex { pos: [0.5, 0.0, -0.5], normal: n, tangent: t, uv: [1.0, 0.0] },
+        PbrVertex { pos: [0.5, 0.0, 0.5], normal: n, tangent: t, uv: [1.0, 1.0] },
+        PbrVertex { pos: [-0.5, 0.0, 0.5], normal: n, tangent: t, uv: [0.0, 1.0] },
+    ];
+    let inds = vec![0, 2, 1, 0, 3, 2];
+    (verts, inds)
+}
+
+struct AaaAssetPack {
+    car: LoadedGlbModel,
+    textures: Vec<BcpackTexture2D>, // 0..13 car + 14..22 PolyHaven 2K
+    asphalt_tex: [u32; 3],
+    promenade_tex: [u32; 3],
+    concrete_tex: [u32; 3],
+    hdri_w: u32,
+    hdri_h: u32,
+    hdri_fp16: Vec<u16>,
+    total_tiles: usize,
+    total_bcpack_bytes: usize,
+    total_bc1_bytes: usize,
+}
+
+fn load_aaa_asset_pack(aaa_dir: &Path, window: &Window, quads: &QuadTable) -> AaaAssetPack {
+    let cache_dir = aaa_dir.join("bcpack_cache");
+    std::fs::create_dir_all(&cache_dir).ok();
+
+    let mut car = load_glb_as_bcpack(&aaa_dir.join("CarConcept.glb"), &cache_dir, window, quads);
+    let mut textures = std::mem::take(&mut car.textures);
+
+    let mut push_2k = |file: &str, name: &str| -> u32 {
+        let idx = textures.len() as u32;
+        textures.push(load_png_as_bcpack(&aaa_dir.join(file), name, 2048, &cache_dir, window, quads));
+        idx
+    };
+
+    let asphalt_tex = [
+        push_2k("asphalt_albedo.png", "asphalt_albedo_2048"),
+        push_2k("asphalt_normal.png", "asphalt_normal_2048"),
+        push_2k("asphalt_arm.png", "asphalt_arm_2048"),
+    ];
+    let promenade_tex = [
+        push_2k("promenade_albedo.png", "promenade_albedo_2048"),
+        push_2k("promenade_normal.png", "promenade_normal_2048"),
+        push_2k("promenade_arm.png", "promenade_arm_2048"),
+    ];
+    let concrete_tex = [
+        push_2k("concrete_albedo.png", "concrete_albedo_2048"),
+        push_2k("concrete_normal.png", "concrete_normal_2048"),
+        push_2k("concrete_arm.png", "concrete_arm_2048"),
+    ];
+
+    assert!(
+        textures.len() <= TEX_SLOT_CAP,
+        "Expected <= {TEX_SLOT_CAP} PBR textures, got {}",
+        textures.len()
+    );
+
+    let (hdri_w, hdri_h, hdri_fp16) =
+        load_hdr_fp16(&aaa_dir.join("sunset_hdri_2k.fp16")).expect("sunset_hdri_2k.fp16 missing");
+
+    let total_tiles: usize = textures.iter().map(|t| t.num_strips).sum();
+    let total_bcpack_bytes: usize = textures.iter().flat_map(|t| t.bcpack_tiles.iter()).map(|b| b.len()).sum();
+    let total_bc1_bytes = total_tiles * TILE_BC1_BYTES;
+
+    AaaAssetPack {
+        car,
+        textures,
+        asphalt_tex,
+        promenade_tex,
+        concrete_tex,
+        hdri_w,
+        hdri_h,
+        hdri_fp16,
+        total_tiles,
+        total_bcpack_bytes,
+        total_bc1_bytes,
+    }
+}
+
+struct TileRef {
+    tex_idx: usize,
+    strip_idx: usize,
+}
+
+struct TextureResidency {
+    resident_strips: Vec<usize>,
+    num_strips: Vec<usize>,
+    fresh_timer: Vec<f32>, // >0 shortly after decompression for [V] X-Ray wave
+    pending: Vec<TileRef>,
+    pending_cursor: usize,
+}
+
+impl TextureResidency {
+    fn new(textures: &[BcpackTexture2D]) -> Self {
+        let mut num_strips = Vec::with_capacity(textures.len());
+        let mut pending = Vec::new();
+        for (ti, tex) in textures.iter().enumerate() {
+            num_strips.push(tex.num_strips);
+            for s in 0..tex.num_strips {
+                pending.push(TileRef { tex_idx: ti, strip_idx: s });
+            }
+        }
+        Self {
+            resident_strips: vec![0; textures.len()],
+            num_strips,
+            fresh_timer: vec![0.0; textures.len()],
+            pending,
+            pending_cursor: 0,
+        }
+    }
+
+    fn flush_to_clay(&mut self) {
+        self.resident_strips.fill(0);
+        self.fresh_timer.fill(0.0);
+        self.pending_cursor = 0;
+    }
+
+    fn tick_timers(&mut self, dt: f32) {
+        for v in &mut self.fresh_timer {
+            if *v > 0.0 {
+                *v = (*v - dt * 1.4).max(0.0);
+            }
+        }
+    }
+
+    fn take_batch(&mut self, count: usize) -> &[TileRef] {
+        let rem = self.pending.len().saturating_sub(self.pending_cursor);
+        let take = count.min(rem);
+        let start = self.pending_cursor;
+        self.pending_cursor += take;
+        &self.pending[start..start + take]
+    }
+
+    fn mark_resident(&mut self, tiles: &[TileRef]) {
+        for t in tiles {
+            self.resident_strips[t.tex_idx] = self.resident_strips[t.tex_idx].max(t.strip_idx + 1);
+            self.fresh_timer[t.tex_idx] = 1.0;
+        }
+    }
+
+    fn total_resident(&self) -> usize {
+        self.resident_strips.iter().sum()
+    }
+
+    fn total_tiles(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn state_for_tex(&self, idx: u32) -> f32 {
+        if idx == u32::MAX {
+            return -1.0;
+        }
+        let ti = idx as usize;
+        let res = self.resident_strips[ti];
+        let tot = self.num_strips[ti].max(1);
+        if res == 0 {
+            return -1.0;
+        }
+        if res < tot {
+            return (res as f32 / tot as f32).clamp(0.01, 0.99);
+        }
+        1.0 + self.fresh_timer[ti]
+    }
+}
+
+struct AaaDxrScene {
+    blas_car: ID3D12Resource,
+    blas_box: ID3D12Resource,
+    blas_plane: ID3D12Resource,
+    _blas_scratch: ID3D12Resource,
+    tlas_scratch: [ID3D12Resource; 2],
+    tlas_result: [ID3D12Resource; 2],
+    instances_upload: [ID3D12Resource; 2],
+    inst_colors_upload: [ID3D12Resource; 2],
+}
+
+impl AaaDxrScene {
+    unsafe fn new(
+        ctx: &mut GpuContext,
+        vb_buf: &ID3D12Resource,
+        ib_buf: &ID3D12Resource,
+        car_vert_count: u32,
+        car_idx_count: u32,
+        box_base_vert: u32,
+        box_idx_offset: u32,
+        plane_base_vert: u32,
+        plane_idx_offset: u32,
+    ) -> Option<Self> {
+        if !supports_dxr_1_1(&ctx.device) {
+            return None;
+        }
+        let dev5: ID3D12Device5 = ctx.device.cast().ok()?;
+        let vb_va = vb_buf.GetGPUVirtualAddress();
+        let ib_va = ib_buf.GetGPUVirtualAddress();
+        let stride = size_of::<PbrVertex>() as u64;
+
+        let geoms = [
+            D3D12_RAYTRACING_GEOMETRY_DESC {
+                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                        Transform3x4: 0,
+                        IndexFormat: DXGI_FORMAT_R32_UINT,
+                        VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                        IndexCount: car_idx_count,
+                        VertexCount: car_vert_count,
+                        IndexBuffer: ib_va,
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                            StartAddress: vb_va,
+                            StrideInBytes: stride,
+                        },
+                    },
+                },
+            },
+            D3D12_RAYTRACING_GEOMETRY_DESC {
+                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                        Transform3x4: 0,
+                        IndexFormat: DXGI_FORMAT_R32_UINT,
+                        VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                        IndexCount: 36,
+                        VertexCount: 24,
+                        IndexBuffer: ib_va + (box_idx_offset as u64) * 4,
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                            StartAddress: vb_va + (box_base_vert as u64) * stride,
+                            StrideInBytes: stride,
+                        },
+                    },
+                },
+            },
+            D3D12_RAYTRACING_GEOMETRY_DESC {
+                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                        Transform3x4: 0,
+                        IndexFormat: DXGI_FORMAT_R32_UINT,
+                        VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                        IndexCount: 6,
+                        VertexCount: 4,
+                        IndexBuffer: ib_va + (plane_idx_offset as u64) * 4,
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                            StartAddress: vb_va + (plane_base_vert as u64) * stride,
+                            StrideInBytes: stride,
+                        },
+                    },
+                },
+            },
+        ];
+
+        let mut blas_res = Vec::with_capacity(3);
+        let mut max_scratch = 256u64;
+        for g in &geoms {
+            let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                NumDescs: 1,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    pGeometryDescs: g,
+                },
+            };
+            let mut pre = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+            dev5.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut pre);
+            max_scratch = max_scratch.max(pre.ScratchDataSizeInBytes);
+            blas_res.push(create_committed_buffer(
+                &ctx.device,
+                D3D12_HEAP_TYPE_DEFAULT,
+                pre.ResultDataMaxSizeInBytes.max(256),
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+            ));
+        }
+
+        let blas_scratch = create_committed_buffer(
+            &ctx.device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            max_scratch,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+
+        let alloc: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        let cmd4: ID3D12GraphicsCommandList4 = list.cast().unwrap();
+        for (i, g) in geoms.iter().enumerate() {
+            let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                NumDescs: 1,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    pGeometryDescs: g,
+                },
+            };
+            let build_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: blas_res[i].GetGPUVirtualAddress(),
+                Inputs: inputs,
+                SourceAccelerationStructureData: 0,
+                ScratchAccelerationStructureData: blas_scratch.GetGPUVirtualAddress(),
+            };
+            cmd4.BuildRaytracingAccelerationStructure(&build_desc, None);
+            cmd_barriers(&list, vec![uav_barrier(&blas_res[i])]);
+        }
+        list.Close().unwrap();
+        let exec = [Some(list.cast::<ID3D12CommandList>().unwrap())];
+        ctx.queue.ExecuteCommandLists(&exec);
+        ctx.signal_and_wait();
+
+        let inst_bytes = (MAX_RT_INSTANCES * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>()) as u64;
+        let col_bytes = (MAX_RT_INSTANCES * size_of::<[f32; 4]>()) as u64;
+        let instances_upload = [
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, inst_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, inst_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+        ];
+        let inst_colors_upload = [
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, col_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, col_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+        ];
+        let tlas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
+            NumDescs: MAX_RT_INSTANCES as u32,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                InstanceDescs: instances_upload[0].GetGPUVirtualAddress(),
+            },
+        };
+        let mut tlas_pre = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        dev5.GetRaytracingAccelerationStructurePrebuildInfo(&tlas_inputs, &mut tlas_pre);
+
+        let tlas_scratch = [
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, tlas_pre.ScratchDataSizeInBytes.max(256), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, tlas_pre.ScratchDataSizeInBytes.max(256), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+        ];
+        let tlas_result = [
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, tlas_pre.ResultDataMaxSizeInBytes.max(256), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE),
+            create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, tlas_pre.ResultDataMaxSizeInBytes.max(256), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE),
+        ];
+
+        let blas_plane = blas_res.pop().unwrap();
+        let blas_box = blas_res.pop().unwrap();
+        let blas_car = blas_res.pop().unwrap();
+
+        Some(Self {
+            blas_car,
+            blas_box,
+            blas_plane,
+            _blas_scratch: blas_scratch,
+            tlas_scratch,
+            tlas_result,
+            instances_upload,
+            inst_colors_upload,
+        })
+    }
+
+    unsafe fn build_tlas(
+        &self,
+        cmd_list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        instances: &[(usize, [f32; 12], [f32; 4])], // (blas_kind 0=car,1=box,2=plane, 3x4, color)
+    ) {
+        let s = slot & 1;
+        let count = instances.len().min(MAX_RT_INSTANCES);
+        let mut descs = Vec::with_capacity(count);
+        let mut cols = Vec::with_capacity(count);
+        let blas_vas = [
+            self.blas_car.GetGPUVirtualAddress(),
+            self.blas_box.GetGPUVirtualAddress(),
+            self.blas_plane.GetGPUVirtualAddress(),
+        ];
+        for (idx, (kind, xf, col)) in instances.iter().take(count).enumerate() {
+            descs.push(D3D12_RAYTRACING_INSTANCE_DESC {
+                Transform: *xf,
+                _bitfield1: (idx as u32 & 0x00FF_FFFF) | (0xFFu32 << 24),
+                _bitfield2: 0,
+                AccelerationStructure: blas_vas[*kind],
+            });
+            cols.push(*col);
+        }
+        upload_slice(&self.instances_upload[s], &descs);
+        upload_slice(&self.inst_colors_upload[s], &cols);
+
+        let cmd4: ID3D12GraphicsCommandList4 = cmd_list.cast().unwrap();
+        let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
+            NumDescs: count as u32,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                InstanceDescs: self.instances_upload[s].GetGPUVirtualAddress(),
+            },
+        };
+        let build_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+            DestAccelerationStructureData: self.tlas_result[s].GetGPUVirtualAddress(),
+            Inputs: inputs,
+            SourceAccelerationStructureData: 0,
+            ScratchAccelerationStructureData: self.tlas_scratch[s].GetGPUVirtualAddress(),
+        };
+        cmd4.BuildRaytracingAccelerationStructure(&build_desc, None);
+        cmd_barriers(cmd_list, vec![uav_barrier(&self.tlas_result[s]), uav_barrier(&self.tlas_scratch[s])]);
+    }
+}
+
+unsafe fn create_fp16_tex(
+    device: &ID3D12Device,
+    w: u32,
+    h: u32,
+    flags: D3D12_RESOURCE_FLAGS,
+    init_state: D3D12_RESOURCE_STATES,
+    clear_rgba: Option<[f32; 4]>,
+) -> ID3D12Resource {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: w as u64,
+        Height: h,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: flags,
+        ..Default::default()
+    };
+    let cv = clear_rgba.map(|col| D3D12_CLEAR_VALUE {
+        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        Anonymous: D3D12_CLEAR_VALUE_0 { Color: col },
+    });
+    let mut res: Option<ID3D12Resource> = None;
+    device
+        .CreateCommittedResource(
+            &heap_props(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            init_state,
+            cv.as_ref().map(|c| c as *const D3D12_CLEAR_VALUE),
+            &mut res,
+        )
+        .expect("CreateCommittedResource fp16_tex");
+    res.unwrap()
+}
+
+unsafe fn create_root_sig(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    flags: D3D12_ROOT_SIGNATURE_FLAGS,
+) -> ID3D12RootSignature {
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: samplers.len() as u32,
+        pStaticSamplers: if samplers.is_empty() { std::ptr::null() } else { samplers.as_ptr() },
+        Flags: flags,
+    };
+    let mut blob = None;
+    let mut err = None;
+    D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, Some(&mut err))
+        .expect("D3D12SerializeRootSignature");
+    let blob = blob.unwrap();
+    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+    device.CreateRootSignature(0, bytes).expect("CreateRootSignature")
+}
+
+unsafe fn create_compute_pso_local(
+    device: &ID3D12Device,
+    root_sig: &ID3D12RootSignature,
+    dxil: &[u8],
+) -> ID3D12PipelineState {
+    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: ManuallyDrop::new(Some(root_sig.clone())),
+        CS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: dxil.as_ptr() as *const c_void,
+            BytecodeLength: dxil.len(),
+        },
+        NodeMask: 0,
+        CachedPSO: D3D12_CACHED_PIPELINE_STATE::default(),
+        Flags: D3D12_PIPELINE_STATE_FLAG_NONE,
+    };
+    let pso: ID3D12PipelineState = device.CreateComputePipelineState(&desc).expect("CreateComputePipelineState");
+    let _ = ManuallyDrop::take(&mut desc.pRootSignature);
+    pso
+}
+
+fn static_sampler(
+    reg: u32,
+    addr_u: D3D12_TEXTURE_ADDRESS_MODE,
+    addr_v: D3D12_TEXTURE_ADDRESS_MODE,
+    aniso: u32,
+) -> D3D12_STATIC_SAMPLER_DESC {
+    D3D12_STATIC_SAMPLER_DESC {
+        Filter: if aniso > 1 { D3D12_FILTER_ANISOTROPIC } else { D3D12_FILTER_MIN_MAG_MIP_LINEAR },
+        AddressU: addr_u,
+        AddressV: addr_v,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        MipLODBias: 0.0,
+        MaxAnisotropy: aniso,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK,
+        MinLOD: 0.0,
+        MaxLOD: D3D12_FLOAT32_MAX,
+        ShaderRegister: reg,
+        RegisterSpace: 0,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+struct AaaPostPipeline {
+    width: u32,
+    height: u32,
+    half_w: u32,
+    half_h: u32,
+    direct_hdr: ID3D12Resource,
+    raw_rtgi: ID3D12Resource,
+    normal_depth: ID3D12Resource,
+    denoise_a: ID3D12Resource,
+    denoise_b: ID3D12Resource,
+    bloom_a: ID3D12Resource,
+    bloom_b: ID3D12Resource,
+    gbuf_rtv_heap: ID3D12DescriptorHeap,
+    rtv_inc: u32,
+    denoise_root_sig: ID3D12RootSignature,
+    denoise_pso: ID3D12PipelineState,
+    bloom_root_sig: ID3D12RootSignature,
+    bloom_pso: ID3D12PipelineState,
+    comp_root_sig: ID3D12RootSignature,
+    comp_pso: ID3D12PipelineState,
+    // Descriptor indices inside main_srv_heap:
+    // 70..71 = raw_rtgi, normal_depth (pass 1 src)
+    // 72..73 = denoise_a, normal_depth (pass 2 src)
+    // 74 = denoise_a UAV, 75 = denoise_b UAV
+    // 76 = direct_hdr SRV, 77 = bloom_a SRV, 78 = bloom_b SRV, 79 = bloom_a UAV, 80 = bloom_b UAV
+    // 81..83 = direct_hdr, denoise_b, bloom_a (composite contiguous SRVs t0, t1, t2)
+    srv_inc: u32,
+}
+
+impl AaaPostPipeline {
+    unsafe fn new(
+        device: &ID3D12Device,
+        width: u32,
+        height: u32,
+        main_srv_heap: &ID3D12DescriptorHeap,
+        srv_inc: u32,
+    ) -> Self {
+        let half_w = (width / 2).max(1);
+        let half_h = (height / 2).max(1);
+        let direct_hdr = create_fp16_tex(
+            device, width, height,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            Some([0.14, 0.08, 0.14, 1.0]),
+        );
+        let raw_rtgi = create_fp16_tex(
+            device, width, height,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            Some([0.0, 0.0, 0.0, 0.0]),
+        );
+        let normal_depth = create_fp16_tex(
+            device, width, height,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            Some([0.0, 0.0, 0.0, 9999.0]),
+        );
+        let denoise_a = create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
+        let denoise_b = create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
+        let bloom_a = create_fp16_tex(device, half_w, half_h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
+        let bloom_b = create_fp16_tex(device, half_w, half_h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
+
+        let gbuf_rtv_heap: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 3,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })
+            .unwrap();
+        let rtv_inc = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        let rtv_base = gbuf_rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        for (i, tex) in [&direct_hdr, &raw_rtgi, &normal_depth].iter().enumerate() {
+            device.CreateRenderTargetView(
+                *tex,
+                None,
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: rtv_base.ptr + i * rtv_inc as usize },
+            );
+        }
+
+        let srv_base = main_srv_heap.GetCPUDescriptorHandleForHeapStart();
+        let cpu_at = |slot: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: srv_base.ptr + slot * srv_inc as usize,
+        };
+        let mut srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        srv_desc.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+        let mut uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        uav_desc.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
+
+        device.CreateShaderResourceView(&raw_rtgi, Some(&srv_desc), cpu_at(70));
+        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(71));
+        device.CreateShaderResourceView(&denoise_a, Some(&srv_desc), cpu_at(72));
+        device.CreateShaderResourceView(&normal_depth, Some(&srv_desc), cpu_at(73));
+        device.CreateUnorderedAccessView(&denoise_a, None, Some(&uav_desc), cpu_at(74));
+        device.CreateUnorderedAccessView(&denoise_b, None, Some(&uav_desc), cpu_at(75));
+
+        device.CreateShaderResourceView(&direct_hdr, Some(&srv_desc), cpu_at(76));
+        device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(77));
+        device.CreateShaderResourceView(&bloom_b, Some(&srv_desc), cpu_at(78));
+        device.CreateUnorderedAccessView(&bloom_a, None, Some(&uav_desc), cpu_at(79));
+        device.CreateUnorderedAccessView(&bloom_b, None, Some(&uav_desc), cpu_at(80));
+
+        device.CreateShaderResourceView(&direct_hdr, Some(&srv_desc), cpu_at(81));
+        device.CreateShaderResourceView(&denoise_b, Some(&srv_desc), cpu_at(82));
+        device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(83));
+
+        // Denoise root sig (CB b0 + SRV range(2) t0..t1 + UAV range(1) u0)
+        let d_srv_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 2,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let d_uav_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let d_params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &d_srv_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &d_uav_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let denoise_root_sig = create_root_sig(device, &d_params, &[], D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        let denoise_pso = create_compute_pso_local(device, &denoise_root_sig, RTGI_DENOISE_CS_DXIL);
+
+        // Bloom root sig (CB b0 + SRV range(1) t0 + UAV range(1) u0 + clamp sampler s0)
+        let b_srv_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let b_uav_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let b_params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &b_srv_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &b_uav_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let clamp_samp = static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 1);
+        let bloom_root_sig = create_root_sig(device, &b_params, &[clamp_samp], D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        let bloom_pso = create_compute_pso_local(device, &bloom_root_sig, AAA_BLOOM_CS_DXIL);
+
+        // Composite root sig (CB b0 + SRV range(3) t0..t2 + clamp sampler s0)
+        let c_srv_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 3,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let c_params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &c_srv_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let comp_root_sig = create_root_sig(device, &c_params, &[clamp_samp], D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        let mut rt_formats = [DXGI_FORMAT_UNKNOWN; 8];
+        rt_formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let mut comp_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: ManuallyDrop::new(Some(comp_root_sig.clone())),
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: AAA_COMP_VS_DXIL.as_ptr() as *const c_void, BytecodeLength: AAA_COMP_VS_DXIL.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: AAA_COMP_PS_DXIL.as_ptr() as *const c_void, BytecodeLength: AAA_COMP_PS_DXIL.len() },
+            BlendState: D3D12_BLEND_DESC {
+                RenderTarget: [D3D12_RENDER_TARGET_BLEND_DESC {
+                    RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                    ..Default::default()
+                }; 8],
+                ..Default::default()
+            },
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: false.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                ..Default::default()
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            RTVFormats: rt_formats,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let comp_pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&comp_desc).expect("comp_pso");
+        let _ = ManuallyDrop::take(&mut comp_desc.pRootSignature);
+
+        Self {
+            width,
+            height,
+            half_w,
+            half_h,
+            direct_hdr,
+            raw_rtgi,
+            normal_depth,
+            denoise_a,
+            denoise_b,
+            bloom_a,
+            bloom_b,
+            gbuf_rtv_heap,
+            rtv_inc,
+            denoise_root_sig,
+            denoise_pso,
+            bloom_root_sig,
+            bloom_pso,
+            comp_root_sig,
+            comp_pso,
+            srv_inc,
+        }
+    }
+
+    unsafe fn begin_gbuffer(&self, cmd: &ID3D12GraphicsCommandList, dsv_handle: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let base = self.gbuf_rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        let rtvs = [
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + self.rtv_inc as usize },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + 2 * self.rtv_inc as usize },
+        ];
+        cmd.ClearRenderTargetView(rtvs[0], &[0.14, 0.08, 0.14, 1.0], None);
+        cmd.ClearRenderTargetView(rtvs[1], &[0.0, 0.0, 0.0, 0.0], None);
+        cmd.ClearRenderTargetView(rtvs[2], &[0.0, 0.0, 0.0, 9999.0], None);
+        cmd.ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, &[]);
+        cmd.OMSetRenderTargets(3, Some(rtvs.as_ptr()), false, Some(&dsv_handle));
+        let vp = D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: self.width as f32,
+            Height: self.height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let sc = RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
+        cmd.RSSetViewports(&[vp]);
+        cmd.RSSetScissorRects(&[sc]);
+    }
+
+    unsafe fn run_post_and_composite(
+        &self,
+        cmd: &ID3D12GraphicsCommandList,
+        main_srv_heap: &ID3D12DescriptorHeap,
+        backbuffer_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        out_w: u32,
+        out_h: u32,
+        rtgi_enabled: bool,
+        time: f32,
+    ) {
+        let srv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let gpu_base = main_srv_heap.GetGPUDescriptorHandleForHeapStart();
+        let gpu_at = |slot: usize| D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: gpu_base.ptr + (slot * self.srv_inc as usize) as u64,
+        };
+
+        cmd_barriers(
+            cmd,
+            vec![
+                transition_barrier(&self.direct_hdr, D3D12_RESOURCE_STATE_RENDER_TARGET, srv_state),
+                transition_barrier(&self.raw_rtgi, D3D12_RESOURCE_STATE_RENDER_TARGET, srv_state),
+                transition_barrier(&self.normal_depth, D3D12_RESOURCE_STATE_RENDER_TARGET, srv_state),
+            ],
+        );
+
+        cmd.SetDescriptorHeaps(&[Some(main_srv_heap.clone())]);
+
+        // 1. 2-Pass A-Trous Bilateral Denoiser for 1-spp Diffuse RTGI
+        if rtgi_enabled {
+            let gx = self.width.div_ceil(8);
+            let gy = self.height.div_ceil(8);
+            cmd.SetComputeRootSignature(&self.denoise_root_sig);
+            cmd.SetPipelineState(&self.denoise_pso);
+            cmd_barriers(cmd, vec![transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            let c1 = [self.width, self.height, 1u32, 0u32];
+            cmd.SetComputeRoot32BitConstants(0, 4, c1.as_ptr() as *const c_void, 0);
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(70));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(74));
+            cmd.Dispatch(gx, gy, 1);
+
+            cmd_barriers(
+                cmd,
+                vec![
+                    uav_barrier(&self.denoise_a),
+                    transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                ],
+            );
+            let c2 = [self.width, self.height, 2u32, 0u32];
+            cmd.SetComputeRoot32BitConstants(0, 4, c2.as_ptr() as *const c_void, 0);
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(72));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(75));
+            cmd.Dispatch(gx, gy, 1);
+
+            cmd_barriers(
+                cmd,
+                vec![
+                    uav_barrier(&self.denoise_b),
+                    transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                    transition_barrier(&self.denoise_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                ],
+            );
+        } else {
+            cmd_barriers(cmd, vec![transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
+        }
+
+        // 2. 3-Dispatch Half-Res HDR Bloom (Bright-pass downsample -> H blur -> V blur)
+        let bx = self.half_w.div_ceil(8);
+        let by = self.half_h.div_ceil(8);
+        cmd.SetComputeRootSignature(&self.bloom_root_sig);
+        cmd.SetPipelineState(&self.bloom_pso);
+
+        cmd_barriers(cmd, vec![transition_barrier(&self.bloom_a, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        let b0 = [self.half_w, self.half_h, 0u32, 1.05f32.to_bits()];
+        cmd.SetComputeRoot32BitConstants(0, 4, b0.as_ptr() as *const c_void, 0);
+        cmd.SetComputeRootDescriptorTable(1, gpu_at(76)); // direct_hdr
+        cmd.SetComputeRootDescriptorTable(2, gpu_at(79)); // bloom_a UAV
+        cmd.Dispatch(bx, by, 1);
+
+        cmd_barriers(
+            cmd,
+            vec![
+                uav_barrier(&self.bloom_a),
+                transition_barrier(&self.bloom_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                transition_barrier(&self.bloom_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ],
+        );
+        let b1 = [self.half_w, self.half_h, 1u32, 0u32];
+        cmd.SetComputeRoot32BitConstants(0, 4, b1.as_ptr() as *const c_void, 0);
+        cmd.SetComputeRootDescriptorTable(1, gpu_at(77)); // bloom_a SRV
+        cmd.SetComputeRootDescriptorTable(2, gpu_at(80)); // bloom_b UAV
+        cmd.Dispatch(bx, by, 1);
+
+        cmd_barriers(
+            cmd,
+            vec![
+                uav_barrier(&self.bloom_b),
+                transition_barrier(&self.bloom_b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                transition_barrier(&self.bloom_a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ],
+        );
+        let b2 = [self.half_w, self.half_h, 2u32, 0u32];
+        cmd.SetComputeRoot32BitConstants(0, 4, b2.as_ptr() as *const c_void, 0);
+        cmd.SetComputeRootDescriptorTable(1, gpu_at(78)); // bloom_b SRV
+        cmd.SetComputeRootDescriptorTable(2, gpu_at(79)); // bloom_a UAV
+        cmd.Dispatch(bx, by, 1);
+
+        cmd_barriers(
+            cmd,
+            vec![
+                uav_barrier(&self.bloom_a),
+                transition_barrier(&self.bloom_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                transition_barrier(&self.bloom_b, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            ],
+        );
+
+        // 3. Final Composite Pass: HDR + RTGI + Bloom + ACES + sRGB + Vignette
+        cmd.OMSetRenderTargets(1, Some(&backbuffer_rtv), false, None);
+        let vp = D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: out_w as f32,
+            Height: out_h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let sc = RECT { left: 0, top: 0, right: out_w as i32, bottom: out_h as i32 };
+        cmd.RSSetViewports(&[vp]);
+        cmd.RSSetScissorRects(&[sc]);
+
+        cmd.SetGraphicsRootSignature(&self.comp_root_sig);
+        cmd.SetPipelineState(&self.comp_pso);
+        let comp_cb = [
+            if rtgi_enabled { 0.85f32 } else { 0.0f32 },
+            0.22f32,
+            1.15f32,
+            time,
+        ];
+        cmd.SetGraphicsRoot32BitConstants(0, 4, comp_cb.as_ptr() as *const c_void, 0);
+        cmd.SetGraphicsRootDescriptorTable(1, gpu_at(81)); // direct_hdr, denoise_b, bloom_a
+        cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd.DrawInstanced(3, 1, 0, 0);
+
+        cmd_barriers(
+            cmd,
+            vec![
+                transition_barrier(&self.direct_hdr, srv_state, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                transition_barrier(&self.raw_rtgi, srv_state, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                transition_barrier(&self.normal_depth, srv_state, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&self.bloom_a, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            ],
+        );
+    }
+}
+
+fn run_flush_bench_mode(pack: &AaaAssetPack, window: &Window, quads: &QuadTable, enable_debug: bool) {
+    let mut ctx = GpuContext::new(enable_debug);
+    let max_tiles = MAX_BATCH_TILES;
+    let mut gpu_dec = BcpackGpuDecoder::new(
+        &mut ctx,
+        window,
+        quads,
+        max_tiles,
+        max_tiles * TILE_BLOCKS,
+        max_tiles * 64 * 1024,
+    );
+
+    println!(
+        "[aaa-flush-bench] Adapter: {} | Assets: {} PBR textures (2K PolyHaven + CarConcept glTF), {} tiles ({:.2} MiB BC1 <- {:.2} MiB BCPack, ratio {:.2}x)",
+        ctx.adapter_name,
+        pack.textures.len(),
+        pack.total_tiles,
+        pack.total_bc1_bytes as f64 / (1024.0 * 1024.0),
+        pack.total_bcpack_bytes as f64 / (1024.0 * 1024.0),
+        pack.total_bc1_bytes as f64 / pack.total_bcpack_bytes.max(1) as f64,
+    );
+
+    // 1) GPU Async Compute full VRAM Flush -> Residency wave (256 tiles/batch)
+    let gpu_start = Instant::now();
+    let mut gpu_kernel_ms = 0.0f64;
+    let mut gpu_batches = 0usize;
+    let all_refs: Vec<TileRef> = pack
+        .textures
+        .iter()
+        .enumerate()
+        .flat_map(|(ti, tex)| (0..tex.num_strips).map(move |s| TileRef { tex_idx: ti, strip_idx: s }))
+        .collect();
+
+    for (bi, chunk) in all_refs.chunks(MAX_BATCH_TILES).enumerate() {
+        let slot = bi & 1;
+        let batch = pack_batch(chunk.iter().map(|t| {
+            (pack.textures[t.tex_idx].bcpack_tiles[t.strip_idx].as_slice(), TILE_BLOCKS)
+        }));
+        let fence = gpu_dec.submit_slot_async_compute(&mut ctx, slot, &batch);
+        let _ = ctx.wait_compute_cpu(fence, u32::MAX);
+        gpu_kernel_ms += gpu_dec.read_slot_kernel_ms(&ctx, slot);
+        gpu_batches += 1;
+    }
+    let gpu_wall_ms = gpu_start.elapsed().as_secs_f64() * 1000.0;
+    let gpu_kernel_gbps = (pack.total_bc1_bytes as f64 / 1e9) / (gpu_kernel_ms / 1000.0);
+    let gpu_eff_gbps = (pack.total_bc1_bytes as f64 / 1e9) / (gpu_wall_ms / 1000.0);
+
+    // 2) CPU 1-Thread Baseline over identical 728 tiles
+    let cpu_start = Instant::now();
+    for t in &all_refs {
+        let dec = bc1::decode(&pack.textures[t.tex_idx].bcpack_tiles[t.strip_idx], TILE_BLOCKS, window, quads)
+            .expect("cpu bc1 decode");
+        std::hint::black_box(dec.blocks[0]);
+    }
+    let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1000.0;
+    let cpu_mbps = (pack.total_bc1_bytes as f64 / 1e6) / (cpu_ms / 1000.0);
+
+    println!(
+        "[aaa-flush-bench] GPU Async Compute: batches={}, kernel={:.3} ms ({:.2} GB/s), wall={:.3} ms ({:.2} GB/s)",
+        gpu_batches, gpu_kernel_ms, gpu_kernel_gbps, gpu_wall_ms, gpu_eff_gbps
+    );
+    println!(
+        "[aaa-flush-bench] CPU 1-Thread Baseline: {:.3} ms ({:.1} MB/s) -> GPU Kernel Speedup = {:.1}x | GPU Wall Speedup = {:.1}x",
+        cpu_ms,
+        cpu_mbps,
+        cpu_ms / gpu_kernel_ms.max(1e-4),
+        cpu_ms / gpu_wall_ms.max(1e-4),
+    );
+    if enable_debug {
+        unsafe { dump_d3d12_info_queue(&ctx.device) };
+    }
+}
+
+pub fn run_aaa_demo(cfg: AaaDemoConfig) {
+    let aaa_dir = cfg
+        .aaa_dir
+        .clone()
+        .or_else(|| find_aaa_assets_dir(Path::new("assets")))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("aaa_assets")))
+                .filter(|p| p.join("CarConcept.glb").exists())
+        })
+        .expect("Could not locate aaa_assets directory; pass --aaa-dir <path>");
+    let window_tbl = Window::default_table();
+    let quads_tbl = QuadTable::default_table();
+    let pack = load_aaa_asset_pack(&aaa_dir, &window_tbl, &quads_tbl);
+
+    if cfg.flush_bench {
+        run_flush_bench_mode(&pack, &window_tbl, &quads_tbl, cfg.enable_debug);
+        return;
+    }
+
+    unsafe {
+        let mut ctx = GpuContext::new(cfg.enable_debug);
+        let mut gpu_dec = BcpackGpuDecoder::new(
+            &mut ctx,
+            &window_tbl,
+            &quads_tbl,
+            MAX_BATCH_TILES,
+            MAX_BATCH_TILES * TILE_BLOCKS,
+            MAX_BATCH_TILES * 64 * 1024,
+        );
+
+        // Win32 Window
+        let hinst = GetModuleHandleW(None).expect("GetModuleHandleW");
+        let class_name = w!("BcpackAaaShowcaseWndV7");
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: hinst.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+        let mut rect = RECT { left: 0, top: 0, right: WIN_W as i32, bottom: WIN_H as i32 };
+        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false).unwrap();
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
+            w!("BCPack AAA Showcase v0.7.0 (2K PBR + HDRI IBL + DXR 1.1) - Initializing..."),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            None,
+            None,
+            hinst,
+            None,
+        )
+        .expect("CreateWindowExW");
+
+        let mut wstate = Box::new(WindowState {
+            use_gpu: !cfg.start_cpu,
+            rt_enabled: true,
+            rtgi_enabled: true,
+            xray_enabled: cfg.xray_mode,
+            cam_mode: 0,
+            flush_requested: false,
+            should_quit: false,
+        });
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *wstate as *mut WindowState) as isize);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+
+        let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: WIN_W,
+            Height: WIN_H,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 3,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
+            Flags: 0,
+        };
+        let sc1 = ctx.factory.CreateSwapChainForHwnd(&ctx.queue, hwnd, &sc_desc, None, None).unwrap();
+        let swap_chain: IDXGISwapChain3 = sc1.cast().unwrap();
+
+        let bb_rtv_heap: ID3D12DescriptorHeap = ctx
+            .device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 3,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })
+            .unwrap();
+        let dsv_heap: ID3D12DescriptorHeap = ctx
+            .device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })
+            .unwrap();
+        // 0..34 (table slot 0) + 35..69 (table slot 1) + 70..83 (RTGI / Bloom / Composite)
+        let main_srv_heap: ID3D12DescriptorHeap = ctx
+            .device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 96,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .unwrap();
+
+        let rtv_inc = ctx.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        let srv_inc = ctx.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let mut backbuffers = Vec::with_capacity(3);
+        let bb_base = bb_rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        for i in 0..3u32 {
+            let bb: ID3D12Resource = swap_chain.GetBuffer(i).unwrap();
+            ctx.device.CreateRenderTargetView(
+                &bb,
+                None,
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: bb_base.ptr + (i * rtv_inc) as usize },
+            );
+            backbuffers.push(bb);
+        }
+
+        let (render_w, render_h) = if cfg.render_1440p { (2560u32, 1440u32) } else { (WIN_W, WIN_H) };
+        let depth_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: render_w as u64,
+            Height: render_h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let depth_clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            Anonymous: D3D12_CLEAR_VALUE_0 {
+                DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 1.0, Stencil: 0 },
+            },
+        };
+        let mut depth_tex: Option<ID3D12Resource> = None;
+        ctx.device
+            .CreateCommittedResource(
+                &heap_props(D3D12_HEAP_TYPE_DEFAULT),
+                D3D12_HEAP_FLAG_NONE,
+                &depth_desc,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                Some(&depth_clear),
+                &mut depth_tex,
+            )
+            .unwrap();
+        let _depth_tex = depth_tex.unwrap();
+        let dsv_handle = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+        ctx.device.CreateDepthStencilView(&_depth_tex, None, dsv_handle);
+
+        // Unified Geometry Buffer (CarConcept + UnitBox + GroundPlane)
+        let mut all_verts = pack.car.vertices.clone();
+        let mut all_indices = pack.car.indices.clone();
+        let car_vert_count = all_verts.len() as u32;
+        let car_idx_count = all_indices.len() as u32;
+
+        let (box_v, box_i) = build_unit_box_pbr();
+        let box_base_vert = all_verts.len() as u32;
+        let box_idx_offset = all_indices.len() as u32;
+        all_verts.extend_from_slice(&box_v);
+        all_indices.extend_from_slice(&box_i);
+
+        let (plane_v, plane_i) = build_plane_pbr();
+        let plane_base_vert = all_verts.len() as u32;
+        let plane_idx_offset = all_indices.len() as u32;
+        all_verts.extend_from_slice(&plane_v);
+        all_indices.extend_from_slice(&plane_i);
+
+        let vb_bytes = (all_verts.len() * size_of::<PbrVertex>()) as u64;
+        let ib_bytes = (all_indices.len() * size_of::<u32>()) as u64;
+        let vb_up = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, vb_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let ib_up = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, ib_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        upload_slice(&vb_up, &all_verts);
+        upload_slice(&ib_up, &all_indices);
+        let vb_def = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, vb_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let ib_def = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, ib_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        // Live 23 PBR BC1 Textures + 1 Dummy Fallback + 1 FP16 HDRI Texture
+        let mut pbr_textures = Vec::with_capacity(pack.textures.len());
+        for t in &pack.textures {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: t.width as u64,
+                Height: t.height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_BC1_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            ctx.device
+                .CreateCommittedResource(
+                    &heap_props(D3D12_HEAP_TYPE_DEFAULT),
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    None,
+                    &mut res,
+                )
+                .unwrap();
+            pbr_textures.push(res.unwrap());
+        }
+
+        // Dummy 1x1 white RGBA8 texture for unused tN slots (<32)
+        let dummy_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        let mut dummy_tex: Option<ID3D12Resource> = None;
+        ctx.device.CreateCommittedResource(&heap_props(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE, &dummy_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut dummy_tex).unwrap();
+        let dummy_tex = dummy_tex.unwrap();
+        let dummy_up = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, 512, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        upload_slice(&dummy_up, &[255u8, 255, 255, 255]);
+
+        // 2K Sunset HDRI FP16 Texture
+        let hdri_tex = create_fp16_tex(&ctx.device, pack.hdri_w, pack.hdri_h, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, None);
+        let hdri_row_pitch = (pack.hdri_w * 8).div_ceil(256) * 256;
+        let hdri_up = create_committed_buffer(
+            &ctx.device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            (hdri_row_pitch * pack.hdri_h) as u64,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        upload_slice(&hdri_up, &pack.hdri_fp16);
+
+        // One-shot Upload Geometry + Dummy + HDRI + CPU Upload Buffer for CPU fallback streaming
+        let init_alloc: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let init_cmd: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &init_alloc, None).unwrap();
+        init_cmd.CopyBufferRegion(&vb_def, 0, &vb_up, 0, vb_bytes);
+        init_cmd.CopyBufferRegion(&ib_def, 0, &ib_up, 0, ib_bytes);
+
+        let mut d_dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(dummy_tex.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let mut d_src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(dummy_up.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 1,
+                        Height: 1,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        init_cmd.CopyTextureRegion(&d_dst, 0, 0, 0, &d_src, None);
+        let _ = ManuallyDrop::take(&mut d_dst.pResource);
+        let _ = ManuallyDrop::take(&mut d_src.pResource);
+
+        let mut h_dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(hdri_tex.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let mut h_src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(hdri_up.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        Width: pack.hdri_w,
+                        Height: pack.hdri_h,
+                        Depth: 1,
+                        RowPitch: hdri_row_pitch,
+                    },
+                },
+            },
+        };
+        init_cmd.CopyTextureRegion(&h_dst, 0, 0, 0, &h_src, None);
+        let _ = ManuallyDrop::take(&mut h_dst.pResource);
+        let _ = ManuallyDrop::take(&mut h_src.pResource);
+
+        cmd_barriers(
+            &init_cmd,
+            vec![
+                transition_barrier(&vb_def, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+                transition_barrier(&ib_def, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER),
+                transition_barrier(&dummy_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                transition_barrier(&hdri_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            ],
+        );
+        init_cmd.Close().unwrap();
+        let exec = [Some(init_cmd.cast::<ID3D12CommandList>().unwrap())];
+        ctx.queue.ExecuteCommandLists(&exec);
+        ctx.signal_and_wait();
+
+        let dxr = AaaDxrScene::new(
+            &mut ctx,
+            &vb_def,
+            &ib_def,
+            car_vert_count,
+            car_idx_count,
+            box_base_vert,
+            box_idx_offset,
+            plane_base_vert,
+            plane_idx_offset,
+        );
+        if dxr.is_none() {
+            wstate.rt_enabled = false;
+            wstate.rtgi_enabled = false;
+        }
+
+        // Populate main_srv_heap slots 0..34 (frame slot 0) and 35..69 (frame slot 1)
+        let srv_base = main_srv_heap.GetCPUDescriptorHandleForHeapStart();
+        let cpu_at = |idx: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: srv_base.ptr + idx * srv_inc as usize,
+        };
+        for frame_slot in 0..2 {
+            let base = frame_slot * SRV_TABLE_STRIDE;
+            for i in 0..TEX_SLOT_CAP {
+                if i < pbr_textures.len() {
+                    let mut sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_BC1_UNORM,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        ..Default::default()
+                    };
+                    sd.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+                    ctx.device.CreateShaderResourceView(&pbr_textures[i], Some(&sd), cpu_at(base + i));
+                } else {
+                    let mut sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        ..Default::default()
+                    };
+                    sd.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+                    ctx.device.CreateShaderResourceView(&dummy_tex, Some(&sd), cpu_at(base + i));
+                }
+            }
+            let mut hdri_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            hdri_sd.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+            ctx.device.CreateShaderResourceView(&hdri_tex, Some(&hdri_sd), cpu_at(base + 32));
+
+            if let Some(ref rt) = dxr {
+                let mut tlas_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    ..Default::default()
+                };
+                tlas_sd.Anonymous.RaytracingAccelerationStructure.Location = rt.tlas_result[frame_slot].GetGPUVirtualAddress();
+                ctx.device.CreateShaderResourceView(None, Some(&tlas_sd), cpu_at(base + 33));
+
+                let mut col_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    ..Default::default()
+                };
+                col_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: MAX_RT_INSTANCES as u32,
+                    StructureByteStride: size_of::<[f32; 4]>() as u32,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                };
+                ctx.device.CreateShaderResourceView(&rt.inst_colors_upload[frame_slot], Some(&col_sd), cpu_at(base + 34));
+            } else {
+                // Fallback SRVs when DXR is absent
+                let mut buf_sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    ..Default::default()
+                };
+                buf_sd.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 1,
+                    StructureByteStride: 16,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                };
+                ctx.device.CreateShaderResourceView(&vb_def, Some(&buf_sd), cpu_at(base + 33));
+                ctx.device.CreateShaderResourceView(&vb_def, Some(&buf_sd), cpu_at(base + 34));
+            }
+        }
+
+        let post = AaaPostPipeline::new(&ctx.device, render_w, render_h, &main_srv_heap, srv_inc);
+
+        // Sky PSO
+        let sky_srv_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let sky_params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 20 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &sky_srv_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let env_samp = static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 1);
+        let sky_root_sig = create_root_sig(&ctx.device, &sky_params, &[env_samp], D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        let mut gbuf_formats = [DXGI_FORMAT_UNKNOWN; 8];
+        gbuf_formats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        gbuf_formats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        gbuf_formats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let gbuf_blends = [D3D12_RENDER_TARGET_BLEND_DESC {
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        }; 8];
+
+        let mut sky_pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: ManuallyDrop::new(Some(sky_root_sig.clone())),
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: AAA_SKY_VS_DXIL.as_ptr() as *const c_void, BytecodeLength: AAA_SKY_VS_DXIL.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: AAA_SKY_PS_DXIL.as_ptr() as *const c_void, BytecodeLength: AAA_SKY_PS_DXIL.len() },
+            BlendState: D3D12_BLEND_DESC { RenderTarget: gbuf_blends, ..Default::default() },
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                DepthFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                ..Default::default()
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 3,
+            RTVFormats: gbuf_formats,
+            DSVFormat: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let sky_pso: ID3D12PipelineState = ctx.device.CreateGraphicsPipelineState(&sky_pso_desc).unwrap();
+        let _ = ManuallyDrop::take(&mut sky_pso_desc.pRootSignature);
+
+        // AAA PBR PSO
+        let pbr_srv_rng = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: SRV_TABLE_STRIDE as u32,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let pbr_params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: (size_of::<AaaDrawCB>() / 4) as u32,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &pbr_srv_rng },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let pbr_samplers = [
+            static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, 8),
+            static_sampler(1, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 1),
+        ];
+        let pbr_root_sig = create_root_sig(
+            &ctx.device,
+            &pbr_params,
+            &pbr_samplers,
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        );
+
+        let input_elems = [
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: windows::core::PCSTR(b"POSITION\0".as_ptr()),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 0,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: windows::core::PCSTR(b"NORMAL\0".as_ptr()),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 12,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: windows::core::PCSTR(b"TANGENT\0".as_ptr()),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 24,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: windows::core::PCSTR(b"TEXCOORD\0".as_ptr()),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 40,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+        ];
+        let mut pbr_pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: ManuallyDrop::new(Some(pbr_root_sig.clone())),
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: AAA_PBR_VS_DXIL.as_ptr() as *const c_void, BytecodeLength: AAA_PBR_VS_DXIL.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: AAA_PBR_PS_DXIL.as_ptr() as *const c_void, BytecodeLength: AAA_PBR_PS_DXIL.len() },
+            BlendState: D3D12_BLEND_DESC { RenderTarget: gbuf_blends, ..Default::default() },
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE, // glTF doubleSided trim/grilles/lights
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                DepthFunc: D3D12_COMPARISON_FUNC_LESS,
+                ..Default::default()
+            },
+            InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: input_elems.as_ptr(),
+                NumElements: input_elems.len() as u32,
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 3,
+            RTVFormats: gbuf_formats,
+            DSVFormat: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let pbr_pso: ID3D12PipelineState = ctx.device.CreateGraphicsPipelineState(&pbr_pso_desc).unwrap();
+        let _ = ManuallyDrop::take(&mut pbr_pso_desc.pRootSignature);
+
+        // Per-frame direct command allocators & lists
+        let cmd_allocs: [ID3D12CommandAllocator; 2] = [
+            ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(),
+            ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(),
+        ];
+        let cmd_lists: [ID3D12GraphicsCommandList; 2] = [
+            ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &cmd_allocs[0], None).unwrap(),
+            ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &cmd_allocs[1], None).unwrap(),
+        ];
+        cmd_lists[0].Close().unwrap();
+        cmd_lists[1].Close().unwrap();
+
+        // CPU fallback upload buffer for MAX_BATCH_TILES
+        let cpu_upload_buf = create_committed_buffer(
+            &ctx.device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            (MAX_BATCH_TILES * TILE_BC1_BYTES) as u64,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        let mut cpu_scratch = vec![0u8; MAX_BATCH_TILES * TILE_BC1_BYTES];
+
+        // Screenshot readback
+        let ss_row_pitch = (WIN_W * 4).div_ceil(256) * 256;
+        let ss_readback = create_committed_buffer(
+            &ctx.device,
+            D3D12_HEAP_TYPE_READBACK,
+            (ss_row_pitch * WIN_H) as u64,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+
+        let mut residency = TextureResidency::new(&pack.textures);
+
+        let vb_view = D3D12_VERTEX_BUFFER_VIEW {
+            BufferLocation: vb_def.GetGPUVirtualAddress(),
+            SizeInBytes: vb_bytes as u32,
+            StrideInBytes: size_of::<PbrVertex>() as u32,
+        };
+        let ib_view = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: ib_def.GetGPUVirtualAddress(),
+            SizeInBytes: ib_bytes as u32,
+            Format: DXGI_FORMAT_R32_UINT,
+        };
+
+        // Precompute Coastal Architectural Towers (clean modern towers lining left side + sunset silhouette)
+        let mut towers: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
+        for i in 0..16 {
+            let z = -60.0 + (i as f32) * 18.0;
+            let h = 22.0 + ((i * 37 % 5) as f32) * 10.0;
+            let w = 11.0 + ((i * 13 % 3) as f32) * 2.5;
+            towers.push(([-26.0 - (i % 2) as f32 * 7.0, h * 0.5, z], [w, h, w * 1.1], [0.85, 0.78, 0.72]));
+        }
+
+        println!("=== BCPack AAA Showcase v0.7.0 ===");
+        println!(
+            "  Assets: CarConcept.glb ({} tris, {} submeshes) + 9x Poly Haven 2K PBR + 2K Sunset HDRI",
+            pack.car.indices.len() / 3,
+            pack.car.submeshes.len()
+        );
+        println!(
+            "  BCPack Stream: {} textures, {} 4K-tiles ({:.2} MiB BC1 <- {:.2} MiB BCPack, ratio {:.2}x)",
+            pack.textures.len(),
+            pack.total_tiles,
+            pack.total_bc1_bytes as f64 / (1024.0 * 1024.0),
+            pack.total_bcpack_bytes as f64 / (1024.0 * 1024.0),
+            pack.total_bc1_bytes as f64 / pack.total_bcpack_bytes.max(1) as f64
+        );
+        println!("  Controls: [T] Flush VRAM Wave | [V] X-Ray Heatmap | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Camera | [ESC] Quit");
+
+        let mut frame_fences = [0u64; 2];
+        let mut frame_count: u32 = 0;
+        let mut free_pos = [-4.2f32, 1.75, -5.0];
+        let mut free_yaw = 0.62f32;
+        let start_time = Instant::now();
+        let mut last_frame = start_time;
+        let mut last_title = start_time;
+        let mut fps_accum = 0u32;
+        let mut last_decode_ms = 0.0f64;
+
+        'main_loop: loop {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    break 'main_loop;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if wstate.should_quit {
+                break;
+            }
+
+            let now = Instant::now();
+            let dt = (now - last_frame).as_secs_f32().min(0.05);
+            last_frame = now;
+            let t_sec = (now - start_time).as_secs_f32();
+            residency.tick_timers(dt);
+
+            if cfg.flush_at_frame == Some(frame_count) {
+                wstate.flush_requested = true;
+            }
+            if wstate.flush_requested {
+                residency.flush_to_clay();
+                wstate.flush_requested = false;
+            }
+
+            let slot = (frame_count as usize) & 1;
+            ctx.wait_direct_cpu(frame_fences[slot]);
+
+            // Stream pending 4K BCPack tiles via Async Compute (or CPU 1-thread when toggled)
+            let batch_tiles_n = cfg.tiles_per_frame.clamp(16, MAX_BATCH_TILES);
+            let taken: Vec<TileRef> = residency
+                .take_batch(batch_tiles_n)
+                .iter()
+                .map(|r| TileRef { tex_idx: r.tex_idx, strip_idx: r.strip_idx })
+                .collect();
+
+            let mut compute_fence = 0u64;
+            let mut streamed_mb = 0.0f64;
+            if !taken.is_empty() {
+                streamed_mb = (taken.len() * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0);
+                if wstate.use_gpu {
+                    let batch = pack_batch(taken.iter().map(|r| {
+                        (pack.textures[r.tex_idx].bcpack_tiles[r.strip_idx].as_slice(), TILE_BLOCKS)
+                    }));
+                    compute_fence = gpu_dec.submit_slot_async_compute(&mut ctx, slot, &batch);
+                } else {
+                    let t_cpu = Instant::now();
+                    for (bi, r) in taken.iter().enumerate() {
+                        let dec = bc1::decode(
+                            &pack.textures[r.tex_idx].bcpack_tiles[r.strip_idx],
+                            TILE_BLOCKS,
+                            &window_tbl,
+                            &quads_tbl,
+                        )
+                        .unwrap();
+                        cpu_scratch[bi * TILE_BC1_BYTES..(bi + 1) * TILE_BC1_BYTES].copy_from_slice(&dec.blocks);
+                    }
+                    last_decode_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
+                    upload_slice(&cpu_upload_buf, &cpu_scratch[..taken.len() * TILE_BC1_BYTES]);
+                }
+            }
+
+            // Camera positioning
+            let speed = if (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 { 24.0 } else { 8.0 };
+            if wstate.cam_mode == 2 {
+                let fwd = [free_yaw.sin(), 0.0, free_yaw.cos()];
+                let right = [free_yaw.cos(), 0.0, -free_yaw.sin()];
+                if (GetAsyncKeyState(b'W' as i32) as u16 & 0x8000) != 0 {
+                    free_pos[0] += fwd[0] * speed * dt;
+                    free_pos[2] += fwd[2] * speed * dt;
+                }
+                if (GetAsyncKeyState(b'S' as i32) as u16 & 0x8000) != 0 {
+                    free_pos[0] -= fwd[0] * speed * dt;
+                    free_pos[2] -= fwd[2] * speed * dt;
+                }
+                if (GetAsyncKeyState(b'D' as i32) as u16 & 0x8000) != 0 {
+                    free_pos[0] += right[0] * speed * dt;
+                    free_pos[2] += right[2] * speed * dt;
+                }
+                if (GetAsyncKeyState(b'A' as i32) as u16 & 0x8000) != 0 {
+                    free_pos[0] -= right[0] * speed * dt;
+                    free_pos[2] -= right[2] * speed * dt;
+                }
+                if (GetAsyncKeyState(VK_LEFT.0 as i32) as u16 & 0x8000) != 0 {
+                    free_yaw -= 1.6 * dt;
+                }
+                if (GetAsyncKeyState(VK_RIGHT.0 as i32) as u16 & 0x8000) != 0 {
+                    free_yaw += 1.6 * dt;
+                }
+                if (GetAsyncKeyState(VK_UP.0 as i32) as u16 & 0x8000) != 0 {
+                    free_pos[1] += speed * 0.5 * dt;
+                }
+                if (GetAsyncKeyState(VK_DOWN.0 as i32) as u16 & 0x8000) != 0 {
+                    free_pos[1] = (free_pos[1] - speed * 0.5 * dt).max(0.8);
+                }
+            }
+
+            let hero_model = Mat4::translation(0.0, 0.0, 0.0).mul(&Mat4::rotate_y(2.42));
+            let (cam_pos, cam_target) = match wstate.cam_mode {
+                0 => {
+                    // Showroom Front 3/4 Orbit facing +Z golden sunset, architectural towers & wet asphalt puddles
+                    let orbit_yaw = -1.28 + (t_sec * 0.14).sin() * 0.14;
+                    let radius = 5.45;
+                    let eye = [orbit_yaw.cos() * radius, 1.32, orbit_yaw.sin() * radius];
+                    (eye, [-0.55, 0.65, 1.50])
+                }
+                1 => {
+                    // Low dynamic chase angle
+                    ([-0.4, 1.28, -5.8], [0.2, 0.68, 8.0])
+                }
+                _ => {
+                    let tgt = [free_pos[0] + free_yaw.sin() * 8.0, free_pos[1] - 0.8, free_pos[2] + free_yaw.cos() * 8.0];
+                    (free_pos, tgt)
+                }
+            };
+
+            let view = Mat4::look_at_rh(cam_pos, cam_target, [0.0, 1.0, 0.0]);
+            let proj = Mat4::perspective_rh(46.0f32.to_radians(), render_w as f32 / render_h as f32, 0.1, 600.0);
+            let vp = proj.mul(&view);
+            let inv_vp = vp.inverse();
+
+            // Build scene instance list (Hero Car + 5 Traffic Cars + Environment)
+            let mut traffic_mats = Vec::with_capacity(5);
+            let traffic_specs = [
+                (-5.2f32, 34.0f32, 0.0f32, 11.0f32, [0.85f32, 0.22, 0.18, 0.0]),
+                (5.4f32, 19.0f32, std::f32::consts::PI, -14.0f32, [0.18, 0.55, 0.88, 0.0]),
+                (-5.6f32, -26.0f32, 0.0f32, 13.0f32, [0.92, 0.72, 0.22, 0.0]),
+                (5.2f32, 62.0f32, std::f32::consts::PI, -12.0f32, [0.22, 0.78, 0.52, 0.0]),
+                (-5.4f32, 86.0f32, 0.0f32, 10.0f32, [0.82, 0.82, 0.86, 0.0]),
+            ];
+            for (lx, z0, yaw, spd, col) in traffic_specs {
+                let z = ((z0 + t_sec * spd + 110.0).rem_euclid(220.0)) - 110.0;
+                // Keep traffic lane far clear of hero car lane (-3..+3)
+                let xf = Mat4::translation(lx, 0.0, z).mul(&Mat4::rotate_y(yaw));
+                traffic_mats.push((xf, col));
+            }
+
+            let cmd_alloc = &cmd_allocs[slot];
+            let cmd = &cmd_lists[slot];
+            cmd_alloc.Reset().unwrap();
+            cmd.Reset(cmd_alloc, None).unwrap();
+
+            // Synchronize GPU compute -> Direct before copying freshly decoded 4K tiles
+            if !taken.is_empty() {
+                if wstate.use_gpu && compute_fence > 0 {
+                    ctx.direct_wait_for_compute(compute_fence);
+                }
+                let src_res = if wstate.use_gpu { gpu_dec.out_buffer(slot) } else { &cpu_upload_buf };
+                if wstate.use_gpu {
+                    cmd_barriers(cmd, vec![transition_barrier(src_res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                }
+                let mut touched = vec![false; pbr_textures.len()];
+                for r in &taken {
+                    touched[r.tex_idx] = true;
+                }
+                let to_copy_dst: Vec<_> = pbr_textures
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| touched[*i])
+                    .map(|(_, res)| transition_barrier(res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST))
+                    .collect();
+                if !to_copy_dst.is_empty() {
+                    cmd_barriers(cmd, to_copy_dst);
+                }
+
+                for (bi, r) in taken.iter().enumerate() {
+                    let tex_meta = &pack.textures[r.tex_idx];
+                    let row_pitch = (tex_meta.width / 4) * 8;
+                    let mut dst = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(pbr_textures[r.tex_idx].clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let mut src = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(src_res.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: (bi * TILE_BC1_BYTES) as u64,
+                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                    Format: DXGI_FORMAT_BC1_UNORM,
+                                    Width: tex_meta.width,
+                                    Height: tex_meta.strip_height,
+                                    Depth: 1,
+                                    RowPitch: row_pitch,
+                                },
+                            },
+                        },
+                    };
+                    cmd.CopyTextureRegion(&dst, 0, (r.strip_idx as u32) * tex_meta.strip_height, 0, &src, None);
+                    let _ = ManuallyDrop::take(&mut dst.pResource);
+                    let _ = ManuallyDrop::take(&mut src.pResource);
+                }
+
+                let mut to_srv: Vec<_> = pbr_textures
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| touched[*i])
+                    .map(|(_, res)| transition_barrier(res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+                    .collect();
+                if wstate.use_gpu {
+                    to_srv.push(transition_barrier(src_res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
+                }
+                if !to_srv.is_empty() {
+                    cmd_barriers(cmd, to_srv);
+                }
+                residency.mark_resident(&taken);
+            }
+
+            // Build TLAS BEFORE OMSetRenderTargets
+            let asphalt_model = Mat4::translation(0.0, 0.0, 0.0).mul(&Mat4::scale(24.0, 1.0, 320.0));
+            let prom_l_model = Mat4::translation(-18.0, 0.08, 0.0).mul(&Mat4::scale(12.0, 1.0, 320.0));
+            let prom_r_model = Mat4::translation(18.0, 0.08, 0.0).mul(&Mat4::scale(12.0, 1.0, 320.0));
+            let seawall_model = Mat4::translation(24.6, 0.55, 0.0).mul(&Mat4::scale(1.2, 1.1, 320.0));
+            let ocean_model = Mat4::translation(145.0, -0.45, 0.0).mul(&Mat4::scale(240.0, 1.0, 400.0));
+
+            if let Some(ref rt) = dxr {
+                let mut rt_insts = Vec::with_capacity(32);
+                rt_insts.push((0usize, hero_model.to_3x4(), [0.78, 0.28, 0.14, 0.25]));
+                for (m, col) in &traffic_mats {
+                    rt_insts.push((0usize, m.to_3x4(), *col));
+                }
+                rt_insts.push((2usize, asphalt_model.to_3x4(), [0.16, 0.15, 0.17, 0.0]));
+                rt_insts.push((2usize, prom_l_model.to_3x4(), [0.46, 0.34, 0.26, 0.0]));
+                rt_insts.push((2usize, prom_r_model.to_3x4(), [0.46, 0.34, 0.26, 0.0]));
+                rt_insts.push((1usize, seawall_model.to_3x4(), [0.58, 0.54, 0.48, 0.0]));
+                for (pos, scale, col) in &towers {
+                    let tm = Mat4::translation(pos[0], pos[1], pos[2]).mul(&Mat4::scale(scale[0], scale[1], scale[2]));
+                    rt_insts.push((1usize, tm.to_3x4(), [col[0], col[1], col[2], 0.12]));
+                }
+                rt.build_tlas(cmd, slot, &rt_insts);
+            }
+
+            // Begin 3-MRT G-Buffer pass
+            post.begin_gbuffer(cmd, dsv_handle);
+            let gpu_base = main_srv_heap.GetGPUDescriptorHandleForHeapStart();
+            let table_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu_base.ptr + ((slot * SRV_TABLE_STRIDE) * srv_inc as usize) as u64,
+            };
+            let env_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu_base.ptr + ((slot * SRV_TABLE_STRIDE + 32) * srv_inc as usize) as u64,
+            };
+            cmd.SetDescriptorHeaps(&[Some(main_srv_heap.clone())]);
+
+            // 1. Sunset HDRI Sky Dome
+            cmd.SetGraphicsRootSignature(&sky_root_sig);
+            cmd.SetPipelineState(&sky_pso);
+            let sky_cb = SkyConstants {
+                inv_view_proj: inv_vp.0,
+                camera_pos: cam_pos,
+                time: t_sec,
+            };
+            cmd.SetGraphicsRoot32BitConstants(0, 20, &sky_cb as *const SkyConstants as *const c_void, 0);
+            cmd.SetGraphicsRootDescriptorTable(1, env_gpu);
+            cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd.DrawInstanced(3, 1, 0, 0);
+
+            // 2. PBR Geometry
+            cmd.SetGraphicsRootSignature(&pbr_root_sig);
+            cmd.SetPipelineState(&pbr_pso);
+            cmd.SetGraphicsRootDescriptorTable(1, table_gpu);
+            cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd.IASetVertexBuffers(0, Some(&[vb_view]));
+            cmd.IASetIndexBuffer(Some(&ib_view));
+
+            let flags_bits = (if wstate.rt_enabled { 1u32 } else { 0u32 })
+                | (if wstate.rtgi_enabled { 2u32 } else { 0u32 })
+                | (if wstate.xray_enabled { 4u32 } else { 0u32 });
+            let flags_f = flags_bits as f32;
+
+            let draw_car = |model: &Mat4| {
+                let mvp = vp.mul(model);
+                for sm in &pack.car.submeshes {
+                    draw_car_submesh(cmd, &mvp, model, cam_pos, flags_f, t_sec, sm, &residency, &pack.textures);
+                }
+            };
+
+            // Hero Car + 5 animated CarConcept traffic cars
+            draw_car(&hero_model);
+            for (tm, _) in &traffic_mats {
+                draw_car(tm);
+            }
+
+            // Wet 4-lane Asphalt Road
+            draw_static_mesh(
+                cmd,
+                &vp,
+                &asphalt_model,
+                plane_base_vert,
+                plane_idx_offset,
+                6,
+                cam_pos,
+                flags_f,
+                t_sec,
+                [0.95, 0.95, 0.95, 1.0],
+                [0.0, 0.85, 22.0, 3.0], // wetAsphalt mode=3, 22x tiled
+                pack.asphalt_tex,
+                &residency,
+                &pack.textures,
+            );
+            // Brick Promenades (Left + Right)
+            draw_static_mesh(
+                cmd,
+                &vp,
+                &prom_l_model,
+                plane_base_vert,
+                plane_idx_offset,
+                6,
+                cam_pos,
+                flags_f,
+                t_sec,
+                [1.0, 0.96, 0.94, 1.0],
+                [0.0, 0.85, 28.0, 2.0], // PolyHaven mode=2
+                pack.promenade_tex,
+                &residency,
+                &pack.textures,
+            );
+            draw_static_mesh(
+                cmd,
+                &vp,
+                &prom_r_model,
+                plane_base_vert,
+                plane_idx_offset,
+                6,
+                cam_pos,
+                flags_f,
+                t_sec,
+                [1.0, 0.96, 0.94, 1.0],
+                [0.0, 0.85, 28.0, 2.0],
+                pack.promenade_tex,
+                &residency,
+                &pack.textures,
+            );
+            // Concrete Seawall Curb
+            draw_static_mesh(
+                cmd,
+                &vp,
+                &seawall_model,
+                box_base_vert,
+                box_idx_offset,
+                36,
+                cam_pos,
+                flags_f,
+                t_sec,
+                [0.92, 0.88, 0.84, 1.0],
+                [0.0, 0.88, 12.0, 2.0],
+                pack.concrete_tex,
+                &residency,
+                &pack.textures,
+            );
+            // Glossy Sunset Ocean Plane
+            draw_static_mesh(
+                cmd,
+                &vp,
+                &ocean_model,
+                plane_base_vert,
+                plane_idx_offset,
+                6,
+                cam_pos,
+                flags_f,
+                t_sec,
+                [0.05, 0.14, 0.22, 1.0],
+                [0.15, 0.05, 1.0, 0.0],
+                [u32::MAX, u32::MAX, u32::MAX],
+                &residency,
+                &pack.textures,
+            );
+            // Coastal Architectural Towers
+            for (pos, scale, col) in &towers {
+                let tm = Mat4::translation(pos[0], pos[1], pos[2]).mul(&Mat4::scale(scale[0], scale[1], scale[2]));
+                draw_static_mesh(
+                    cmd,
+                    &vp,
+                    &tm,
+                    box_base_vert,
+                    box_idx_offset,
+                    36,
+                    cam_pos,
+                    flags_f,
+                    t_sec,
+                    [col[0], col[1], col[2], 1.0],
+                    [0.05, 0.72, 4.0, 2.0],
+                    pack.concrete_tex,
+                    &residency,
+                    &pack.textures,
+                );
+            }
+
+            // Backbuffer transition -> RT + Run RTGI Denoiser + Bloom + ACES Composite
+            let bb_idx = swap_chain.GetCurrentBackBufferIndex();
+            let bb = &backbuffers[bb_idx as usize];
+            let bb_rtv = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: bb_base.ptr + (bb_idx * rtv_inc) as usize,
+            };
+            cmd_barriers(cmd, vec![transition_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+
+            post.run_post_and_composite(
+                cmd,
+                &main_srv_heap,
+                bb_rtv,
+                WIN_W,
+                WIN_H,
+                wstate.rtgi_enabled,
+                t_sec,
+            );
+
+            let take_shot = cfg.screenshot_path.is_some() && frame_count + 1 >= cfg.screenshot_frames;
+            if take_shot {
+                cmd_barriers(cmd, vec![transition_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let mut dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(ss_readback.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: WIN_W,
+                                Height: WIN_H,
+                                Depth: 1,
+                                RowPitch: ss_row_pitch,
+                            },
+                        },
+                    },
+                };
+                let mut src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(bb.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                cmd.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                let _ = ManuallyDrop::take(&mut dst.pResource);
+                let _ = ManuallyDrop::take(&mut src.pResource);
+                cmd_barriers(cmd, vec![transition_barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+            } else {
+                cmd_barriers(cmd, vec![transition_barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+            }
+
+            cmd.Close().unwrap();
+            let lists = [Some(cmd.cast::<ID3D12CommandList>().unwrap())];
+            ctx.queue.ExecuteCommandLists(&lists);
+            let _ = swap_chain.Present(0, DXGI_PRESENT(0));
+
+            if take_shot {
+                ctx.signal_and_wait();
+                if wstate.use_gpu && !taken.is_empty() {
+                    last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
+                }
+            } else {
+                frame_fences[slot] = ctx.signal_direct_async();
+                if wstate.use_gpu && !taken.is_empty() {
+                    last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
+                }
+            }
+
+            frame_count += 1;
+            fps_accum += 1;
+
+            if take_shot {
+                let out_path = cfg.screenshot_path.as_ref().unwrap();
+                let mut ptr: *mut c_void = std::ptr::null_mut();
+                let rng = D3D12_RANGE { Begin: 0, End: (ss_row_pitch * WIN_H) as usize };
+                ss_readback.Map(0, Some(&rng), Some(&mut ptr)).unwrap();
+                let raw = std::slice::from_raw_parts(ptr as *const u8, (ss_row_pitch * WIN_H) as usize);
+                let file = File::create(out_path).expect("create screenshot");
+                let mut enc = png::Encoder::new(BufWriter::new(file), WIN_W, WIN_H);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                let mut writer = enc.write_header().unwrap();
+                writer.write_image_data(raw).unwrap();
+                ss_readback.Unmap(0, None);
+                println!(
+                    "[aaa-screenshot] Saved {} ({}x{}, resident={}/{} tiles, xray={})",
+                    out_path.display(),
+                    WIN_W,
+                    WIN_H,
+                    residency.total_resident(),
+                    residency.total_tiles(),
+                    wstate.xray_enabled
+                );
+                break;
+            }
+
+            if (now - last_title).as_secs_f64() >= 0.35 {
+                let secs = (now - last_title).as_secs_f64();
+                let fps_val = fps_accum as f64 / secs;
+                fps_accum = 0;
+                last_title = now;
+                let mode_str = if wstate.use_gpu { "GPU Async" } else { "CPU 1T" };
+                let cam_str = match wstate.cam_mode {
+                    0 => "Showroom",
+                    1 => "Chase",
+                    _ => "FreeCam",
+                };
+                let title = format!(
+                    "BCPack AAA v0.7 | {} | {:.1} FPS | VRAM {}/{} tiles ({:.1} MiB) | dec {:.2}ms ({:.2}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
+                    mode_str,
+                    fps_val,
+                    residency.total_resident(),
+                    residency.total_tiles(),
+                    (residency.total_resident() * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0),
+                    last_decode_ms,
+                    streamed_mb,
+                    if wstate.rt_enabled { "ON" } else { "OFF" },
+                    if wstate.rtgi_enabled { "ON" } else { "OFF" },
+                    if wstate.xray_enabled { "ON" } else { "OFF" },
+                    cam_str,
+                );
+                let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+            }
+
+            if let Some(target_n) = cfg.measure_frames {
+                if frame_count >= target_n {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    println!(
+                        "[aaa-measure] {} frames in {:.3}s = {:.2} FPS | res={}x{} | resident={}/{} tiles | last_decode={:.3} ms",
+                        frame_count,
+                        elapsed,
+                        frame_count as f64 / elapsed,
+                        render_w,
+                        render_h,
+                        residency.total_resident(),
+                        residency.total_tiles(),
+                        last_decode_ms
+                    );
+                    break;
+                }
+            }
+        }
+
+        ctx.signal_and_wait();
+        if cfg.enable_debug {
+            dump_d3d12_info_queue(&ctx.device);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_car_submesh(
+    cmd: &ID3D12GraphicsCommandList,
+    mvp: &Mat4,
+    model: &Mat4,
+    cam_pos: [f32; 3],
+    flags_f: f32,
+    t_sec: f32,
+    sm: &PbrSubmesh,
+    residency: &TextureResidency,
+    textures: &[BcpackTexture2D],
+) {
+    let a_idx = sm.albedo_tex.map(|i| i as u32).unwrap_or(u32::MAX);
+    let n_idx = sm.normal_tex.map(|i| i as u32).unwrap_or(u32::MAX);
+    let o_idx = sm.orm_tex.map(|i| i as u32).unwrap_or(u32::MAX);
+    let e_idx = sm.emissive_tex.map(|i| i as u32).unwrap_or(u32::MAX);
+    let strips = sm
+        .albedo_tex
+        .map(|i| (textures[i].height / textures[i].strip_height.max(1)) as f32)
+        .unwrap_or(16.0);
+
+    let cb = AaaDrawCB {
+        mvp: mvp.0,
+        model: model.0,
+        camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], flags_f],
+        base_color: sm.base_color_factor,
+        mat_params: [
+            sm.metallic_factor,
+            sm.roughness_factor,
+            1.0,
+            if sm.is_glass { 1.0 } else { 0.0 },
+        ],
+        emissive_time: [sm.emissive_factor[0], sm.emissive_factor[1], sm.emissive_factor[2], t_sec],
+        tex_indices: [a_idx, n_idx, o_idx, e_idx],
+        tile_states: [
+            residency.state_for_tex(a_idx),
+            residency.state_for_tex(n_idx),
+            residency.state_for_tex(o_idx),
+            strips,
+        ],
+    };
+    cmd.SetGraphicsRoot32BitConstants(0, (size_of::<AaaDrawCB>() / 4) as u32, &cb as *const AaaDrawCB as *const c_void, 0);
+    cmd.DrawIndexedInstanced(sm.index_count, 1, sm.index_offset, 0, 0);
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_static_mesh(
+    cmd: &ID3D12GraphicsCommandList,
+    vp: &Mat4,
+    model: &Mat4,
+    base_vert: u32,
+    idx_offset: u32,
+    idx_count: u32,
+    cam_pos: [f32; 3],
+    flags_f: f32,
+    t_sec: f32,
+    base_color: [f32; 4],
+    mat_params: [f32; 4],
+    tex3: [u32; 3],
+    residency: &TextureResidency,
+    textures: &[BcpackTexture2D],
+) {
+    let mvp = vp.mul(model);
+    let strips = if tex3[0] != u32::MAX {
+        (textures[tex3[0] as usize].height / textures[tex3[0] as usize].strip_height.max(1)) as f32
+    } else {
+        16.0
+    };
+    let cb = AaaDrawCB {
+        mvp: mvp.0,
+        model: model.0,
+        camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], flags_f],
+        base_color,
+        mat_params,
+        emissive_time: [0.0, 0.0, 0.0, t_sec],
+        tex_indices: [tex3[0], tex3[1], tex3[2], u32::MAX],
+        tile_states: [
+            residency.state_for_tex(tex3[0]),
+            residency.state_for_tex(tex3[1]),
+            residency.state_for_tex(tex3[2]),
+            strips,
+        ],
+    };
+    cmd.SetGraphicsRoot32BitConstants(0, (size_of::<AaaDrawCB>() / 4) as u32, &cb as *const AaaDrawCB as *const c_void, 0);
+    cmd.DrawIndexedInstanced(idx_count, 1, idx_offset, base_vert as i32, 0);
+}
