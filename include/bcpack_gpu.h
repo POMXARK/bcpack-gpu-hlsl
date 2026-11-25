@@ -1,0 +1,83 @@
+// Clean-room C-ABI interface for bcpack_gpu.dll
+// Designed for integration into Xbox translation layers / IDStorageQueueX hooks (e.g., XCL / AnyXboxX).
+
+#ifndef BCPACK_GPU_H
+#define BCPACK_GPU_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if defined(_WIN32) && !defined(BCPACK_STATIC)
+#  ifdef BCPACK_EXPORTS
+#    define BCPACK_API __declspec(dllexport)
+#  else
+#    define BCPACK_API __declspec(dllimport)
+#  endif
+#else
+#  define BCPACK_API
+#endif
+
+typedef struct BcPackContext BcPackContext;
+
+typedef enum BcPackFormat {
+    BCPACK_FORMAT_BC1      = 0, // Full 12-lane rANS + predictor + quad reconstruction -> raw BC1 blocks (8B/block)
+    BCPACK_FORMAT_BC7_RANS = 1, // 16-lane rANS entropy stage (100% Wave32) -> uint16[16] symbols/row (32B/row)
+} BcPackFormat;
+
+typedef enum BcPackSwizzle {
+    BCPACK_SWIZZLE_LINEAR        = 0, // Linear block order
+    BCPACK_SWIZZLE_GFX10_64KB_D  = 1, // AMD Gfx10 64KB_D ("xyxxyyxyxyxyx") -> detiled to linear on GPU
+    BCPACK_SWIZZLE_GFX10_4KB_S   = 2, // AMD Gfx10 4KB_S  ("xyyxxyxyx")     -> detiled to linear on GPU
+} BcPackSwizzle;
+
+// Creates a DX12 Async Compute GPU decompression context on the high-performance adapter.
+// Pass 0 for defaults (max_chunks=2048, max_blocks=8_388_608, max_stream_bytes=96 MiB).
+BCPACK_API BcPackContext* bcpack_gpu_create(
+    uint32_t max_chunks,
+    uint32_t max_blocks,
+    uint32_t max_stream_bytes);
+
+// Destroys the DX12 context and frees GPU heaps/queues.
+BCPACK_API void bcpack_gpu_destroy(BcPackContext* ctx);
+
+// Submits a BCPack chunk onto the DX12 D3D12_COMMAND_LIST_TYPE_COMPUTE Async Compute Queue.
+// - For BCPACK_FORMAT_BC1: num_blocks is BC1 block count (width_blocks * height_blocks), output = num_blocks * 8 bytes.
+//   If swizzle_mode != BCPACK_SWIZZLE_LINEAR, chains Gfx10 Swizzle -> Linear compute pass in the same Async Compute list.
+// - For BCPACK_FORMAT_BC7_RANS: num_blocks is BC7 block count (emits 2 symbol rows per block, total 2*num_blocks*32 bytes).
+// - If out_host_buffer != NULL: waits for the compute fence and copies decoded bytes into out_host_buffer.
+// - If out_host_buffer == NULL: returns immediately after signaling *out_fence_value (zero-stall async mode).
+// Returns 0 on success, < 0 on error.
+BCPACK_API int32_t BcPackDecodeAsync(
+    BcPackContext* ctx,
+    const uint8_t* compressed_data,
+    uint32_t compressed_size,
+    uint32_t num_blocks,
+    uint32_t format,
+    uint32_t swizzle_mode,
+    uint32_t width_blocks,
+    uint32_t height_blocks,
+    uint8_t* out_host_buffer,
+    uint32_t out_capacity,
+    uint64_t* out_fence_value);
+
+// Waits on CPU for a previously returned Async Compute fence value.
+// Returns 0 if signaled, 1 on timeout, < 0 on error.
+BCPACK_API int32_t BcPackWaitFence(
+    BcPackContext* ctx,
+    uint64_t fence_value,
+    uint32_t timeout_ms);
+
+// Reads the GPU compute kernel timestamp duration (in milliseconds) of the last completed submission.
+// Returns 0 on success, < 0 on error.
+BCPACK_API int32_t BcPackGetLastTimingMs(
+    const BcPackContext* ctx,
+    double* out_kernel_ms);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // BCPACK_GPU_H

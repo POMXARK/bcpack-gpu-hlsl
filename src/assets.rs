@@ -35,6 +35,18 @@ pub const ASSET_NAMES: [&str; 12] = [
     "12_concrete_rooftop",
 ];
 
+/// Exact BC7 16-lane rANS alphabet widths (matches Ahmet-Dedeler/bcpack-rs format.rs).
+pub const BC7_ALPHABET_BITS: [u8; 16] = [
+    3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Bc7EntropyProfile {
+    StandardAlbedo,
+    NormalHighEntropy,
+    SharpUi,
+}
+
 pub struct TextureAsset {
     pub name: &'static str,
     pub bcpack_bytes: Vec<u8>,
@@ -313,16 +325,18 @@ fn expand_565(c: u16) -> [i32; 3] {
     ]
 }
 
-fn compress_rgba_to_bc1(rgba: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; TEX_BC1_BYTES];
-    for by in 0..BLOCKS_Y {
-        for bx in 0..BLOCKS_X {
+fn compress_rgba_dims_to_bc1(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let bx_count = width / 4;
+    let by_count = height / 4;
+    let mut out = vec![0u8; bx_count * by_count * 8];
+    for by in 0..by_count {
+        for bx in 0..bx_count {
             let mut block_px = [[0u8; 3]; 16];
             let mut min_rgb = [255u8; 3];
             let mut max_rgb = [0u8; 3];
             for py in 0..4 {
                 for px in 0..4 {
-                    let off = ((by * 4 + py) * TEX_W + (bx * 4 + px)) * 4;
+                    let off = ((by * 4 + py) * width + (bx * 4 + px)) * 4;
                     let p = [rgba[off], rgba[off + 1], rgba[off + 2]];
                     block_px[py * 4 + px] = p;
                     for c in 0..3 {
@@ -387,13 +401,17 @@ fn compress_rgba_to_bc1(rgba: &[u8]) -> Vec<u8> {
                 idx_word |= best_k << (2 * i);
             }
 
-            let bi = (by * BLOCKS_X + bx) * 8;
+            let bi = (by * bx_count + bx) * 8;
             out[bi..bi + 2].copy_from_slice(&c0.to_le_bytes());
             out[bi + 2..bi + 4].copy_from_slice(&c1.to_le_bytes());
             out[bi + 4..bi + 8].copy_from_slice(&idx_word.to_le_bytes());
         }
     }
     out
+}
+
+fn compress_rgba_to_bc1(rgba: &[u8]) -> Vec<u8> {
+    compress_rgba_dims_to_bc1(rgba, TEX_W, TEX_H)
 }
 
 #[inline]
@@ -633,4 +651,244 @@ pub fn load_or_generate_assets(
             }
         })
         .collect()
+}
+
+/// Software AMD Gfx10 (RDNA2) linear -> swizzled encoder (exact inverse of gfx10_detile.hlsl).
+/// `tile_mode`: 0 = SW_64KB_D (8B), 1 = SW_4KB_S (8B), 2 = SW_64KB_D (16B).
+pub fn swizzle_gfx10_cpu(
+    linear: &[u8],
+    width_blocks: usize,
+    height_blocks: usize,
+    tile_mode: u32,
+    block_bytes: usize,
+) -> Vec<u8> {
+    let (pattern, tw, th) = match tile_mode {
+        0 => (b"xyxxyyxyxyxyx".as_slice(), 128usize, 64usize),
+        1 => (b"xyyxxyxyx".as_slice(), 32usize, 16usize),
+        _ => (b"xyxxyyxyxyxy".as_slice(), 64usize, 64usize),
+    };
+    let tl = pattern.len();
+    let tiles_x = (width_blocks + tw - 1) / tw;
+    let tiles_y = (height_blocks + th - 1) / th;
+    let total_swizzled_blocks = tiles_x.max(1) * tiles_y.max(1) * (1usize << tl);
+    let mut swizzled = vec![0u8; total_swizzled_blocks * block_bytes];
+
+    for i in 0..total_swizzled_blocks {
+        let mut lx = 0usize;
+        let mut ly = 0usize;
+        let mut xi = 0usize;
+        let mut yi = 0usize;
+        for (bit, &axis) in pattern.iter().enumerate() {
+            let v = (i >> bit) & 1;
+            if axis == b'x' {
+                lx |= v << xi;
+                xi += 1;
+            } else {
+                ly |= v << yi;
+                yi += 1;
+            }
+        }
+        let k = i >> tl;
+        let tpr = tiles_x.max(1);
+        let x = (k % tpr) * tw + lx;
+        let y = (k / tpr) * th + ly;
+        if x < width_blocks && y < height_blocks {
+            let lin_idx = y * width_blocks + x;
+            swizzled[i * block_bytes..(i + 1) * block_bytes]
+                .copy_from_slice(&linear[lin_idx * block_bytes..(lin_idx + 1) * block_bytes]);
+        }
+    }
+    swizzled
+}
+
+fn downsample_rgba_box2(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let nw = (w / 2).max(4);
+    let nh = (h / 2).max(4);
+    let mut dst = vec![0u8; nw * nh * 4];
+    for y in 0..nh {
+        for x in 0..nw {
+            let sx = (x * 2).min(w - 2);
+            let sy = (y * 2).min(h - 2);
+            for c in 0..4 {
+                let s0 = src[(sy * w + sx) * 4 + c] as u32;
+                let s1 = src[(sy * w + sx + 1) * 4 + c] as u32;
+                let s2 = src[((sy + 1) * w + sx) * 4 + c] as u32;
+                let s3 = src[((sy + 1) * w + sx + 1) * 4 + c] as u32;
+                dst[(y * nw + x) * 4 + c] = ((s0 + s1 + s2 + s3 + 2) / 4) as u8;
+            }
+        }
+    }
+    dst
+}
+
+pub struct MipLevelEncoded {
+    pub label: String,
+    pub blocks: usize,
+    pub bcpack: Vec<u8>,
+    pub expected_bc1: Vec<u8>,
+}
+
+/// Builds a console-style mipmap chain from 512x512 down to a Packed Mip Tail (32x32+16x16+8x8+4x4 = 85 blocks).
+pub fn generate_mip_chain_bc1(tex_idx: usize, window: &Window, quads: &QuadTable) -> Vec<MipLevelEncoded> {
+    let mut out = Vec::new();
+    let mut rgba = generate_rgba(tex_idx);
+    let mut w = TEX_W;
+    let mut h = TEX_H;
+
+    // Individual major mips: 512x512, 256x256, 128x128, 64x64
+    for mip in 0..4 {
+        let raw = compress_rgba_dims_to_bc1(&rgba, w, h);
+        let enc = encode_bc1_to_bcpack(&raw, window, quads);
+        out.push(MipLevelEncoded {
+            label: format!("mip{mip}_{w}x{h}"),
+            blocks: raw.len() / 8,
+            bcpack: enc,
+            expected_bc1: raw,
+        });
+        rgba = downsample_rgba_box2(&rgba, w, h);
+        w /= 2;
+        h /= 2;
+    }
+
+    // Packed Mip Tail: 32x32 (64 blks) + 16x16 (16 blks) + 8x8 (4 blks) + 4x4 (1 blk) = 85 blocks in one chunk
+    let mut tail_bc1 = Vec::new();
+    loop {
+        let raw = compress_rgba_dims_to_bc1(&rgba, w, h);
+        tail_bc1.extend_from_slice(&raw);
+        if w <= 4 || h <= 4 {
+            break;
+        }
+        rgba = downsample_rgba_box2(&rgba, w, h);
+        w /= 2;
+        h /= 2;
+    }
+    let tail_enc = encode_bc1_to_bcpack(&tail_bc1, window, quads);
+    out.push(MipLevelEncoded {
+        label: "packed_mip_tail_32_to_4".to_string(),
+        blocks: tail_bc1.len() / 8,
+        bcpack: tail_enc,
+        expected_bc1: tail_bc1,
+    });
+    out
+}
+
+/// Generates a high-entropy tangent-space normal-map stress tile (4,096 blocks = 512x128 strip).
+pub fn generate_high_entropy_bc1_normal_map(
+    blocks: usize,
+    seed: u64,
+    window: &Window,
+    quads: &QuadTable,
+) -> (Vec<u8>, Vec<u8>) {
+    let w = 512usize;
+    let h = ((blocks * 16) / w).max(4);
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let h1 = hash2((x as u32 ^ (seed as u32)) as i32, (y as u32 ^ ((seed >> 16) as u32)) as i32);
+            let h2 = hash2((x as u32).wrapping_mul(3) as i32, (y as u32).wrapping_add(seed as u32) as i32);
+            let nx = ((h1 & 0xFF) as f32 / 255.0 - 0.5) * 1.6;
+            let ny = (((h2 >> 8) & 0xFF) as f32 / 255.0 - 0.5) * 1.6;
+            let nz = (1.0 - (nx * nx + ny * ny).min(0.85)).sqrt();
+            let px = rgb(nx * 127.0 + 128.0, ny * 127.0 + 128.0, nz * 127.0 + 128.0);
+            let off = (y * w + x) * 4;
+            rgba[off..off + 4].copy_from_slice(&px);
+        }
+    }
+    let raw = compress_rgba_dims_to_bc1(&rgba, w, h);
+    let enc = encode_bc1_to_bcpack(&raw, window, quads);
+    (enc, raw)
+}
+
+/// Generates a sharp high-contrast UI/HUD grid stress tile (4,096 blocks = 512x128 strip).
+pub fn generate_sharp_ui_bc1(
+    blocks: usize,
+    seed: u64,
+    window: &Window,
+    quads: &QuadTable,
+) -> (Vec<u8>, Vec<u8>) {
+    let w = 512usize;
+    let h = ((blocks * 16) / w).max(4);
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let border = (x % 16 == 0) || (y % 16 == 0);
+            let diag = ((x ^ y) + seed as usize) % 13 == 0;
+            let px = if border {
+                [0, 255, 240, 255]
+            } else if diag {
+                [255, 40, 200, 255]
+            } else if ((x / 8) ^ (y / 8)) & 1 == 0 {
+                [248, 248, 252, 255]
+            } else {
+                [12, 16, 28, 255]
+            };
+            let off = (y * w + x) * 4;
+            rgba[off..off + 4].copy_from_slice(&px);
+        }
+    }
+    let raw = compress_rgba_dims_to_bc1(&rgba, w, h);
+    let enc = encode_bc1_to_bcpack(&raw, window, quads);
+    (enc, raw)
+}
+
+/// Generates a valid clean-room 16-lane BC7 rANS stream (`out_target = bc7_blocks * 2` symbols per lane).
+pub fn generate_bc7_16lane_stream(
+    seed: u64,
+    bc7_blocks: usize,
+    profile: Bc7EntropyProfile,
+) -> (Vec<u8>, usize) {
+    let out_target = bc7_blocks * 2;
+    let mut lane_syms: [Vec<u16>; 16] = std::array::from_fn(|_| Vec::with_capacity(out_target));
+
+    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xBF58476D1CE4E5B9;
+    let mut next_u32 = || -> u32 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 32) as u32
+    };
+
+    for row in 0..out_target {
+        for (li, &ab) in BC7_ALPHABET_BITS.iter().enumerate() {
+            let max_val = (1u32 << ab) - 1;
+            let r = next_u32();
+            let sym = match profile {
+                Bc7EntropyProfile::StandardAlbedo => {
+                    // Concentrated near low residuals
+                    let s = ((r & max_val) >> 2).min(max_val);
+                    s as u16
+                }
+                Bc7EntropyProfile::NormalHighEntropy => {
+                    // Wide uniform-like spread across almost the full alphabet width
+                    (r % (max_val + 1)) as u16
+                }
+                Bc7EntropyProfile::SharpUi => {
+                    // Bimodal jumps between 0 and upper half of alphabet
+                    if (row + li) % 5 == 0 {
+                        (max_val - (r & 3).min(max_val)) as u16
+                    } else {
+                        (r & 3).min(max_val) as u16
+                    }
+                }
+            };
+            lane_syms[li].push(sym);
+        }
+    }
+
+    let mut lanes: Vec<Vec<Fragment>> = Vec::with_capacity(16);
+    for (li, &ab) in BC7_ALPHABET_BITS.iter().enumerate() {
+        let mut frags = Vec::new();
+        for chunk in lane_syms[li].chunks(4096) {
+            let (z, q) = best_model_for_fragment(ab, chunk);
+            frags.push(Fragment {
+                symbols: chunk.to_vec(),
+                q,
+                z,
+            });
+        }
+        lanes.push(frags);
+    }
+
+    let stream = encode_lanes(&BC7_ALPHABET_BITS, &lanes).expect("BC7 encode_lanes failed");
+    (stream, out_target)
 }
