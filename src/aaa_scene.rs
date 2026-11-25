@@ -2023,7 +2023,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         )
         .expect("CreateWindowExW");
 
-        let hud_default = !cfg.benchmark_run && cfg.screenshot_path.is_none() && cfg.record_dir.is_none();
+        let hud_default = cfg.screenshot_path.is_none() && cfg.record_dir.is_none();
         let mut wstate = Box::new(WindowState {
             use_gpu: !cfg.start_cpu,
             rt_enabled: !cfg.no_rt,
@@ -2795,14 +2795,14 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             let now = Instant::now();
             let raw_dt_ms = (now - last_frame).as_secs_f64() * 1000.0;
             const RECORD_WARMUP: u32 = 24;
-            let (dt, wall_sec, t_sec) = if cfg.record_dir.is_some() {
+            let (dt, t_sec) = if cfg.record_dir.is_some() {
                 let rec_step = frame_count.saturating_sub(RECORD_WARMUP);
                 let rec_t = (rec_step as f32) / 15.0;
-                (1.0f32 / 15.0, rec_t, rec_t)
+                (1.0f32 / 15.0, rec_t)
             } else {
                 let frame_dt = ((raw_dt_ms * 0.001) as f32).min(0.05);
                 sim_time += frame_dt * wstate.sim_speed;
-                (frame_dt, (now - start_time).as_secs_f32(), sim_time)
+                (frame_dt, sim_time)
             };
             last_frame = now;
             residency.tick_timers(dt);
@@ -2810,7 +2810,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             if cfg.benchmark_run && frame_count > 4 {
                 bench_frame_ms.push(raw_dt_ms);
             }
-            if cfg.benchmark_run && cfg.record_dir.is_none() && !bench_flushed && wall_sec >= cfg.benchmark_secs * 0.75 {
+            if cfg.benchmark_run && cfg.record_dir.is_none() && !bench_flushed && t_sec >= cfg.benchmark_secs * 0.75 {
                 wstate.flush_requested = true;
                 bench_flushed = true;
             }
@@ -2889,7 +2889,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             let hero_model = Mat4::translation(0.0, 0.0, 0.0).mul(&Mat4::rotate_y(2.42));
             let (cam_pos, cam_target) = if cfg.benchmark_run {
-                let p = (wall_sec / cfg.benchmark_secs.max(5.0)).clamp(0.0, 1.0);
+                let p = (t_sec / cfg.benchmark_secs.max(5.0)).clamp(0.0, 1.0);
                 if p < 0.33 {
                     let s = p / 0.33;
                     let orbit_yaw = -1.45 + s * 0.45;
@@ -3644,7 +3644,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
             }
 
-            if cfg.benchmark_run && cfg.record_dir.is_none() && wall_sec >= cfg.benchmark_secs {
+            if cfg.benchmark_run && cfg.record_dir.is_none() && t_sec >= cfg.benchmark_secs {
                 let cur_mib = residency.current_vram_bytes() as f64 / (1024.0 * 1024.0);
                 let tot_mib = residency.total_vram_bytes as f64 / (1024.0 * 1024.0);
                 let saved_mib = (tot_mib - cur_mib).max(0.0);
@@ -3655,7 +3655,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let p999_ms = bench_frame_ms[((n as f64 * 0.999) as usize).min(n - 1)];
                 let pre_tris = meshlet_city.as_ref().map(|c| c.total_tris).unwrap_or(0);
                 let fc = frame_count.max(1) as f64;
-                println!("=== BCPack AAA Benchmark v0.8.0 Summary ({:.1}s, {}x{}) ===", wall_sec, render_w, render_h);
+                println!("=== BCPack AAA Benchmark v0.8.0 Summary ({:.1}s sim, {}x{}) ===", t_sec, render_w, render_h);
                 println!("  Frames: {} | Average FPS: {:.2} ({:.2} ms) | 1% Low: {:.2} FPS ({:.2} ms) | 0.1% Low: {:.2} FPS ({:.2} ms)",
                     frame_count, 1000.0 / avg_ms.max(0.01), avg_ms, 1000.0 / p99_ms.max(0.01), p99_ms, 1000.0 / p999_ms.max(0.01), p999_ms);
                 println!("  GPU BCPack Peak Throughput (Live 64K BC7/BC5 Tiles): {:.2} GB/s", bench_peak_gbps);

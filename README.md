@@ -48,6 +48,8 @@ What `v0.6.0` adds to stress-test full Xbox Series X open-world workloads every 
 ### Side-by-Side v0.1 Comparison Video (GPU vs 1-Core CPU: 45 FPS vs 5 FPS)
 ![GPU HLSL SM 6.6 vs CPU bcpack-rs side-by-side comparison](media/demo_preview.gif)
 - **Full HD comparison video:** [`media/demo_comparison.mp4`](media/demo_comparison.mp4) ([Release `v0.1.0`](https://github.com/POMXARK/bcpack-gpu-hlsl/releases/tag/v0.1.0))
+- **AI / Systems Architecture & Optimizations Guide:** [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md) (complete module map, 11 unique optimizations, DXC `-O3` & RTX 5080 `621.24` workarounds, register bindings, C-ABI invariants)
+- **Community Integration Proposals:** [`docs/OUTREACH_PITCH.md`](docs/OUTREACH_PITCH.md)
 - **Русская документация:** [`DOCS_RU.md`](DOCS_RU.md)
 
 ---
