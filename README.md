@@ -1,25 +1,26 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
-[![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20Zero--Barrier%20Wave32-2f80ed)](shaders/bcpack_decode.hlsl)
-[![v0.4.0](https://img.shields.io/badge/v0.4.0-11.33%20GB%2Fs%20%7C%20189%20FPS%20Live-ff4081)](#v040-performance-leap--benchmarks-rtx-5080)
+[![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20Wave32%20%2B%20DXR%201.1-2f80ed)](shaders/bcpack_decode.hlsl)
+[![v0.5.0](https://img.shields.io/badge/v0.5.0-11.33%20GB%2Fs%20%7C%20171%20FPS%20w%2F%20RT-ff4081)](#v040--v050-performance-leap--benchmarks-rtx-5080)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
 
-**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor written in zero-barrier HLSL Shader Model 6.6 Compute Shaders + DirectX 12 Ping-Pong Async Compute (`D3D12_COMMAND_LIST_TYPE_COMPUTE`), reaching 11,327.6 MB/s (11.33 GB/s — 279.0× faster than 1-core CPU) on BC1, 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), and 189.36 FPS live (171.86 FPS at 32 MiB/frame!) on an NVIDIA RTX 5080.**
+**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor written in zero-barrier HLSL Shader Model 6.6 Compute Shaders + DirectX 12 Ping-Pong Async Compute + DXR 1.1 Hardware Inline Ray Tracing (`RayQuery`), reaching 11,327.6 MB/s (11.33 GB/s — 279.0× faster than 1-core CPU) on BC1, 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 189.36 FPS live (zero-barrier Ping-Pong), and 171.45 FPS live with real-time DXR 1.1 shadows + wet-asphalt reflections on an NVIDIA RTX 5080.**
 
 > Clean-room implementation using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. Built on the format specification and CPU oracle from [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) and Microsoft's MIT-licensed [`microsoft/silicon-rans`](https://github.com/microsoft/silicon-rans).
 
 ---
 
-## Live 3D Streaming Demo: Zero-Barrier + Ping-Pong Async Compute (`v0.4.0` — 189.4 FPS Live)
+## Live 3D Streaming Demo: Ping-Pong Async Compute + DXR 1.1 (`v0.5.0` — 171.5 FPS Live w/ RT)
 
-![Coastal Highway 3D Live GPU BCPack Streaming Demo](media/highway_demo.gif)
+![Coastal Highway 3D Live GPU BCPack + DXR 1.1 Streaming Demo](media/highway_demo.gif)
 
-Every frame decompresses **256–1,024 compressed 4K-block `.bcpack` tiles (8–32 MiB of BC1 output per frame!)** on the DX12 **Async Compute Queue** synchronized via cross-queue `ID3D12Fence` with the Direct graphics queue, updating 12 live `512×512 DXGI_FORMAT_BC1_UNORM` textures driving a coastal highway 3D scene:
-- **Cruising Hero Sports Car** + **10 animated traffic coupes** across a 4-lane wet asphalt highway
-- **Curved 3D Palm Trees**, **Streetlamps**, **Multi-tier Art-Deco skyline** with neon storefronts & penthouses, **Boardwalk**, **Beach**, and **Animated Ocean Waves**
-- **Sampler Feedback Streaming (`[F]`)** distance-LOD residency budgeting mode (dynamically modulates streamed tiles from landmark proximity)
+![v0.5.0 High-Res Screenshot with Hardware DXR 1.1 Reflections and Sun Shadows](media/highway_rt_v5.png)
+
+Every frame decompresses **256–1,024 compressed 4K-block `.bcpack` tiles (8–32 MiB of BC1 output per frame!)** on the DX12 **Async Compute Queue** synchronized via cross-queue `ID3D12Fence` with the Direct graphics queue, rebuilding a dynamic hardware **DXR 1.1 TLAS** over 5 static BLAS geometries (`src/raytracing.rs`) and tracing inline rays in `shaders/scene.hlsl`:
+- **Hardware DXR 1.1 Sun Shadows + Glossy Reflections (`[R]`):** `RayQuery` (`ps_6_5`) traces shadows and reflections across wet coastal asphalt, ocean waves, neon Art-Deco towers, hero car, and **10 animated traffic coupes**
+- **Sampler Feedback Streaming (`[F]`):** distance-LOD residency budgeting mode (dynamically modulates streamed tiles from landmark proximity)
 - **Camera Modes (`[C]`):** **Chase Cam** / **Free Drive (`WASD` + `QE`)** / **Helicopter Orbit**
 
 ### Side-by-Side v0.1 Comparison Video (GPU vs 1-Core CPU: 45 FPS vs 5 FPS)
@@ -74,10 +75,11 @@ Tested on **NVIDIA GeForce RTX 5080 (Driver 621.24)** with **DX12 Debug Layer + 
 5. **PASS 5/7 — AMD Gfx10 Swizzle → BCPack → Async GPU Decode → GPU Detile → Linear BC1**: both `SW_64KB_D` (`512×512`) and `SW_4KB_S` (`256×256`) match original BC1 with `0` byte mismatches (`0.002–0.003 ms` detile)
 6. **PASS 6/7 — Full Mipmap Chain + Packed Mip Tail** (`512×512 .. 64×64` + `85`-block packed tail `32..4`): `0` byte mismatches (`17.012 ms`)
 7. **PASS 7/7 — C-ABI FFI `BcPackDecodeAsync` Smoke Test**: Linear BC1 + Fused Gfx10 `SW_64KB_D` + Non-blocking Async BC7 16-lane: `0` mismatches
+8. **PASS 8/8 — DXR 1.1 Hardware BLAS/TLAS + Inline `RayQuery`** (`4` analytical rays against unit box BVH, `0.003 ms`, `0` mismatches)
 
 ---
 
-## v0.4.0 Performance Leap & Benchmarks (RTX 5080)
+## v0.4.0–v0.5.0 Performance Leap & Benchmarks (RTX 5080)
 
 ### 1. Headless Compute Benchmarks (`bcpack-gpu-demo --bench`)
 
@@ -120,6 +122,8 @@ Tested on **NVIDIA GeForce RTX 5080 (Driver 621.24)** with **DX12 Debug Layer + 
 | `bcpack-demo-gpu.exe` (v0.3 Async Compute) | 256 tiles (8.0 MiB) | **140.13 FPS** | 5.31 ms |
 | `bcpack-demo-gpu.exe` (**v0.4 Zero-Barrier + Ping-Pong**) | 256 tiles (8.0 MiB) | **189.36 FPS** | **4.81 ms** |
 | `bcpack-demo-gpu.exe --chunks 1024` (**v0.4 32 MiB/frame!**) | 1024 tiles (32.0 MiB) | **171.86 FPS** | **5.15 ms** |
+| `bcpack-demo-gpu.exe` (**v0.5 + Hardware DXR 1.1 RT Shadows & Reflections**) | 256 tiles (8.0 MiB) | **171.45 FPS** | **4.77 ms** |
+| `bcpack-demo-gpu.exe --no-rt` (**v0.5 binary w/ DXR OFF**) | 256 tiles (8.0 MiB) | **172.98 FPS** | **4.86 ms** |
 
 ---
 
@@ -132,14 +136,14 @@ git clone https://github.com/POMXARK/bcpack-gpu-hlsl.git
 cd bcpack-gpu-hlsl
 cargo build --release
 
-REM 1. Run all 7 bit-exact verifications + full RTX benchmark suite
+REM 1. Run all 8 bit-exact verifications (incl. DXR 1.1) + full RTX benchmark suite
 target\release\bcpack-gpu-demo.exe --verify --bench
 
-REM 2. OLD CPU baseline (5 FPS) vs NEW Async Compute GPU demo (140 FPS)
+REM 2. OLD CPU baseline (5 FPS) vs NEW Ping-Pong + DXR 1.1 GPU demo (171-189 FPS)
 target\release\bcpack-demo-cpu.exe
 target\release\bcpack-demo-gpu.exe
 
-REM 3. Unified toggleable demo ([SPACE] GPU <-> CPU, [F] SFS LOD mode, [C] Camera)
+REM 3. Unified toggleable demo ([SPACE] GPU <-> CPU, [R] DXR 1.1, [F] SFS, [C] Camera)
 target\release\bcpack-gpu-demo.exe --demo
 ```
 
@@ -154,7 +158,7 @@ BcPackDecodeAsync(ctx, stream, stream_len, num_blocks,
 BcPackWaitFence(ctx, fence, UINT32_MAX);
 ```
 
-To recompile all 7 HLSL shaders yourself (requires Windows 10/11 SDK `dxc.exe`):
+To recompile all 8 HLSL shaders yourself (requires Windows 10/11 SDK `dxc.exe`):
 ```bat
 shaders\compile_shaders.bat
 ```

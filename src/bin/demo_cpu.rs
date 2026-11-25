@@ -41,6 +41,8 @@ fn main() {
             mode: DemoMode::CpuOnly,
             initial_chunks: chunks,
             multi_core_cpu: multi_core,
+            enable_debug: false,
+            start_rt_enabled: false,
             screenshot_path: None,
             screenshot_frames: 20,
             measure_frames,

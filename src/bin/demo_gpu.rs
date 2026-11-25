@@ -6,6 +6,8 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut chunks = 256usize;
+    let enable_debug = args.iter().any(|a| a == "--debug");
+    let start_rt_enabled = !args.iter().any(|a| a == "--no-rt");
     let mut measure_frames: Option<u32> = None;
     let mut assets_dir = PathBuf::from("assets");
 
@@ -37,6 +39,8 @@ fn main() {
             mode: DemoMode::GpuOnly,
             initial_chunks: chunks,
             multi_core_cpu: false,
+            enable_debug,
+            start_rt_enabled,
             screenshot_path: None,
             screenshot_frames: 20,
             measure_frames,

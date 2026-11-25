@@ -218,10 +218,41 @@ pub fn create_committed_buffer(
     res.unwrap()
 }
 
+pub unsafe fn dump_d3d12_info_queue(device: &ID3D12Device) {
+    let reason = device.GetDeviceRemovedReason();
+    eprintln!("[d3d12] GetDeviceRemovedReason = {reason:?}");
+    if let Ok(iq) = device.cast::<ID3D12InfoQueue>() {
+        let count = iq.GetNumStoredMessagesAllowedByRetrievalFilter();
+        for i in 0..count {
+            let mut len = 0usize;
+            let _ = iq.GetMessage(i, None, &mut len);
+            if len > 0 {
+                let mut buf = vec![0u8; len];
+                let msg_ptr = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+                if iq.GetMessage(i, Some(msg_ptr), &mut len).is_ok() {
+                    let msg = &*msg_ptr;
+                    if !msg.pDescription.is_null() && msg.DescriptionByteLength > 0 {
+                        let s = std::slice::from_raw_parts(msg.pDescription, msg.DescriptionByteLength - 1);
+                        eprintln!("[d3d12 {:?}] {}", msg.Severity, String::from_utf8_lossy(s));
+                    }
+                }
+            }
+        }
+        iq.ClearStoredMessages();
+    }
+}
+
 pub unsafe fn upload_slice<T: Copy>(res: &ID3D12Resource, data: &[T]) {
     let mut ptr: *mut c_void = std::ptr::null_mut();
     let empty_range = D3D12_RANGE { Begin: 0, End: 0 };
-    res.Map(0, Some(&empty_range), Some(&mut ptr)).expect("Map failed");
+    if let Err(e) = res.Map(0, Some(&empty_range), Some(&mut ptr)) {
+        let mut dev: Option<ID3D12Device> = None;
+        let _ = res.GetDevice(&mut dev);
+        if let Some(d) = dev {
+            dump_d3d12_info_queue(&d);
+        }
+        panic!("Map failed: {e:?}");
+    }
     copy_nonoverlapping(data.as_ptr() as *const u8, ptr as *mut u8, std::mem::size_of_val(data));
     res.Unmap(0, None);
 }
@@ -361,7 +392,7 @@ impl GpuContext {
 
             let compute_desc = D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
-                Priority: D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0,
+                Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
                 Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
                 NodeMask: 0,
             };
