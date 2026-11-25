@@ -394,19 +394,31 @@ impl GpuContext {
         }
     }
 
-    pub fn signal_and_wait(&mut self) {
+    pub fn signal_direct_async(&mut self) -> u64 {
         unsafe {
             self.fence_value += 1;
             self.queue
                 .Signal(&self.fence, self.fence_value)
-                .expect("Signal DIRECT");
-            if self.fence.GetCompletedValue() < self.fence_value {
-                self.fence
-                    .SetEventOnCompletion(self.fence_value, self.fence_event)
-                    .expect("SetEventOnCompletion DIRECT");
-                WaitForSingleObject(self.fence_event, INFINITE);
-            }
+                .expect("Signal DIRECT async");
+            self.fence_value
         }
+    }
+
+    pub fn wait_direct_cpu(&self, val: u64) {
+        unsafe {
+            if val == 0 || self.fence.GetCompletedValue() >= val {
+                return;
+            }
+            self.fence
+                .SetEventOnCompletion(val, self.fence_event)
+                .expect("SetEventOnCompletion DIRECT");
+            WaitForSingleObject(self.fence_event, INFINITE);
+        }
+    }
+
+    pub fn signal_and_wait(&mut self) {
+        let v = self.signal_direct_async();
+        self.wait_direct_cpu(v);
     }
 
     pub fn signal_compute(&mut self) -> u64 {
@@ -454,6 +466,73 @@ impl Drop for GpuContext {
     }
 }
 
+pub struct Bc1SlotResources {
+    pub streams_upload: ID3D12Resource,
+    pub streams_default: ID3D12Resource,
+    pub chunks_upload: ID3D12Resource,
+    pub chunks_default: ID3D12Resource,
+    pub out_blocks_default: ID3D12Resource,
+    pub status_default: ID3D12Resource,
+    pub ts_query_heap: ID3D12QueryHeap,
+    pub ts_readback: ID3D12Resource,
+    pub cmd_alloc: ID3D12CommandAllocator,
+    pub cmd_list: ID3D12GraphicsCommandList,
+    pub last_compute_fence: u64,
+}
+
+impl Bc1SlotResources {
+    fn new(
+        device: &ID3D12Device,
+        max_stream_bytes: usize,
+        padded_max_chunks: usize,
+        max_blocks: usize,
+    ) -> Self {
+        unsafe {
+            let streams_upload = create_committed_buffer(device, D3D12_HEAP_TYPE_UPLOAD, max_stream_bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let streams_default = create_committed_buffer(device, D3D12_HEAP_TYPE_DEFAULT, max_stream_bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            let chunks_bytes = (padded_max_chunks * size_of::<ChunkDescGpu>()) as u64;
+            let chunks_upload = create_committed_buffer(device, D3D12_HEAP_TYPE_UPLOAD, chunks_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let chunks_default = create_committed_buffer(device, D3D12_HEAP_TYPE_DEFAULT, chunks_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            let out_bytes = (max_blocks * 8) as u64;
+            let out_blocks_default = create_committed_buffer(device, D3D12_HEAP_TYPE_DEFAULT, out_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+            let status_bytes = (padded_max_chunks * size_of::<ChunkStatusGpu>()) as u64;
+            let status_default = create_committed_buffer(device, D3D12_HEAP_TYPE_DEFAULT, status_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+            let mut ts_query_heap: Option<ID3D12QueryHeap> = None;
+            device
+                .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut ts_query_heap)
+                .expect("CreateQueryHeap");
+            let ts_query_heap = ts_query_heap.unwrap();
+            let ts_readback = create_committed_buffer(device, D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            let cmd_alloc: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)
+                .expect("CreateCommandAllocator COMPUTE slot");
+            let cmd_list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &cmd_alloc, None)
+                .expect("CreateCommandList COMPUTE slot");
+            cmd_list.Close().expect("Close initial slot cmd_list");
+
+            Self {
+                streams_upload,
+                streams_default,
+                chunks_upload,
+                chunks_default,
+                out_blocks_default,
+                status_default,
+                ts_query_heap,
+                ts_readback,
+                cmd_alloc,
+                cmd_list,
+                last_compute_fence: 0,
+            }
+        }
+    }
+}
+
 pub struct BcpackGpuDecoder {
     root_sig: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -465,21 +544,9 @@ pub struct BcpackGpuDecoder {
     cap_chunks: usize,
     cap_blocks: usize,
 
-    streams_upload: ID3D12Resource,
-    streams_default: ID3D12Resource,
-    chunks_upload: ID3D12Resource,
-    chunks_default: ID3D12Resource,
-    pub out_blocks_default: ID3D12Resource,
-    status_default: ID3D12Resource,
-
+    pub slots: [Bc1SlotResources; 2],
     out_readback: ID3D12Resource,
     status_readback: ID3D12Resource,
-    ts_query_heap: ID3D12QueryHeap,
-    ts_readback: ID3D12Resource,
-
-    pub cmd_alloc: ID3D12CommandAllocator,
-    pub cmd_list: ID3D12GraphicsCommandList,
-    last_compute_fence: u64,
 }
 
 impl BcpackGpuDecoder {
@@ -551,58 +618,33 @@ impl BcpackGpuDecoder {
             let window_buf = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, win_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
             let quads_buf = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, quad_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
 
-            let cmd_alloc: ID3D12CommandAllocator = ctx
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)
-                .expect("CreateCommandAllocator COMPUTE");
-            let cmd_list: ID3D12GraphicsCommandList = ctx
-                .device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &cmd_alloc, None)
-                .expect("CreateCommandList COMPUTE");
+            let padded_max_chunks = max_chunks + 2;
+            let slots = [
+                Bc1SlotResources::new(&ctx.device, max_stream_bytes, padded_max_chunks, max_blocks),
+                Bc1SlotResources::new(&ctx.device, max_stream_bytes, padded_max_chunks, max_blocks),
+            ];
 
-            cmd_list.CopyBufferRegion(&models_buf, 0, &models_up, 0, models_size);
-            cmd_list.CopyBufferRegion(&window_buf, 0, &win_up, 0, win_size);
-            cmd_list.CopyBufferRegion(&quads_buf, 0, &quad_up, 0, quad_size);
+            slots[0].cmd_alloc.Reset().unwrap();
+            slots[0].cmd_list.Reset(&slots[0].cmd_alloc, None).unwrap();
+            slots[0].cmd_list.CopyBufferRegion(&models_buf, 0, &models_up, 0, models_size);
+            slots[0].cmd_list.CopyBufferRegion(&window_buf, 0, &win_up, 0, win_size);
+            slots[0].cmd_list.CopyBufferRegion(&quads_buf, 0, &quad_up, 0, quad_size);
             let mut barriers = [
                 transition_barrier(&models_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                 transition_barrier(&window_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                 transition_barrier(&quads_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             ];
-            cmd_list.ResourceBarrier(&barriers);
+            slots[0].cmd_list.ResourceBarrier(&barriers);
             drop_barriers(&mut barriers);
-            cmd_list.Close().expect("Close");
-            let lists = [Some(cmd_list.cast::<ID3D12CommandList>().unwrap())];
+            slots[0].cmd_list.Close().expect("Close");
+            let lists = [Some(slots[0].cmd_list.cast::<ID3D12CommandList>().unwrap())];
             ctx.compute_queue.ExecuteCommandLists(&lists);
             ctx.signal_and_wait_compute();
 
-            let streams_upload = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, max_stream_bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-            let streams_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, max_stream_bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-            let padded_max_chunks = max_chunks + 2;
-            let chunks_bytes = (padded_max_chunks * size_of::<ChunkDescGpu>()) as u64;
-            let chunks_upload = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, chunks_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-            let chunks_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, chunks_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
             let out_bytes = (max_blocks * 8) as u64;
-            // Kept in COMMON between submissions so DIRECT queue CopyTextureRegion and COMPUTE UAV share cleanly across fences.
-            let out_blocks_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, out_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-            let out_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, out_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-
             let status_bytes = (padded_max_chunks * size_of::<ChunkStatusGpu>()) as u64;
-            let status_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, status_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let out_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, out_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
             let status_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, status_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-
-            let q_desc = D3D12_QUERY_HEAP_DESC {
-                Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
-                Count: 2,
-                NodeMask: 0,
-            };
-            let mut ts_query_heap: Option<ID3D12QueryHeap> = None;
-            ctx.device
-                .CreateQueryHeap(&q_desc, &mut ts_query_heap)
-                .expect("CreateQueryHeap");
-            let ts_query_heap = ts_query_heap.unwrap();
-            let ts_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
             Self {
                 root_sig,
@@ -613,57 +655,56 @@ impl BcpackGpuDecoder {
                 cap_stream_bytes: max_stream_bytes,
                 cap_chunks: padded_max_chunks,
                 cap_blocks: max_blocks,
-                streams_upload,
-                streams_default,
-                chunks_upload,
-                chunks_default,
-                out_blocks_default,
-                status_default,
+                slots,
                 out_readback,
                 status_readback,
-                ts_query_heap,
-                ts_readback,
-                cmd_alloc,
-                cmd_list,
-                last_compute_fence: 0,
             }
         }
     }
 
-    pub unsafe fn upload_batch(&self, batch: &BatchPayload) {
+    pub fn out_buffer(&self, slot: usize) -> &ID3D12Resource {
+        &self.slots[slot & 1].out_blocks_default
+    }
+
+    pub unsafe fn upload_batch_slot(&self, slot: usize, batch: &BatchPayload) {
         assert!(batch.stream_bytes.len() <= self.cap_stream_bytes, "stream buffer capacity exceeded");
         assert!(batch.chunks.len() <= self.cap_chunks, "chunks capacity exceeded");
         assert!(batch.total_blocks <= self.cap_blocks, "blocks capacity exceeded");
-        upload_slice(&self.streams_upload, &batch.stream_bytes);
-        upload_slice(&self.chunks_upload, &batch.chunks);
+        let s = &self.slots[slot & 1];
+        upload_slice(&s.streams_upload, &batch.stream_bytes);
+        upload_slice(&s.chunks_upload, &batch.chunks);
     }
 
-    /// Records stream/chunk upload and compute dispatch on a COMPUTE (or DIRECT) list.
-    /// Assumes `out_blocks_default` and `status_default` start in COMMON and leaves both in COMMON.
-    pub unsafe fn record_upload_and_dispatch(
+    pub unsafe fn upload_batch(&self, batch: &BatchPayload) {
+        self.upload_batch_slot(0, batch);
+    }
+
+    pub unsafe fn record_slot_upload_and_dispatch(
         &self,
+        slot: usize,
         cmd: &ID3D12GraphicsCommandList,
         batch: &BatchPayload,
         ts_heap: Option<&ID3D12QueryHeap>,
         ts_start_idx: u32,
         ts_end_idx: u32,
     ) {
+        let s = &self.slots[slot & 1];
         let s_len = batch.stream_bytes.len() as u64;
         let c_len = (batch.chunks.len() * size_of::<ChunkDescGpu>()) as u64;
 
         let mut b_pre = [
-            transition_barrier(&self.streams_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
-            transition_barrier(&self.chunks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
-            transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            transition_barrier(&self.status_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition_barrier(&s.streams_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition_barrier(&s.chunks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition_barrier(&s.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition_barrier(&s.status_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ];
         cmd.ResourceBarrier(&b_pre);
         drop_barriers(&mut b_pre);
-        cmd.CopyBufferRegion(&self.streams_default, 0, &self.streams_upload, 0, s_len);
-        cmd.CopyBufferRegion(&self.chunks_default, 0, &self.chunks_upload, 0, c_len);
+        cmd.CopyBufferRegion(&s.streams_default, 0, &s.streams_upload, 0, s_len);
+        cmd.CopyBufferRegion(&s.chunks_default, 0, &s.chunks_upload, 0, c_len);
         let mut b_post = [
-            transition_barrier(&self.streams_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            transition_barrier(&self.chunks_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition_barrier(&s.streams_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition_barrier(&s.chunks_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         ];
         cmd.ResourceBarrier(&b_post);
         drop_barriers(&mut b_post);
@@ -673,10 +714,10 @@ impl BcpackGpuDecoder {
         cmd.SetComputeRootShaderResourceView(0, self.models_buf.GetGPUVirtualAddress());
         cmd.SetComputeRootShaderResourceView(1, self.window_buf.GetGPUVirtualAddress());
         cmd.SetComputeRootShaderResourceView(2, self.quads_buf.GetGPUVirtualAddress());
-        cmd.SetComputeRootShaderResourceView(3, self.streams_default.GetGPUVirtualAddress());
-        cmd.SetComputeRootShaderResourceView(4, self.chunks_default.GetGPUVirtualAddress());
-        cmd.SetComputeRootUnorderedAccessView(5, self.out_blocks_default.GetGPUVirtualAddress());
-        cmd.SetComputeRootUnorderedAccessView(6, self.status_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(3, s.streams_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(4, s.chunks_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(5, s.out_blocks_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(6, s.status_default.GetGPUVirtualAddress());
 
         if let Some(qh) = ts_heap {
             cmd.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, ts_start_idx);
@@ -686,47 +727,70 @@ impl BcpackGpuDecoder {
             cmd.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, ts_end_idx);
         }
         let mut b_end = [
-            transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
-            transition_barrier(&self.status_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+            transition_barrier(&s.out_blocks_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+            transition_barrier(&s.status_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
         ];
         cmd.ResourceBarrier(&b_end);
         drop_barriers(&mut b_end);
     }
 
-    /// Submits BC1 decode onto `ctx.compute_queue` without blocking CPU; returns Compute fence value.
-    pub fn submit_async_compute(&mut self, ctx: &mut GpuContext, batch: &BatchPayload) -> u64 {
-        unsafe {
-            if self.last_compute_fence > 0 {
-                let _ = ctx.wait_compute_cpu(self.last_compute_fence, INFINITE);
-            }
-            self.upload_batch(batch);
-            self.cmd_alloc.Reset().expect("cmd_alloc Reset");
-            self.cmd_list.Reset(&self.cmd_alloc, None).expect("cmd_list Reset");
-            self.record_upload_and_dispatch(&self.cmd_list, batch, Some(&self.ts_query_heap), 0, 1);
-            self.cmd_list.ResolveQueryData(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.ts_readback, 0);
-            self.cmd_list.Close().expect("Close");
+    pub unsafe fn record_upload_and_dispatch(
+        &self,
+        cmd: &ID3D12GraphicsCommandList,
+        batch: &BatchPayload,
+        ts_heap: Option<&ID3D12QueryHeap>,
+        ts_start_idx: u32,
+        ts_end_idx: u32,
+    ) {
+        self.record_slot_upload_and_dispatch(0, cmd, batch, ts_heap, ts_start_idx, ts_end_idx);
+    }
 
-            let lists = [Some(self.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+    /// Submits BC1 decode onto `ctx.compute_queue` for Ping-Pong slot (0 or 1); returns Compute fence value.
+    pub fn submit_slot_async_compute(&mut self, ctx: &mut GpuContext, slot: usize, batch: &BatchPayload) -> u64 {
+        let idx = slot & 1;
+        unsafe {
+            let prev = self.slots[idx].last_compute_fence;
+            if prev > 0 {
+                let _ = ctx.wait_compute_cpu(prev, INFINITE);
+            }
+            self.upload_batch_slot(idx, batch);
+            let s = &mut self.slots[idx];
+            s.cmd_alloc.Reset().expect("slot cmd_alloc Reset");
+            s.cmd_list.Reset(&s.cmd_alloc, None).expect("slot cmd_list Reset");
+            self.record_slot_upload_and_dispatch(idx, &self.slots[idx].cmd_list, batch, Some(&self.slots[idx].ts_query_heap), 0, 1);
+            let s = &mut self.slots[idx];
+            s.cmd_list.ResolveQueryData(&s.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &s.ts_readback, 0);
+            s.cmd_list.Close().expect("Close");
+
+            let lists = [Some(s.cmd_list.cast::<ID3D12CommandList>().unwrap())];
             ctx.compute_queue.ExecuteCommandLists(&lists);
             let val = ctx.signal_compute();
-            self.last_compute_fence = val;
+            s.last_compute_fence = val;
             val
         }
     }
 
-    pub fn read_last_kernel_ms(&self, ctx: &GpuContext) -> f64 {
+    pub fn submit_async_compute(&mut self, ctx: &mut GpuContext, batch: &BatchPayload) -> u64 {
+        self.submit_slot_async_compute(ctx, 0, batch)
+    }
+
+    pub fn read_slot_kernel_ms(&self, ctx: &GpuContext, slot: usize) -> f64 {
         unsafe {
+            let s = &self.slots[slot & 1];
             let mut ptr: *mut c_void = std::ptr::null_mut();
             let r_ts = D3D12_RANGE { Begin: 0, End: 16 };
-            self.ts_readback.Map(0, Some(&r_ts), Some(&mut ptr)).expect("Map ts");
+            s.ts_readback.Map(0, Some(&r_ts), Some(&mut ptr)).expect("Map ts");
             let ts = std::slice::from_raw_parts(ptr as *const u64, 2);
             let ticks = ts[1].saturating_sub(ts[0]);
-            self.ts_readback.Unmap(0, None);
+            s.ts_readback.Unmap(0, None);
             (ticks as f64 / ctx.compute_timestamp_freq as f64) * 1000.0
         }
     }
 
-    /// Runs Async Compute decode, optional Gfx10 detile in another helper or standalone, waits and reads back BC1 bytes.
+    pub fn read_last_kernel_ms(&self, ctx: &GpuContext) -> f64 {
+        self.read_slot_kernel_ms(ctx, 0)
+    }
+
     pub fn decode_batch_and_readback(
         &mut self,
         ctx: &mut GpuContext,
@@ -734,40 +798,44 @@ impl BcpackGpuDecoder {
     ) -> (Vec<u8>, Vec<ChunkStatusGpu>, f64, f64) {
         unsafe {
             let t0 = std::time::Instant::now();
-            if self.last_compute_fence > 0 {
-                let _ = ctx.wait_compute_cpu(self.last_compute_fence, INFINITE);
+            if self.slots[0].last_compute_fence > 0 {
+                let _ = ctx.wait_compute_cpu(self.slots[0].last_compute_fence, INFINITE);
             }
-            self.upload_batch(batch);
+            self.upload_batch_slot(0, batch);
 
-            self.cmd_alloc.Reset().expect("cmd_alloc Reset");
-            self.cmd_list.Reset(&self.cmd_alloc, None).expect("cmd_list Reset");
+            {
+                let s = &self.slots[0];
+                s.cmd_alloc.Reset().expect("cmd_alloc Reset");
+                s.cmd_list.Reset(&s.cmd_alloc, None).expect("cmd_list Reset");
+            }
 
-            self.record_upload_and_dispatch(&self.cmd_list, batch, Some(&self.ts_query_heap), 0, 1);
+            self.record_slot_upload_and_dispatch(0, &self.slots[0].cmd_list, batch, Some(&self.slots[0].ts_query_heap), 0, 1);
 
             let out_bytes = (batch.total_blocks * 8) as u64;
             let status_bytes = (batch.chunks.len() * size_of::<ChunkStatusGpu>()) as u64;
+            let s = &mut self.slots[0];
             let mut b_to_copy = [
-                transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition_barrier(&self.status_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition_barrier(&s.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition_barrier(&s.status_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
             ];
-            self.cmd_list.ResourceBarrier(&b_to_copy);
+            s.cmd_list.ResourceBarrier(&b_to_copy);
             drop_barriers(&mut b_to_copy);
-            self.cmd_list.CopyBufferRegion(&self.out_readback, 0, &self.out_blocks_default, 0, out_bytes);
-            self.cmd_list.CopyBufferRegion(&self.status_readback, 0, &self.status_default, 0, status_bytes);
-            self.cmd_list.ResolveQueryData(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.ts_readback, 0);
+            s.cmd_list.CopyBufferRegion(&self.out_readback, 0, &s.out_blocks_default, 0, out_bytes);
+            s.cmd_list.CopyBufferRegion(&self.status_readback, 0, &s.status_default, 0, status_bytes);
+            s.cmd_list.ResolveQueryData(&s.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &s.ts_readback, 0);
 
             let mut b_restore = [
-                transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-                transition_barrier(&self.status_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&s.out_blocks_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&s.status_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
             ];
-            self.cmd_list.ResourceBarrier(&b_restore);
+            s.cmd_list.ResourceBarrier(&b_restore);
             drop_barriers(&mut b_restore);
-            self.cmd_list.Close().expect("Close");
+            s.cmd_list.Close().expect("Close");
 
-            let lists = [Some(self.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+            let lists = [Some(s.cmd_list.cast::<ID3D12CommandList>().unwrap())];
             ctx.compute_queue.ExecuteCommandLists(&lists);
             ctx.signal_and_wait_compute();
-            self.last_compute_fence = ctx.compute_fence_value;
+            s.last_compute_fence = ctx.compute_fence_value;
             let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             let mut ptr: *mut c_void = std::ptr::null_mut();
@@ -781,17 +849,17 @@ impl BcpackGpuDecoder {
             let statuses = std::slice::from_raw_parts(ptr as *const ChunkStatusGpu, batch.real_chunk_count).to_vec();
             self.status_readback.Unmap(0, None);
 
-            let kernel_ms = self.read_last_kernel_ms(ctx);
+            let kernel_ms = self.read_slot_kernel_ms(ctx, 0);
             (decoded, statuses, kernel_ms, total_ms)
         }
     }
 
     pub fn bench_gpu_kernel_only(&mut self, ctx: &mut GpuContext, batch: &BatchPayload) -> (f64, f64) {
         let t0 = std::time::Instant::now();
-        let fence_val = self.submit_async_compute(ctx, batch);
+        let fence_val = self.submit_slot_async_compute(ctx, 0, batch);
         let _ = ctx.wait_compute_cpu(fence_val, INFINITE);
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let kernel_ms = self.read_last_kernel_ms(ctx);
+        let kernel_ms = self.read_slot_kernel_ms(ctx, 0);
         (kernel_ms, wall_ms)
     }
 }

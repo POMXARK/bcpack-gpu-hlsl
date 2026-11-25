@@ -1,6 +1,26 @@
-# bcpack-gpu-hlsl v0.3.0 — Xbox Velocity Parity (BC7 16-Lane, Gfx10 Detile, Async Compute, C-ABI DLL)
+# bcpack-gpu-hlsl v0.4.0 — Безбарьерный WaveReadLaneAt + Ping-Pong Async Compute (11.33 GB/s, 189 FPS)
 
-![Живая 3D-сцена Coastal Highway на Async Compute GPU (140 FPS)](media/highway_demo.gif)
+![Живая 3D-сцена Coastal Highway на Ping-Pong Async Compute GPU](media/highway_demo.gif)
+
+---
+
+## Что нового в v0.4.0 (0% роста размера файлов на диске)
+
+1. **Ноль барьеров `GroupMemoryBarrierWithGroupSync` внутри горячего цикла ([`shaders/bcpack_decode.hlsl`](shaders/bcpack_decode.hlsl), [`shaders/bcpack_bc7_rans.hlsl`](shaders/bcpack_bc7_rans.hlsl)):**
+   - 64-байтный кэш потока держится в регистрах (`cache_word`), а чтение байт и передача декодированных символов идут напрямую через warp-shuffle **`WaveReadLaneAt`** (убрано >4 096 барьеров на каждый чанк).
+2. **Бинарный поиск за 4 шага + слитный `decode_and_advance`:**
+   - Линейный перебор по 10 сегментам заменён бинарным поиском за 4 шага, а обновление состояния `next_p0` вычисляется тут же без повторного поиска сегмента.
+3. **Двойная буферизация Ping-Pong (`src/gpu_decoder.rs` + `src/demo_scene.rs`):**
+   - Два независимых слота буферов + тройной буфер SwapChain перекрывают декодирование кадра `N+1` на `Async Compute Queue` с рендером кадра `N` на `Direct Queue`.
+
+## Замеры v0.4.0 на NVIDIA GeForce RTX 5080 (Driver 621.24, DX12 Debug Layer)
+- `--verify`: **7 из 7 PASS (`0` расхождений)**.
+- **BC1 4K-тайлы (`2048` чанков = `64.0 MiB`):** **5.650 мс (`11 327.6 MB/s`, `279.0×` vs 1T CPU, `75.7×` vs MT CPU)**.
+- **BC7 16-lane rANS 32/32 (`1024` чанка = `32.0 MiB` BC7 экв.):** **5.312 мс (`6 024.0 MB/s`, `247.1×` vs 1T CPU, `68.9×` vs MT CPU)**.
+- **Gfx10 `SW_64KB_D` Detile (`64.0 MiB`):** **0.144 мс (`432.6 ГБ/с`)**.
+- **Живой FPS в 3D-сцене 1280×720 (Ping-Pong Async Compute):**
+  - `256` тайлов (`8.0 MiB/кадр`): **189.36 FPS** (`4.814 мс` декод, **36.0×** выше `5.26 FPS` на CPU)
+  - `1024` тайла (`32.0 MiB/кадр` — 5.5 ГБ/с вживую!): **171.86 FPS** (`5.148 мс` декод)
 
 Чистая (clean-room) реализация декодера **Xbox Series X|S BCPack** на вычислительных шейдерах **DirectX 12 HLSL SM 6.6 (`WaveSize(32)`)**, приближенная к реальному аппаратному конвейеру консоли (**MDU + Gfx10 Swizzling + Async Compute + DirectStorage C-ABI + SFS**).
 
