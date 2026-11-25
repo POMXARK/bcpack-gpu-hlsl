@@ -5,7 +5,7 @@ use crate::gltf_loader::{
 };
 use crate::gpu_decoder::{
     cmd_barriers, create_committed_buffer, dump_d3d12_info_queue, heap_props, pack_batch,
-    transition_barrier, uav_barrier, upload_slice, BcpackGpuDecoder, GpuContext,
+    transition_barrier, uav_barrier, uav_barrier_all, upload_slice, BcpackGpuDecoder, GpuContext,
 };
 use crate::raytracing::{supports_dxr_1_1, MAX_RT_INSTANCES};
 use crate::rtgi::RTGI_DENOISE_CS_DXIL;
@@ -63,6 +63,8 @@ pub struct AaaDemoConfig {
     pub enable_debug: bool,
     pub xray_mode: bool,
     pub vsync: bool,
+    pub no_rt: bool,
+    pub no_rtgi: bool,
     pub tiles_per_frame: usize,
     pub measure_frames: Option<u32>,
     pub flush_at_frame: Option<u32>,
@@ -79,7 +81,9 @@ impl Default for AaaDemoConfig {
             flush_bench: false,
             enable_debug: false,
             xray_mode: false,
-            vsync: false,
+            vsync: true,
+            no_rt: false,
+            no_rtgi: false,
             tiles_per_frame: 256,
             measure_frames: None,
             flush_at_frame: None,
@@ -517,6 +521,8 @@ struct AaaDxrScene {
     tlas_result: [ID3D12Resource; 2],
     instances_upload: [ID3D12Resource; 2],
     inst_colors_upload: [ID3D12Resource; 2],
+    tlas_alloc: ID3D12CommandAllocator,
+    tlas_cmd: ID3D12GraphicsCommandList,
 }
 
 impl AaaDxrScene {
@@ -648,7 +654,7 @@ impl AaaDxrScene {
                 ScratchAccelerationStructureData: blas_scratch.GetGPUVirtualAddress(),
             };
             cmd4.BuildRaytracingAccelerationStructure(&build_desc, None);
-            cmd_barriers(&list, vec![uav_barrier(&blas_res[i])]);
+            cmd_barriers(&list, vec![uav_barrier(&blas_res[i]), uav_barrier(&blas_scratch)]);
         }
         list.Close().unwrap();
         let exec = [Some(list.cast::<ID3D12CommandList>().unwrap())];
@@ -667,7 +673,7 @@ impl AaaDxrScene {
         ];
         let tlas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
             NumDescs: MAX_RT_INSTANCES as u32,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
@@ -690,6 +696,10 @@ impl AaaDxrScene {
         let blas_box = blas_res.pop().unwrap();
         let blas_car = blas_res.pop().unwrap();
 
+        let tlas_alloc: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let tlas_cmd: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &tlas_alloc, None).unwrap();
+        tlas_cmd.Close().unwrap();
+
         Some(Self {
             blas_car,
             blas_box,
@@ -699,12 +709,14 @@ impl AaaDxrScene {
             tlas_result,
             instances_upload,
             inst_colors_upload,
+            tlas_alloc,
+            tlas_cmd,
         })
     }
 
     unsafe fn build_tlas(
         &self,
-        cmd_list: &ID3D12GraphicsCommandList,
+        ctx: &mut GpuContext,
         slot: usize,
         instances: &[(usize, [f32; 12], [f32; 4])], // (blas_kind 0=car,1=box,2=plane, 3x4, color)
     ) {
@@ -729,10 +741,12 @@ impl AaaDxrScene {
         upload_slice(&self.instances_upload[s], &descs);
         upload_slice(&self.inst_colors_upload[s], &cols);
 
-        let cmd4: ID3D12GraphicsCommandList4 = cmd_list.cast().unwrap();
+        self.tlas_alloc.Reset().unwrap();
+        self.tlas_cmd.Reset(&self.tlas_alloc, None).unwrap();
+        let cmd4: ID3D12GraphicsCommandList4 = self.tlas_cmd.cast().unwrap();
         let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
             NumDescs: count as u32,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
@@ -746,7 +760,11 @@ impl AaaDxrScene {
             ScratchAccelerationStructureData: self.tlas_scratch[s].GetGPUVirtualAddress(),
         };
         cmd4.BuildRaytracingAccelerationStructure(&build_desc, None);
-        cmd_barriers(cmd_list, vec![uav_barrier(&self.tlas_result[s]), uav_barrier(&self.tlas_scratch[s])]);
+        cmd_barriers(&self.tlas_cmd, vec![uav_barrier_all()]);
+        self.tlas_cmd.Close().unwrap();
+        let exec = [Some(self.tlas_cmd.cast::<ID3D12CommandList>().unwrap())];
+        ctx.queue.ExecuteCommandLists(&exec);
+        ctx.signal_and_wait();
     }
 }
 
@@ -1488,8 +1506,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
         let mut wstate = Box::new(WindowState {
             use_gpu: !cfg.start_cpu,
-            rt_enabled: true,
-            rtgi_enabled: true,
+            rt_enabled: !cfg.no_rt,
+            rtgi_enabled: !cfg.no_rt && !cfg.no_rtgi,
             xray_enabled: cfg.xray_mode,
             vsync_enabled: cfg.vsync,
             cam_mode: 0,
@@ -2336,7 +2354,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     let tm = Mat4::translation(pos[0], pos[1], pos[2]).mul(&Mat4::scale(scale[0], scale[1], scale[2]));
                     rt_insts.push((1usize, tm.to_3x4(), [col[0], col[1], col[2], 0.12]));
                 }
-                rt.build_tlas(cmd, slot, &rt_insts);
+                rt.build_tlas(&mut ctx, slot, &rt_insts);
             }
 
             // Begin 3-MRT G-Buffer pass
@@ -2552,16 +2570,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 break;
             }
 
-            if take_shot {
-                ctx.signal_and_wait();
-                if wstate.use_gpu && !taken.is_empty() {
-                    last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
-                }
-            } else {
-                frame_fences[slot] = ctx.signal_direct_async();
-                if wstate.use_gpu && !taken.is_empty() {
-                    last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
-                }
+            ctx.signal_and_wait();
+            frame_fences[slot] = 0;
+            if wstate.use_gpu && !taken.is_empty() {
+                last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
             }
 
             frame_count += 1;

@@ -178,6 +178,18 @@ pub fn uav_barrier(res: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
     }
 }
 
+pub fn uav_barrier_all() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: ManuallyDrop::new(None),
+            }),
+        },
+    }
+}
+
 pub unsafe fn drop_barriers(barriers: &mut [D3D12_RESOURCE_BARRIER]) {
     for b in barriers.iter_mut() {
         if b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {

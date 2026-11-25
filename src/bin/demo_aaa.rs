@@ -17,6 +17,9 @@ fn main() {
             "--debug" => cfg.enable_debug = true,
             "--xray" => cfg.xray_mode = true,
             "--vsync" => cfg.vsync = true,
+            "--no-vsync" => cfg.vsync = false,
+            "--no-rt" => cfg.no_rt = true,
+            "--no-rtgi" => cfg.no_rtgi = true,
             "--tiles-per-frame" if i + 1 < args.len() => {
                 cfg.tiles_per_frame = args[i + 1].parse().unwrap_or(256);
                 i += 1;
