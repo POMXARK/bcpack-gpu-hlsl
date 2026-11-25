@@ -4,3 +4,4 @@ pub mod ffi;
 pub mod gpu_decoder;
 pub mod meshes;
 pub mod raytracing;
+pub mod world_streaming;

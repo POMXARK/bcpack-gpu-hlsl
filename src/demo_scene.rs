@@ -8,6 +8,7 @@ use crate::gpu_decoder::{
 };
 use crate::meshes::{build_all_meshes, MeshRange, Vertex};
 use crate::raytracing::{tex_reflection_color, RayTracingScene, RtInstanceInput, MAX_RT_INSTANCES};
+use crate::world_streaming::WorldStreamManager;
 use bcpack::bc1::{self, QuadTable, Window};
 use rayon::prelude::*;
 use std::ffi::c_void;
@@ -195,6 +196,8 @@ pub struct DemoConfig {
     pub multi_core_cpu: bool,
     pub enable_debug: bool,
     pub start_rt_enabled: bool,
+    pub start_world_stream: bool,
+    pub vram_cap_mb: usize,
     pub screenshot_path: Option<PathBuf>,
     pub screenshot_frames: u32,
     pub measure_frames: Option<u32>,
@@ -502,12 +505,18 @@ pub fn run_demo(
             mode: cfg.mode,
             use_gpu: init_use_gpu,
             multi_core_cpu: cfg.multi_core_cpu,
-            sfs_enabled: false,
+            sfs_enabled: cfg.start_world_stream,
             rt_enabled: false,
             tiles_per_frame: init_tiles,
             cam_mode: 0,
             should_quit: false,
         });
+        let mut world_mgr = WorldStreamManager::new(cfg.vram_cap_mb.clamp(4, 16384) * 1024 * 1024);
+        let mut last_world_res_mb = 0.0f64;
+        let last_world_cap_mb = world_mgr.cap_bytes() as f64 / (1024.0 * 1024.0);
+        let mut last_world_evict = 0u64;
+        let mut last_world_frag = 0.0f64;
+        let mut last_world_peak_mbs = 0.0f64;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *wstate as *mut WindowState) as isize);
         let _ = ShowWindow(hwnd, SW_SHOW);
 
@@ -1037,26 +1046,88 @@ pub fn run_demo(
             };
             let hero_z = t_sec * 18.0;
 
-            let cur_tiles = if wstate.sfs_enabled {
-                // Emulated Sampler Feedback Streaming (SFS): vary active residency budget from highway landmark proximity
-                let span_phase = ((hero_z % 40.0) / 40.0 * std::f32::consts::TAU).cos() * 0.5 + 0.5;
-                let min_tiles = 48usize;
-                let target = min_tiles + (((wstate.tiles_per_frame - min_tiles) as f32) * (0.35 + 0.45 * span_phase)) as usize;
-                let snapped = (target / 2) * 2;
-                snapped.clamp(48, wstate.tiles_per_frame)
-            } else {
-                wstate.tiles_per_frame
+            // Camera selection (computed before streaming so WorldStreamManager tracks real camera pos & forward)
+            let (eye, target) = match wstate.cam_mode {
+                0 => {
+                    // Chase Car Camera
+                    let hx = 2.4 + (t_sec * 0.7).sin() * 0.45;
+                    let eye = [hx - 0.6 + (t_sec * 0.35).sin() * 1.1, 3.6, hero_z - 9.2];
+                    let tgt = [hx * 0.65, 1.8, hero_z + 18.0];
+                    (eye, tgt)
+                }
+                1 => {
+                    // Free Drive Camera (WASD + QE + Left/Right)
+                    let spd = 22.0 * dt;
+                    let rot_spd = 1.6 * dt;
+                    if GetAsyncKeyState(VK_LEFT.0 as i32) < 0 { free_yaw -= rot_spd; }
+                    if GetAsyncKeyState(VK_RIGHT.0 as i32) < 0 { free_yaw += rot_spd; }
+                    let (sy, cy) = free_yaw.sin_cos();
+                    if GetAsyncKeyState(VK_W.0 as i32) < 0 { free_pos[0] += sy * spd; free_pos[2] += cy * spd; }
+                    if GetAsyncKeyState(VK_S.0 as i32) < 0 { free_pos[0] -= sy * spd; free_pos[2] -= cy * spd; }
+                    if GetAsyncKeyState(VK_D.0 as i32) < 0 { free_pos[0] += cy * spd; free_pos[2] -= sy * spd; }
+                    if GetAsyncKeyState(VK_A.0 as i32) < 0 { free_pos[0] -= cy * spd; free_pos[2] += sy * spd; }
+                    if GetAsyncKeyState(VK_E.0 as i32) < 0 { free_pos[1] += spd; }
+                    if GetAsyncKeyState(VK_Q.0 as i32) < 0 { free_pos[1] = (free_pos[1] - spd).max(0.8); }
+                    let tgt = [free_pos[0] + sy * 15.0, free_pos[1] - 1.2, free_pos[2] + cy * 15.0];
+                    (free_pos, tgt)
+                }
+                _ => {
+                    // Helicopter Orbit Camera
+                    let ang = t_sec * 0.32;
+                    let eye = [ang.sin() * 20.0 + 4.0, 12.5, hero_z - ang.cos() * 24.0];
+                    let tgt = [0.0, 3.5, hero_z + 8.0];
+                    (eye, tgt)
+                }
             };
-            let sfs_batch;
-            let batch = if let Some((_, b)) = batches.iter().find(|(n, _)| *n == cur_tiles) {
-                b
+            let cam_fwd = norm3(sub3(target, eye));
+
+            let mut world_tile_pairs: Vec<(usize, usize)> = Vec::new();
+            let world_active_frame = wstate.sfs_enabled && frame_count > 0;
+            let dyn_batch;
+            let (batch, cur_tiles) = if world_active_frame {
+                // Scale highway Z into 32x32 250m sector coordinates so high-speed driving traverses & evicts sectors continuously
+                let world_pos = [eye[0] * 3.0, eye[1], eye[2] * 3.5];
+                let step = world_mgr.update(
+                    world_pos,
+                    cam_fwd,
+                    frame_count as u64,
+                    dt.max(0.001),
+                    wstate.tiles_per_frame.min(max_tiles),
+                );
+                last_world_res_mb = step.resident_bytes as f64 / (1024.0 * 1024.0);
+                last_world_evict = step.total_evictions;
+                last_world_frag = step.fragmentation_pct;
+                last_world_peak_mbs = step.peak_mbs;
+
+                world_tile_pairs = step.tiles_to_decode;
+                if world_tile_pairs.is_empty() {
+                    let base = (frame_count as usize) * 4;
+                    for k in 0..4usize {
+                        let i = base + k;
+                        world_tile_pairs.push(((i / TILE_STRIPS) % NUM_TEX, i % TILE_STRIPS));
+                    }
+                }
+                if world_tile_pairs.len() > max_tiles {
+                    world_tile_pairs.truncate(max_tiles);
+                }
+                dyn_batch = pack_batch(
+                    world_tile_pairs
+                        .iter()
+                        .map(|&(tex_i, strip)| (assets[tex_i].bcpack_tiles[strip].as_slice(), TILE_BLOCKS)),
+                );
+                (&dyn_batch, world_tile_pairs.len())
             } else {
-                sfs_batch = pack_batch((0..cur_tiles).map(|i| {
-                    let tex_i = (i / TILE_STRIPS) % NUM_TEX;
-                    let strip = i % TILE_STRIPS;
-                    (assets[tex_i].bcpack_tiles[strip].as_slice(), TILE_BLOCKS)
-                }));
-                &sfs_batch
+                let target_tiles = wstate.tiles_per_frame;
+                if let Some((_, b)) = batches.iter().find(|(n, _)| *n == target_tiles) {
+                    (b, target_tiles)
+                } else {
+                    dyn_batch = pack_batch((0..target_tiles).map(|i| {
+                        let tex_i = (i / TILE_STRIPS) % NUM_TEX;
+                        let strip = i % TILE_STRIPS;
+                        (assets[tex_i].bcpack_tiles[strip].as_slice(), TILE_BLOCKS)
+                    }));
+                    (&dyn_batch, target_tiles)
+                }
             };
             let streamed_mb = (cur_tiles * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0);
 
@@ -1075,7 +1146,27 @@ pub fn run_demo(
             if !wstate.use_gpu {
                 pending_compute_fences = [None, None];
                 let t0 = Instant::now();
-                let decoded_list: Vec<Vec<u8>> = if wstate.multi_core_cpu {
+                let decoded_list: Vec<Vec<u8>> = if world_active_frame {
+                    if wstate.multi_core_cpu {
+                        world_tile_pairs
+                            .par_iter()
+                            .map(|&(tex_i, strip)| {
+                                bc1::decode(&assets[tex_i].bcpack_tiles[strip], TILE_BLOCKS, window_tbl, quads_tbl)
+                                    .unwrap()
+                                    .blocks
+                            })
+                            .collect()
+                    } else {
+                        world_tile_pairs
+                            .iter()
+                            .map(|&(tex_i, strip)| {
+                                bc1::decode(&assets[tex_i].bcpack_tiles[strip], TILE_BLOCKS, window_tbl, quads_tbl)
+                                    .unwrap()
+                                    .blocks
+                            })
+                            .collect()
+                    }
+                } else if wstate.multi_core_cpu {
                     (0..cur_tiles)
                         .into_par_iter()
                         .map(|i| {
@@ -1097,8 +1188,16 @@ pub fn run_demo(
                         })
                         .collect()
                 };
-                for ti in 0..(NUM_TEX * TILE_STRIPS) {
-                    cpu_buf[ti * TILE_BC1_BYTES..(ti + 1) * TILE_BC1_BYTES].copy_from_slice(&decoded_list[ti]);
+                if world_active_frame {
+                    for (idx, &(tex_i, strip)) in world_tile_pairs.iter().enumerate() {
+                        let slot = tex_i * TILE_STRIPS + strip;
+                        cpu_buf[slot * TILE_BC1_BYTES..(slot + 1) * TILE_BC1_BYTES]
+                            .copy_from_slice(&decoded_list[idx]);
+                    }
+                } else {
+                    for ti in 0..(NUM_TEX * TILE_STRIPS).min(decoded_list.len()) {
+                        cpu_buf[ti * TILE_BC1_BYTES..(ti + 1) * TILE_BC1_BYTES].copy_from_slice(&decoded_list[ti]);
+                    }
                 }
                 upload_slice(&cpu_upload_buf, &cpu_buf);
                 decomp_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1109,10 +1208,10 @@ pub fn run_demo(
                     Some(v) => v,
                     None => gpu_dec.submit_slot_async_compute(&mut ctx, cur_slot, batch),
                 };
-                // 2) Kick next frame's decode onto next_slot asynchronously ONLY when DXR is off
-                //    (on Blackwell, concurrent high-occupancy Compute + DXR BuildTLAS/RayQuery can trip TDR).
+                // 2) Kick next frame's decode onto next_slot asynchronously ONLY when DXR is off and world stream is off
                 let rt_active = rt_scene.is_some() && wstate.rt_enabled;
                 let kick_next = !rt_active
+                    && !world_active_frame
                     && cfg.screenshot_path.is_none()
                     && (cfg.record_dir.is_none() || frame_count + 1 < cfg.record_frames);
                 if kick_next && pending_compute_fences[next_slot].is_none() {
@@ -1129,7 +1228,7 @@ pub fn run_demo(
             cmd_alloc.Reset().unwrap();
             cmd_list.Reset(cmd_alloc, None).unwrap();
 
-            // Copy all 48 decoded 4K tiles (12 textures x 4 strips) directly into the 12 DXGI_FORMAT_BC1_UNORM textures
+            // Copy decoded 4K tiles directly into the 12 DXGI_FORMAT_BC1_UNORM textures
             let mut to_copy = Vec::with_capacity(NUM_TEX + 1);
             for t in &textures {
                 to_copy.push(transition_barrier(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
@@ -1144,9 +1243,14 @@ pub fn run_demo(
             } else {
                 &cpu_upload_buf
             };
-            for (ti, tex) in textures.iter().enumerate() {
-                for strip in 0..TILE_STRIPS {
-                    let tile_idx = ti * TILE_STRIPS + strip;
+            if world_active_frame {
+                for (idx, &(ti, strip)) in world_tile_pairs.iter().enumerate() {
+                    let tex = &textures[ti];
+                    let src_offset = if wstate.use_gpu {
+                        (idx * TILE_BC1_BYTES) as u64
+                    } else {
+                        ((ti * TILE_STRIPS + strip) * TILE_BC1_BYTES) as u64
+                    };
                     let mut dst = D3D12_TEXTURE_COPY_LOCATION {
                         pResource: ManuallyDrop::new(Some(tex.clone())),
                         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1157,13 +1261,13 @@ pub fn run_demo(
                         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                             PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: (tile_idx * TILE_BC1_BYTES) as u64,
+                                Offset: src_offset,
                                 Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                                     Format: DXGI_FORMAT_BC1_UNORM,
                                     Width: TEX_W as u32,
-                                    Height: (TEX_H / TILE_STRIPS) as u32, // 128 px strip
+                                    Height: (TEX_H / TILE_STRIPS) as u32,
                                     Depth: 1,
-                                    RowPitch: (TEX_W / 4 * 8) as u32, // 1024 bytes
+                                    RowPitch: (TEX_W / 4 * 8) as u32,
                                 },
                             },
                         },
@@ -1171,6 +1275,36 @@ pub fn run_demo(
                     cmd_list.CopyTextureRegion(&dst, 0, (strip * (TEX_H / TILE_STRIPS)) as u32, 0, &src, None);
                     let _ = ManuallyDrop::take(&mut dst.pResource);
                     let _ = ManuallyDrop::take(&mut src.pResource);
+                }
+            } else {
+                for (ti, tex) in textures.iter().enumerate() {
+                    for strip in 0..TILE_STRIPS {
+                        let tile_idx = ti * TILE_STRIPS + strip;
+                        let mut dst = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: ManuallyDrop::new(Some(tex.clone())),
+                            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                        };
+                        let mut src = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: ManuallyDrop::new(Some(src_res.clone())),
+                            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                    Offset: (tile_idx * TILE_BC1_BYTES) as u64,
+                                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                        Format: DXGI_FORMAT_BC1_UNORM,
+                                        Width: TEX_W as u32,
+                                        Height: (TEX_H / TILE_STRIPS) as u32, // 128 px strip
+                                        Depth: 1,
+                                        RowPitch: (TEX_W / 4 * 8) as u32, // 1024 bytes
+                                    },
+                                },
+                            },
+                        };
+                        cmd_list.CopyTextureRegion(&dst, 0, (strip * (TEX_H / TILE_STRIPS)) as u32, 0, &src, None);
+                        let _ = ManuallyDrop::take(&mut dst.pResource);
+                        let _ = ManuallyDrop::take(&mut src.pResource);
+                    }
                 }
             }
 
@@ -1240,40 +1374,6 @@ pub fn run_demo(
             let sc = RECT { left: 0, top: 0, right: WIN_W as i32, bottom: WIN_H as i32 };
             cmd_list.RSSetViewports(&[vp]);
             cmd_list.RSSetScissorRects(&[sc]);
-
-            // Camera selection
-            let (eye, target) = match wstate.cam_mode {
-                0 => {
-                    // Chase Car Camera
-                    let hx = 2.4 + (t_sec * 0.7).sin() * 0.45;
-                    let eye = [hx - 0.6 + (t_sec * 0.35).sin() * 1.1, 3.6, hero_z - 9.2];
-                    let tgt = [hx * 0.65, 1.8, hero_z + 18.0];
-                    (eye, tgt)
-                }
-                1 => {
-                    // Free Drive Camera (WASD + QE + Left/Right)
-                    let spd = 22.0 * dt;
-                    let rot_spd = 1.6 * dt;
-                    if GetAsyncKeyState(VK_LEFT.0 as i32) < 0 { free_yaw -= rot_spd; }
-                    if GetAsyncKeyState(VK_RIGHT.0 as i32) < 0 { free_yaw += rot_spd; }
-                    let (sy, cy) = free_yaw.sin_cos();
-                    if GetAsyncKeyState(VK_W.0 as i32) < 0 { free_pos[0] += sy * spd; free_pos[2] += cy * spd; }
-                    if GetAsyncKeyState(VK_S.0 as i32) < 0 { free_pos[0] -= sy * spd; free_pos[2] -= cy * spd; }
-                    if GetAsyncKeyState(VK_D.0 as i32) < 0 { free_pos[0] += cy * spd; free_pos[2] -= sy * spd; }
-                    if GetAsyncKeyState(VK_A.0 as i32) < 0 { free_pos[0] -= cy * spd; free_pos[2] += sy * spd; }
-                    if GetAsyncKeyState(VK_E.0 as i32) < 0 { free_pos[1] += spd; }
-                    if GetAsyncKeyState(VK_Q.0 as i32) < 0 { free_pos[1] = (free_pos[1] - spd).max(0.8); }
-                    let tgt = [free_pos[0] + sy * 15.0, free_pos[1] - 1.2, free_pos[2] + cy * 15.0];
-                    (free_pos, tgt)
-                }
-                _ => {
-                    // Helicopter Orbit Camera
-                    let ang = t_sec * 0.32;
-                    let eye = [ang.sin() * 20.0 + 4.0, 12.5, hero_z - ang.cos() * 24.0];
-                    let tgt = [0.0, 3.5, hero_z + 8.0];
-                    (eye, tgt)
-                }
-            };
 
             let view = Mat4::look_at_lh(eye, target, [0.0, 1.0, 0.0]);
             let vp_mat = proj.mul(&view);
@@ -1452,10 +1552,18 @@ pub fn run_demo(
                         } else {
                             "OLD_CPU_1CORE"
                         };
-                        println!(
-                            "[fps] mode={} tiles={} ({:.1} MiB/frame) frames={} avg_fps={:.2} avg_decode_ms={:.3}",
-                            mode_tag, cur_tiles, streamed_mb, measured, avg_fps, avg_dec
-                        );
+                        if wstate.sfs_enabled {
+                            println!(
+                                "[fps] mode={} tiles={} ({:.1} MiB/frame) frames={} avg_fps={:.2} avg_decode_ms={:.3} Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Frag:{:.0}% Peak:{:.0}MB/s",
+                                mode_tag, cur_tiles, streamed_mb, measured, avg_fps, avg_dec,
+                                last_world_res_mb, last_world_cap_mb, last_world_evict, last_world_frag, last_world_peak_mbs
+                            );
+                        } else {
+                            println!(
+                                "[fps] mode={} tiles={} ({:.1} MiB/frame) frames={} avg_fps={:.2} avg_decode_ms={:.3}",
+                                mode_tag, cur_tiles, streamed_mb, measured, avg_fps, avg_dec
+                            );
+                        }
                         break;
                     }
                 }
@@ -1470,7 +1578,7 @@ pub fn run_demo(
                     0.0
                 };
                 let mode_str = if wstate.use_gpu {
-                    "NEW v0.5: AsyncCompute+DXR"
+                    "NEW v0.6: AsyncCompute+DXR"
                 } else if wstate.multi_core_cpu {
                     "OLD: CPU Multi-Core"
                 } else {
@@ -1483,10 +1591,17 @@ pub fn run_demo(
                 };
                 let sfs_str = if wstate.sfs_enabled { "ON" } else { "OFF" };
                 let rt_str = if rt_scene.is_some() && wstate.rt_enabled { "ON" } else { "OFF" };
-                let title = format!(
-                    "{} | {:.1} FPS | {:.1} MB/f ({}t) | Dec:{:.2}ms ({:.0} MB/s) | RT[R]:{} SFS[F]:{} | Cam[C]:{}",
-                    mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, rt_str, sfs_str, cam_str
-                );
+                let title = if wstate.sfs_enabled {
+                    format!(
+                        "{} | {:.1} FPS | Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Frag:{:.0}% Peak:{:.0}MB/s | RT[R]:{} SFS[F]:{} Cam[C]:{}",
+                        mode_str, fps, last_world_res_mb, last_world_cap_mb, last_world_evict, last_world_frag, last_world_peak_mbs, rt_str, sfs_str, cam_str
+                    )
+                } else {
+                    format!(
+                        "{} | {:.1} FPS | {:.1} MB/f ({}t) | Dec:{:.2}ms ({:.0} MB/s) | RT[R]:{} SFS[F]:{} | Cam[C]:{}",
+                        mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, rt_str, sfs_str, cam_str
+                    )
+                };
                 let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
                 fps_accum = 0;

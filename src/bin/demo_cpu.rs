@@ -7,6 +7,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut chunks = 256usize;
     let mut multi_core = false;
+    let start_world_stream = args.iter().any(|a| a == "--world-stream");
+    let mut vram_cap_mb = 32usize;
     let mut measure_frames: Option<u32> = None;
     let mut assets_dir = PathBuf::from("assets");
 
@@ -17,6 +19,9 @@ fn main() {
             i += 1;
         } else if args[i] == "--chunks" && i + 1 < args.len() {
             chunks = args[i + 1].parse().unwrap_or(256);
+            i += 2;
+        } else if args[i] == "--vram-cap-mb" && i + 1 < args.len() {
+            vram_cap_mb = args[i + 1].parse().unwrap_or(32);
             i += 2;
         } else if args[i] == "--measure-frames" && i + 1 < args.len() {
             measure_frames = Some(args[i + 1].parse().unwrap_or(10));
@@ -43,6 +48,8 @@ fn main() {
             multi_core_cpu: multi_core,
             enable_debug: false,
             start_rt_enabled: false,
+            start_world_stream,
+            vram_cap_mb,
             screenshot_path: None,
             screenshot_frames: 20,
             measure_frames,

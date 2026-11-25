@@ -17,6 +17,7 @@ use bcpack_gpu::gpu_decoder::{
     pack_batch, Bc7RansGpuDecoder, BcpackGpuDecoder, Gfx10DetileGpu, GpuContext,
 };
 use bcpack_gpu::raytracing::run_rt_verify;
+use bcpack_gpu::world_streaming::run_world_stream_verify;
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -46,8 +47,8 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         .map(|c| c.1)
         .sum::<usize>()
         .max(assets.len() * NUM_BLOCKS)
-        .max(65536);
-    let max_chunks = cases.len().max(total_tiles).max(64);
+        .max(256 * TILE_BLOCKS);
+    let max_chunks = cases.len().max(total_tiles).max(256);
     let mut gpu_dec = BcpackGpuDecoder::new(&mut ctx, &window, &quads, max_chunks, max_blocks, 32 * 1024 * 1024);
 
     let mut synth_streams = Vec::new();
@@ -78,7 +79,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         offset += byte_len;
     }
     println!(
-        "[verify] PASS 1/7 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 1/9 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
         cases.len(),
         cases.iter().map(|c| c.1).sum::<usize>(),
         gpu_ms
@@ -98,7 +99,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 2/7 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 2/9 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         assets.len(),
         tex_gpu_ms
     );
@@ -123,7 +124,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 3/7 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 3/9 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         total_tiles,
         tile_gpu_ms
     );
@@ -167,7 +168,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         row_off += *rows;
     }
     println!(
-        "[verify] PASS 4/7 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
+        "[verify] PASS 4/9 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
         bc7_cases.len(),
         total_sym_rows,
         bc7_gpu_ms
@@ -190,7 +191,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         let (detiled, det_ms) = detile.detile_and_readback(&mut ctx, &gpu_swizzled_out, w_blk as u32, h_blk as u32, tile_mode, 8);
         assert_eq!(detiled.as_slice(), linear_bc1.as_slice(), "FAIL Gfx10 detile mismatch on {name}");
         println!(
-            "[verify] PASS 5/7 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
+            "[verify] PASS 5/9 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
         );
     }
 
@@ -210,7 +211,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         m_off += byte_len;
     }
     println!(
-        "[verify] PASS 6/7 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 6/9 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
         mip_chain.len(),
         mip_ms
     );
@@ -281,14 +282,21 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         assert_eq!(BcPackGetLastTimingMs(ffi_ctx, &mut kms), 0);
         bcpack_gpu_destroy(ffi_ctx);
         println!(
-            "[verify] PASS 7/7 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
+            "[verify] PASS 7/9 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
         );
     }
 
     // 8) DXR 1.1 Hardware BVH + Inline RayQuery verification on RT Cores
     let rt_ms = run_rt_verify(&mut ctx);
     println!(
-        "[verify] PASS 8/8 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
+        "[verify] PASS 8/9 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
+    );
+
+    // 9) World Grid 32x32 Streaming + LRU VRAM Residency Manager verification
+    let ws = run_world_stream_verify(&mut ctx, &mut gpu_dec, &assets);
+    println!(
+        "[verify] PASS 9/9 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
+        ws.frames, ws.verified_tiles, ws.total_evictions, ws.turn_burst_tiles, ws.peak_mbs, ws.gpu_ms
     );
     let _ = (BCPACK_SWIZZLE_GFX10_4KB_S,);
 }
@@ -579,6 +587,8 @@ fn main() {
     let regen_assets = args.iter().any(|a| a == "--regen-assets");
     let enable_debug = args.iter().any(|a| a == "--debug");
     let start_rt_enabled = !args.iter().any(|a| a == "--no-rt");
+    let start_world_stream = args.iter().any(|a| a == "--world-stream");
+    let mut vram_cap_mb = 32usize;
 
     let mut screenshot: Option<PathBuf> = None;
     let mut frames = 20u32;
@@ -604,6 +614,9 @@ fn main() {
         } else if args[i] == "--chunks" && i + 1 < args.len() {
             chunks = args[i + 1].parse().unwrap_or(256);
             i += 2;
+        } else if args[i] == "--vram-cap-mb" && i + 1 < args.len() {
+            vram_cap_mb = args[i + 1].parse().unwrap_or(32);
+            i += 2;
         } else if args[i] == "--measure-frames" && i + 1 < args.len() {
             measure_frames = Some(args[i + 1].parse().unwrap_or(20));
             i += 2;
@@ -616,7 +629,7 @@ fn main() {
     }
 
     if !do_verify && !do_bench && !do_demo {
-        println!("Usage: bcpack-gpu-demo [--verify] [--bench] [--demo] [--chunks N] [--measure-frames N] [--assets-dir <dir>] [--screenshot <out.png> --frames <N>] [--record-dir <dir> --record-frames <N>] [--regen-assets]");
+        println!("Usage: bcpack-gpu-demo [--verify] [--bench] [--demo] [--chunks N] [--world-stream] [--vram-cap-mb N] [--measure-frames N] [--assets-dir <dir>] [--screenshot <out.png> --frames <N>] [--record-dir <dir> --record-frames <N>] [--regen-assets]");
         return;
     }
 
@@ -640,6 +653,8 @@ fn main() {
                 multi_core_cpu: true,
                 enable_debug,
                 start_rt_enabled,
+                start_world_stream,
+                vram_cap_mb,
                 screenshot_path: screenshot,
                 screenshot_frames: frames,
                 measure_frames,
