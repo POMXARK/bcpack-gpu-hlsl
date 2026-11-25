@@ -1,8 +1,12 @@
-use crate::assets::{TextureAsset, NUM_BLOCKS, TEX_BC1_BYTES, TEX_H, TEX_W};
+use crate::assets::{
+    TextureAsset, ASSET_NAMES, TEX_BC1_BYTES, TEX_H, TEX_W, TILE_BC1_BYTES, TILE_BLOCKS,
+    TILE_STRIPS,
+};
 use crate::gpu_decoder::{
     cmd_barriers, create_committed_buffer, drop_barriers, heap_props, pack_batch,
     transition_barrier, upload_slice, BcpackGpuDecoder, GpuContext,
 };
+use crate::meshes::{build_all_meshes, MeshRange, Vertex};
 use bcpack::bc1::{self, QuadTable, Window};
 use rayon::prelude::*;
 use std::ffi::c_void;
@@ -10,6 +14,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::mem::{size_of, ManuallyDrop};
 use std::path::PathBuf;
+use std::ptr::copy_nonoverlapping;
 use std::time::Instant;
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -19,22 +24,28 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_DOWN, VK_ESCAPE, VK_M, VK_SPACE, VK_UP,
+    GetAsyncKeyState, VK_A, VK_C, VK_D, VK_DOWN, VK_E, VK_ESCAPE, VK_LEFT, VK_M, VK_Q,
+    VK_RIGHT, VK_S, VK_SPACE, VK_UP, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const SCENE_VS_DXIL: &[u8] = include_bytes!("../shaders/scene_vs.dxil");
 pub const SCENE_PS_DXIL: &[u8] = include_bytes!("../shaders/scene_ps.dxil");
+pub const SKY_VS_DXIL: &[u8] = include_bytes!("../shaders/sky_vs.dxil");
+pub const SKY_PS_DXIL: &[u8] = include_bytes!("../shaders/sky_ps.dxil");
 
 const WIN_W: u32 = 1280;
 const WIN_H: u32 = 720;
+const NUM_TEX: usize = ASSET_NAMES.len(); // 12
+const MAX_DRAWS: usize = 320;
+const CB_STRIDE: usize = 512;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Vertex {
-    pos: [f32; 3],
-    normal: [f32; 3],
-    uv: [f32; 2],
+struct SkyConstants {
+    inv_view_proj: [f32; 16],
+    camera_pos: [f32; 3],
+    time: f32,
 }
 
 #[repr(C)]
@@ -46,9 +57,11 @@ struct DrawConstants {
     emissive: f32,
     time: f32,
     uv_scale: f32,
+    camera_pos: [f32; 4],
+    point_lights: [[f32; 4]; 4],
+    light_colors: [[f32; 4]; 4],
 }
 
-// Column-major 4x4 matrix helpers matching HLSL default column_major mul(M, v)
 #[derive(Clone, Copy)]
 struct Mat4([f32; 16]);
 
@@ -100,6 +113,50 @@ impl Mat4 {
             -dot3(r, eye), -dot3(u, eye), -dot3(f, eye), 1.0,
         ])
     }
+
+    fn inverse(&self) -> Mat4 {
+        let m = &self.0;
+        let mut inv = [0.0f32; 16];
+        inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
+            + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+        inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
+            - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+        inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
+            + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+        inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
+            - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+        inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
+            - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+        inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
+            + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+        inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
+            - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+        inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
+            + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+        inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
+            + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+        inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
+            - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+        inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
+            + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+        inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
+            - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+        inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
+            - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+        inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
+            + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+        inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
+            - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+        inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
+            + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+        let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+        let inv_det = if det.abs() > 1e-8 { 1.0 / det } else { 1.0 };
+        for v in &mut inv {
+            *v *= inv_det;
+        }
+        Mat4(inv)
+    }
 }
 
 #[inline]
@@ -124,103 +181,6 @@ fn norm3(v: [f32; 3]) -> [f32; 3] {
     [v[0] / l, v[1] / l, v[2] / l]
 }
 
-fn build_unit_cube() -> (Vec<Vertex>, Vec<u16>) {
-    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
-        // +Z front
-        ([0.0, 0.0, 1.0], [[-0.5, -0.5, 0.5], [-0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5]]),
-        // -Z back
-        ([0.0, 0.0, -1.0], [[0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5], [-0.5, -0.5, -0.5]]),
-        // +X right
-        ([1.0, 0.0, 0.0], [[0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, -0.5], [0.5, -0.5, -0.5]]),
-        // -X left
-        ([-1.0, 0.0, 0.0], [[-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [-0.5, -0.5, 0.5]]),
-        // +Y top
-        ([0.0, 1.0, 0.0], [[-0.5, 0.5, 0.5], [-0.5, 0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5]]),
-        // -Y bottom
-        ([0.0, -1.0, 0.0], [[-0.5, -0.5, -0.5], [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, -0.5, -0.5]]),
-    ];
-    let uvs = [[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]];
-    let mut verts = Vec::with_capacity(24);
-    let mut inds = Vec::with_capacity(36);
-    for (fi, (n, pts)) in faces.iter().enumerate() {
-        let base = (fi * 4) as u16;
-        for i in 0..4 {
-            verts.push(Vertex {
-                pos: pts[i],
-                normal: *n,
-                uv: uvs[i],
-            });
-        }
-        inds.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
-    (verts, inds)
-}
-
-struct SceneBox {
-    pos: [f32; 3],
-    rot_y: f32,
-    scale: [f32; 3],
-    tex: u32,
-    emissive: f32,
-    uv_scale: f32,
-    spin: bool,
-}
-
-fn build_vice_city_scene() -> Vec<SceneBox> {
-    let mut boxes = Vec::new();
-    // Main asphalt boulevard
-    boxes.push(SceneBox { pos: [0.0, -0.1, 0.0], rot_y: 0.0, scale: [10.0, 0.2, 70.0], tex: 0, emissive: 0.05, uv_scale: 3.0, spin: false });
-    // Left & right terracotta sidewalks
-    boxes.push(SceneBox { pos: [-7.5, -0.05, 0.0], rot_y: 0.0, scale: [5.0, 0.3, 70.0], tex: 3, emissive: 0.05, uv_scale: 4.0, spin: false });
-    boxes.push(SceneBox { pos: [7.5, -0.05, 0.0], rot_y: 0.0, scale: [5.0, 0.3, 70.0], tex: 3, emissive: 0.05, uv_scale: 4.0, spin: false });
-    // Caribbean ocean bay on the right
-    boxes.push(SceneBox { pos: [28.0, -0.35, 0.0], rot_y: 0.0, scale: [36.0, 0.2, 80.0], tex: 4, emissive: 0.12, uv_scale: 5.0, spin: false });
-    // Left plaza ground
-    boxes.push(SceneBox { pos: [-22.0, -0.15, 0.0], rot_y: 0.0, scale: [24.0, 0.2, 80.0], tex: 3, emissive: 0.02, uv_scale: 6.0, spin: false });
-
-    // Art-Deco neon & Miami pastel buildings on the left strip
-    let left_buildings = [
-        (-13.5, -18.0, 8.0, 14.0, 8.0, 1u32, 0.35, 2.0),
-        (-13.0, -6.0, 7.0, 9.5, 7.5, 2u32, 0.20, 1.5),
-        (-14.0, 7.0, 8.5, 17.0, 8.5, 1u32, 0.40, 2.0),
-        (-13.0, 20.0, 7.0, 11.0, 8.0, 2u32, 0.25, 1.5),
-    ];
-    for &(x, z, sx, sy, sz, tex, em, uv) in &left_buildings {
-        boxes.push(SceneBox { pos: [x, sy * 0.5, z], rot_y: 0.0, scale: [sx, sy, sz], tex, emissive: em, uv_scale: uv, spin: false });
-    }
-
-    // Oceanfront boutique hotels on the right boardwalk
-    let right_buildings = [
-        (13.0, -14.0, 6.0, 7.5, 7.0, 2u32, 0.22, 1.5),
-        (13.5, 12.0, 6.5, 11.5, 7.0, 1u32, 0.35, 1.8),
-    ];
-    for &(x, z, sx, sy, sz, tex, em, uv) in &right_buildings {
-        boxes.push(SceneBox { pos: [x, sy * 0.5, z], rot_y: 0.0, scale: [sx, sy, sz], tex, emissive: em, uv_scale: uv, spin: false });
-    }
-
-    // Palm trees along the boulevard
-    for &z in &[-20.0f32, -10.0, 0.0, 10.0, 20.0] {
-        for &side in &[-6.0f32, 6.0] {
-            // Trunk
-            boxes.push(SceneBox { pos: [side, 2.2, z], rot_y: 0.0, scale: [0.35, 4.4, 0.35], tex: 3, emissive: 0.0, uv_scale: 1.0, spin: false });
-            // Canopy
-            boxes.push(SceneBox { pos: [side, 4.6, z], rot_y: z * 0.2, scale: [2.6, 0.9, 2.6], tex: 5, emissive: 0.10, uv_scale: 1.0, spin: false });
-        }
-    }
-
-    // Giant glowing Synthwave billboard spanning the horizon
-    boxes.push(SceneBox { pos: [0.0, 6.5, 24.0], rot_y: 0.0, scale: [12.0, 7.0, 0.6], tex: 6, emissive: 0.55, uv_scale: 1.0, spin: false });
-    // Support pillars
-    boxes.push(SceneBox { pos: [-4.8, 1.8, 24.0], rot_y: 0.0, scale: [0.6, 3.6, 0.6], tex: 1, emissive: 0.25, uv_scale: 1.0, spin: false });
-    boxes.push(SceneBox { pos: [4.8, 1.8, 24.0], rot_y: 0.0, scale: [0.6, 3.6, 0.6], tex: 1, emissive: 0.25, uv_scale: 1.0, spin: false });
-
-    // Central rotating calibration & synthwave monolith cubes (proof of live BC1 streaming)
-    boxes.push(SceneBox { pos: [0.0, 2.2, 0.0], rot_y: 0.0, scale: [2.4, 2.4, 2.4], tex: 7, emissive: 0.25, uv_scale: 1.0, spin: true });
-    boxes.push(SceneBox { pos: [0.0, 5.1, 0.0], rot_y: 0.7, scale: [1.5, 1.5, 1.5], tex: 6, emissive: 0.45, uv_scale: 1.0, spin: true });
-
-    boxes
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DemoMode {
     GpuOnly,
@@ -230,7 +190,7 @@ pub enum DemoMode {
 
 pub struct DemoConfig {
     pub mode: DemoMode,
-    pub initial_chunks: usize,
+    pub initial_chunks: usize, // number of 4096-block tiles/frame (256 = 8.0 MiB/frame)
     pub multi_core_cpu: bool,
     pub screenshot_path: Option<PathBuf>,
     pub screenshot_frames: u32,
@@ -241,7 +201,8 @@ struct WindowState {
     mode: DemoMode,
     use_gpu: bool,
     multi_core_cpu: bool,
-    chunks_per_frame: usize,
+    tiles_per_frame: usize,
+    cam_mode: u8, // 0 = Chase, 1 = Free Drive, 2 = Helicopter
     should_quit: bool,
 }
 
@@ -271,16 +232,180 @@ unsafe extern "system" fn wnd_proc(
                     st.use_gpu = !st.use_gpu;
                 } else if vk == VK_M.0 && (st.mode == DemoMode::CpuOnly || !st.use_gpu) {
                     st.multi_core_cpu = !st.multi_core_cpu;
+                } else if vk == VK_C.0 {
+                    st.cam_mode = (st.cam_mode + 1) % 3;
                 } else if vk == VK_UP.0 {
-                    st.chunks_per_frame = (st.chunks_per_frame * 2).min(256);
+                    st.tiles_per_frame = match st.tiles_per_frame {
+                        48 => 128,
+                        128 => 256,
+                        256 => 512,
+                        _ => 1024,
+                    };
                 } else if vk == VK_DOWN.0 {
-                    st.chunks_per_frame = (st.chunks_per_frame / 2).max(8);
+                    st.tiles_per_frame = match st.tiles_per_frame {
+                        1024 => 512,
+                        512 => 256,
+                        256 => 128,
+                        _ => 48,
+                    };
                 }
             }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+struct DrawObj {
+    mesh: MeshRange,
+    pos: [f32; 3],
+    rot_y: f32,
+    scale: [f32; 3],
+    tex: u32,
+    emissive: f32,
+    uv_scale: f32,
+    spec_power: f32,
+}
+
+#[inline]
+fn wrap_z(base_z: f32, hero_z: f32, span: f32) -> f32 {
+    let rel = (base_z - hero_z + span * 0.25).rem_euclid(span) - span * 0.25;
+    hero_z + rel
+}
+
+fn build_highway_frame(meshes: &crate::meshes::SceneMeshes, t_sec: f32, hero_z: f32) -> (Vec<DrawObj>, [[f32; 4]; 4], [[f32; 4]; 4]) {
+    let mut objs = Vec::with_capacity(180);
+    let span = 160.0f32;
+
+    // 1. Road, boardwalk, golden beach, animated ocean (tiled along Z moving with hero_z)
+    let tile_len = 40.0f32;
+    let base_seg = (hero_z / tile_len).floor() * tile_len;
+    for s in -1..=4 {
+        let cz = base_seg + s as f32 * tile_len;
+        // 4-lane coastal highway
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [0.0, -0.10, cz], rot_y: 0.0, scale: [14.0, 0.2, tile_len], tex: 0, emissive: 0.04, uv_scale: 2.0, spec_power: 48.0 });
+        // Left & right promenade sidewalks
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-9.5, -0.04, cz], rot_y: 0.0, scale: [5.0, 0.32, tile_len], tex: 3, emissive: 0.03, uv_scale: 3.0, spec_power: 12.0 });
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [9.5, -0.04, cz], rot_y: 0.0, scale: [5.0, 0.32, tile_len], tex: 3, emissive: 0.03, uv_scale: 3.0, spec_power: 12.0 });
+        // Left city ground pad
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-26.0, -0.14, cz], rot_y: 0.0, scale: [28.0, 0.2, tile_len], tex: 11, emissive: 0.02, uv_scale: 4.0, spec_power: 8.0 });
+        // Golden beach sand + wide ocean bay on the right
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [17.0, -0.22, cz], rot_y: 0.0, scale: [10.0, 0.2, tile_len], tex: 7, emissive: 0.02, uv_scale: 4.0, spec_power: 8.0 });
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [52.0, -0.45, cz], rot_y: 0.0, scale: [60.0, 0.2, tile_len], tex: 4, emissive: 0.14, uv_scale: 6.0, spec_power: 72.0 });
+    }
+
+    // 2. Multi-tier Art-Deco Ocean Drive skyline on the left + boutique beach pavilions
+    let left_slots = [
+        (0.0f32, 11.0, 26.0, 14.0, 1u32, 0.36),
+        (20.0, 10.0, 16.0, 13.0, 2, 0.24),
+        (40.0, 12.0, 34.0, 15.0, 1, 0.42),
+        (60.0, 9.5, 13.0, 12.0, 2, 0.22),
+        (80.0, 11.5, 29.0, 14.0, 1, 0.38),
+        (100.0, 10.0, 19.0, 13.0, 2, 0.25),
+        (120.0, 12.0, 38.0, 16.0, 1, 0.44),
+        (140.0, 10.0, 15.0, 13.0, 2, 0.22),
+    ];
+    for &(bz, w, h, d, tex, em) in &left_slots {
+        let z = wrap_z(bz, hero_z, span);
+        // Ground-floor neon cafe/storefront podium
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-17.5, 2.2, z], rot_y: 0.0, scale: [w + 1.2, 4.4, d + 0.8], tex: 10, emissive: 0.32, uv_scale: 1.5, spec_power: 24.0 });
+        // Main upper tower
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-18.2, 4.4 + h * 0.5, z], rot_y: 0.0, scale: [w, h, d], tex, emissive: em, uv_scale: 2.0, spec_power: 32.0 });
+        // Rooftop penthouse
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [-18.2, 4.4 + h + 1.1, z], rot_y: 0.0, scale: [w * 0.58, 2.2, d * 0.58], tex: 11, emissive: 0.12, uv_scale: 1.0, spec_power: 16.0 });
+    }
+
+    // Two oceanfront boutique hotels on the right boardwalk (leaving gaps to see the ocean!)
+    for &(bz, h, tex) in &[(28.0f32, 11.0, 2u32), (108.0, 14.0, 1u32)] {
+        let z = wrap_z(bz, hero_z, span);
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [14.5, 1.8, z], rot_y: 0.0, scale: [6.0, 3.6, 11.0], tex: 10, emissive: 0.28, uv_scale: 1.5, spec_power: 24.0 });
+        objs.push(DrawObj { mesh: meshes.unit_box, pos: [14.8, 3.6 + h * 0.5, z], rot_y: 0.0, scale: [5.2, h, 9.5], tex, emissive: 0.28, uv_scale: 1.6, spec_power: 28.0 });
+    }
+
+    // 3. Curved 3D Palm Trees along both promenades (swaying gently in the ocean breeze)
+    for k in 0..8 {
+        let z = wrap_z(k as f32 * 20.0 + 6.0, hero_z, span);
+        let sway = (t_sec * 1.6 + k as f32 * 0.9).sin() * 0.06;
+        // Left palm (curving slightly over street)
+        objs.push(DrawObj { mesh: meshes.palm_trunk, pos: [-8.2, 0.0, z], rot_y: 0.15 + sway, scale: [1.0, 1.0, 1.0], tex: 3, emissive: 0.0, uv_scale: 2.0, spec_power: 8.0 });
+        objs.push(DrawObj { mesh: meshes.palm_canopy, pos: [-8.2 + 0.84, 5.55, z + 0.12], rot_y: k as f32 * 0.7 + sway, scale: [1.15, 1.15, 1.15], tex: 5, emissive: 0.10, uv_scale: 1.0, spec_power: 18.0 });
+        // Right palm (curving toward ocean/road)
+        objs.push(DrawObj { mesh: meshes.palm_trunk, pos: [8.4, 0.0, z + 10.0], rot_y: std::f32::consts::PI - 0.1 + sway, scale: [1.05, 1.05, 1.05], tex: 3, emissive: 0.0, uv_scale: 2.0, spec_power: 8.0 });
+        objs.push(DrawObj { mesh: meshes.palm_canopy, pos: [8.4 - 0.88, 5.80, z + 10.0], rot_y: k as f32 * 1.1 - sway, scale: [1.2, 1.2, 1.2], tex: 5, emissive: 0.10, uv_scale: 1.0, spec_power: 18.0 });
+    }
+
+    // 4. Boulevard Streetlamps + Nearest 2 Lamps for Dynamic Point Lights
+    let mut lamp_positions: Vec<f32> = Vec::with_capacity(8);
+    for k in 0..4 {
+        let z = wrap_z(k as f32 * 40.0 + 16.0, hero_z, span);
+        lamp_positions.push(z);
+        objs.push(DrawObj { mesh: meshes.street_lamp, pos: [-7.4, 0.0, z], rot_y: 0.0, scale: [1.0, 1.0, 1.0], tex: 11, emissive: 0.35, uv_scale: 1.0, spec_power: 32.0 });
+        objs.push(DrawObj { mesh: meshes.street_lamp, pos: [7.4, 0.0, z], rot_y: std::f32::consts::PI, scale: [1.0, 1.0, 1.0], tex: 11, emissive: 0.35, uv_scale: 1.0, spec_power: 32.0 });
+    }
+    lamp_positions.sort_by(|a, b| (a - hero_z).abs().partial_cmp(&(b - hero_z).abs()).unwrap());
+
+    // 5. Overhead Highway Synthwave Gantry Sign
+    let arch_z = wrap_z(72.0, hero_z, span);
+    objs.push(DrawObj { mesh: meshes.unit_box, pos: [-7.3, 4.4, arch_z], rot_y: 0.0, scale: [0.5, 8.8, 0.5], tex: 1, emissive: 0.25, uv_scale: 1.0, spec_power: 24.0 });
+    objs.push(DrawObj { mesh: meshes.unit_box, pos: [7.3, 4.4, arch_z], rot_y: 0.0, scale: [0.5, 8.8, 0.5], tex: 1, emissive: 0.25, uv_scale: 1.0, spec_power: 24.0 });
+    objs.push(DrawObj { mesh: meshes.unit_box, pos: [0.0, 8.8, arch_z], rot_y: 0.0, scale: [15.4, 4.6, 0.5], tex: 6, emissive: 0.65, uv_scale: 1.0, spec_power: 16.0 });
+
+    // 6. Hero Sports Car (right lane, cruising forward +Z with subtle steering weave)
+    let hero_x = 2.4 + (t_sec * 0.7).sin() * 0.45;
+    let hero_yaw = (t_sec * 0.7).cos() * 0.04;
+    objs.push(DrawObj {
+        mesh: meshes.car_body,
+        pos: [hero_x, 0.0, hero_z],
+        rot_y: hero_yaw,
+        scale: [1.05, 1.05, 1.05],
+        tex: 8,
+        emissive: 0.14,
+        uv_scale: 1.0,
+        spec_power: 96.0,
+    });
+
+    // 7. 10 Animated Traffic Cars across all 4 lanes
+    let traffic = [
+        (5.2f32, 26.0f32, 13.5f32, 0.0f32, 9u32),
+        (2.4, 62.0, 14.5, 0.0, 9),
+        (5.2, 105.0, 15.0, 0.0, 8),
+        (2.4, 140.0, 13.0, 0.0, 9),
+        (-2.4, 12.0, -14.0, std::f32::consts::PI, 9),
+        (-5.2, 42.0, -16.0, std::f32::consts::PI, 8),
+        (-2.4, 78.0, -15.0, std::f32::consts::PI, 9),
+        (-5.2, 114.0, -17.0, std::f32::consts::PI, 8),
+        (-2.4, 138.0, -14.0, std::f32::consts::PI, 9),
+        (5.2, 150.0, 14.0, 0.0, 8),
+    ];
+    for &(lx, z0, spd, yaw, tex) in &traffic {
+        let tz = wrap_z(z0 + t_sec * spd, hero_z, span);
+        objs.push(DrawObj {
+            mesh: meshes.car_body,
+            pos: [lx, 0.0, tz],
+            rot_y: yaw,
+            scale: [1.0, 1.0, 1.0],
+            tex,
+            emissive: 0.12,
+            uv_scale: 1.0,
+            spec_power: 88.0,
+        });
+    }
+
+    // 4 Dynamic Point Lights: Hero Headlights, Hero Taillights, 2 Nearest Streetlamps
+    let lights = [
+        [hero_x, 1.2, hero_z + 3.2, 4.5],
+        [hero_x, 1.0, hero_z - 2.6, 3.2],
+        [-5.5, 6.4, lamp_positions[0], 5.0],
+        [5.5, 6.4, lamp_positions[1], 5.0],
+    ];
+    let colors = [
+        [0.95, 0.96, 1.00, 64.0], // cool white headlights + default spec power
+        [1.00, 0.18, 0.28, 64.0], // crimson brake glow
+        [1.00, 0.62, 0.25, 64.0], // warm streetlamp gold
+        [0.25, 0.90, 1.00, 64.0], // cyan neon boardwalk glow
+    ];
+
+    (objs, lights, colors)
 }
 
 pub fn run_demo(
@@ -291,33 +416,35 @@ pub fn run_demo(
 ) {
     unsafe {
         let mut ctx = GpuContext::new(false);
-        let max_chunks = 256usize;
-        let max_blocks = max_chunks * NUM_BLOCKS;
-        let max_stream = max_chunks * 160 * 1024;
+        let levels = [48usize, 128, 256, 512, 1024];
+        let max_tiles = 1024usize;
+        let max_blocks = max_tiles * TILE_BLOCKS;
+        let max_stream = max_tiles * 48 * 1024;
         let gpu_dec = BcpackGpuDecoder::new(
             &mut ctx,
             window_tbl,
             quads_tbl,
-            max_chunks,
+            max_tiles,
             max_blocks,
             max_stream,
         );
 
-        // Pre-pack batches for all load levels (8, 16, 32, 64, 128, 256)
-        let levels = [8usize, 16, 32, 64, 128, 256];
+        // Pre-pack 4K-tile batches (first 48 tiles = 12 textures x 4 strips, remaining tiles simulate open-world streaming)
         let batches: Vec<(usize, _)> = levels
             .iter()
             .map(|&n| {
-                let batch = pack_batch(
-                    (0..n).map(|i| (assets[i % assets.len()].bcpack_bytes.as_slice(), NUM_BLOCKS)),
-                );
+                let batch = pack_batch((0..n).map(|i| {
+                    let tex_i = (i / TILE_STRIPS) % NUM_TEX;
+                    let strip = i % TILE_STRIPS;
+                    (assets[tex_i].bcpack_tiles[strip].as_slice(), TILE_BLOCKS)
+                }));
                 (n, batch)
             })
             .collect();
 
-        // Create Win32 window
+        // Win32 Window
         let hinst = GetModuleHandleW(None).expect("GetModuleHandleW");
-        let class_name = w!("BcpackGpuDemoWnd");
+        let class_name = w!("BcpackGpuDemoWndV2");
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -340,7 +467,7 @@ pub fn run_demo(
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
-            w!("BCPack GPU Demo (RTX 5080 HLSL SM 6.6) - Starting..."),
+            w!("BCPack GPU Highway Demo v0.2 (RTX 5080 HLSL SM 6.6) - Starting..."),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -353,18 +480,19 @@ pub fn run_demo(
         )
         .expect("CreateWindowExW");
 
-        let init_chunks = levels
+        let init_tiles = levels
             .iter()
             .copied()
             .min_by_key(|&x| x.abs_diff(cfg.initial_chunks))
-            .unwrap_or(64);
+            .unwrap_or(256);
         let init_use_gpu = cfg.mode != DemoMode::CpuOnly;
 
         let mut wstate = Box::new(WindowState {
             mode: cfg.mode,
             use_gpu: init_use_gpu,
             multi_core_cpu: cfg.multi_core_cpu,
-            chunks_per_frame: init_chunks,
+            tiles_per_frame: init_tiles,
+            cam_mode: 0,
             should_quit: false,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *wstate as *mut WindowState) as isize);
@@ -390,7 +518,6 @@ pub fn run_demo(
             .expect("CreateSwapChainForHwnd");
         let swap_chain: IDXGISwapChain3 = sc1.cast().unwrap();
 
-        // Descriptor heaps: RTV (2), DSV (1), SRV (8 textures)
         let rtv_heap: ID3D12DescriptorHeap = ctx
             .device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -413,7 +540,7 @@ pub fn run_demo(
             .device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 8,
+                NumDescriptors: NUM_TEX as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -466,10 +593,10 @@ pub fn run_demo(
         let depth_res = depth_res.unwrap();
         ctx.device.CreateDepthStencilView(&depth_res, None, dsv_heap.GetCPUDescriptorHandleForHeapStart());
 
-        // Create 8 live 512x512 DXGI_FORMAT_BC1_UNORM textures + SRVs
-        let mut textures = Vec::with_capacity(8);
+        // 12 live 512x512 DXGI_FORMAT_BC1_UNORM textures
+        let mut textures = Vec::with_capacity(NUM_TEX);
         let srv_base = srv_heap.GetCPUDescriptorHandleForHeapStart();
-        for i in 0..8usize {
+        for i in 0..NUM_TEX {
             let t_desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                 Alignment: 0,
@@ -515,19 +642,111 @@ pub fn run_demo(
             textures.push(tex);
         }
 
-        // CPU Upload staging buffer for CPU mode comparison (up to 8 * 131072 bytes = 1 MB)
+        // CPU Upload staging buffer (12 x 128 KiB = 1.5 MiB)
         let cpu_upload_buf = create_committed_buffer(
             &ctx.device,
             D3D12_HEAP_TYPE_UPLOAD,
-            (8 * TEX_BC1_BYTES) as u64,
+            (NUM_TEX * TEX_BC1_BYTES) as u64,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_GENERIC_READ,
         );
 
-        // Graphics Root Signature: 32-bit constants (36 DWORDs at b0) + DescriptorTable (8 SRVs t0..t7) + StaticSampler (s0)
+        // Per-draw constant buffer ring (MAX_DRAWS x 512 bytes)
+        let cb_upload = create_committed_buffer(
+            &ctx.device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            (MAX_DRAWS * CB_STRIDE) as u64,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        let mut cb_mapped_ptr: *mut c_void = std::ptr::null_mut();
+        cb_upload
+            .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut cb_mapped_ptr))
+            .unwrap();
+        let cb_base_ptr = cb_mapped_ptr as *mut u8;
+        let cb_gpu_va = cb_upload.GetGPUVirtualAddress();
+
+        // Sky Root Signature + PSO (20 32-bit root constants at b0)
+        let sky_param = [D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: (size_of::<SkyConstants>() / 4) as u32,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        }];
+        let sky_rs_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 1,
+                    pParameters: sky_param.as_ptr(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                },
+            },
+        };
+        let mut sky_rs_blob = None;
+        D3D12SerializeVersionedRootSignature(&sky_rs_desc, &mut sky_rs_blob, None).unwrap();
+        let sky_rs_blob = sky_rs_blob.unwrap();
+        let sky_root_sig: ID3D12RootSignature = ctx
+            .device
+            .CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(sky_rs_blob.GetBufferPointer() as *const u8, sky_rs_blob.GetBufferSize()),
+            )
+            .unwrap();
+
+        let mut rt_formats = [DXGI_FORMAT_UNKNOWN; 8];
+        rt_formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        let mut sky_pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: ManuallyDrop::new(Some(sky_root_sig.clone())),
+            VS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: SKY_VS_DXIL.as_ptr() as *const c_void,
+                BytecodeLength: SKY_VS_DXIL.len(),
+            },
+            PS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: SKY_PS_DXIL.as_ptr() as *const c_void,
+                BytecodeLength: SKY_PS_DXIL.len(),
+            },
+            BlendState: D3D12_BLEND_DESC {
+                RenderTarget: [D3D12_RENDER_TARGET_BLEND_DESC {
+                    RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                    ..Default::default()
+                }; 8],
+                ..Default::default()
+            },
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: false.into(),
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: false.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                ..Default::default()
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            RTVFormats: rt_formats,
+            DSVFormat: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let sky_pso: ID3D12PipelineState = ctx.device.CreateGraphicsPipelineState(&sky_pso_desc).unwrap();
+        let _ = ManuallyDrop::take(&mut sky_pso_desc.pRootSignature);
+
+        // Scene Root Signature: Root CBV (b0) + DescriptorTable (12 SRVs t0..t11) + StaticSampler (s0)
         let range = D3D12_DESCRIPTOR_RANGE1 {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            NumDescriptors: 8,
+            NumDescriptors: NUM_TEX as u32,
             BaseShaderRegister: 0,
             RegisterSpace: 0,
             Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
@@ -535,12 +754,12 @@ pub fn run_demo(
         };
         let gfx_params = [
             D3D12_ROOT_PARAMETER1 {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                    Constants: D3D12_ROOT_CONSTANTS {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: 0,
                         RegisterSpace: 0,
-                        Num32BitValues: (size_of::<DrawConstants>() / 4) as u32,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -594,7 +813,6 @@ pub fn run_demo(
             )
             .unwrap();
 
-        // Graphics PSO
         let input_elems = [
             D3D12_INPUT_ELEMENT_DESC {
                 SemanticName: windows::core::s!("POSITION"),
@@ -624,9 +842,6 @@ pub fn run_demo(
                 InstanceDataStepRate: 0,
             },
         ];
-
-        let mut rt_formats = [DXGI_FORMAT_UNKNOWN; 8];
-        rt_formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 
         let mut pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: ManuallyDrop::new(Some(gfx_root_sig.clone())),
@@ -673,36 +888,35 @@ pub fn run_demo(
         let gfx_pso: ID3D12PipelineState = ctx.device.CreateGraphicsPipelineState(&pso_desc).unwrap();
         let _ = ManuallyDrop::take(&mut pso_desc.pRootSignature);
 
-        // Cube Vertex & Index buffers (Upload heap is fine for tiny static mesh)
-        let (verts, inds) = build_unit_cube();
+        // Upload combined procedural meshes
+        let meshes = build_all_meshes();
         let vb_buf = create_committed_buffer(
             &ctx.device,
             D3D12_HEAP_TYPE_UPLOAD,
-            (verts.len() * size_of::<Vertex>()) as u64,
+            (meshes.vertices.len() * size_of::<Vertex>()) as u64,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_GENERIC_READ,
         );
         let ib_buf = create_committed_buffer(
             &ctx.device,
             D3D12_HEAP_TYPE_UPLOAD,
-            (inds.len() * size_of::<u16>()) as u64,
+            (meshes.indices.len() * size_of::<u16>()) as u64,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_GENERIC_READ,
         );
-        upload_slice(&vb_buf, &verts);
-        upload_slice(&ib_buf, &inds);
+        upload_slice(&vb_buf, &meshes.vertices);
+        upload_slice(&ib_buf, &meshes.indices);
         let vbv = D3D12_VERTEX_BUFFER_VIEW {
             BufferLocation: vb_buf.GetGPUVirtualAddress(),
-            SizeInBytes: (verts.len() * size_of::<Vertex>()) as u32,
+            SizeInBytes: (meshes.vertices.len() * size_of::<Vertex>()) as u32,
             StrideInBytes: size_of::<Vertex>() as u32,
         };
         let ibv = D3D12_INDEX_BUFFER_VIEW {
             BufferLocation: ib_buf.GetGPUVirtualAddress(),
-            SizeInBytes: (inds.len() * size_of::<u16>()) as u32,
+            SizeInBytes: (meshes.indices.len() * size_of::<u16>()) as u32,
             Format: DXGI_FORMAT_R16_UINT,
         };
 
-        // Frame command allocator & list + GPU timestamp query heap + screenshot readback
         let cmd_alloc: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
         let cmd_list: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &cmd_alloc, None).unwrap();
         cmd_list.Close().unwrap();
@@ -712,25 +926,29 @@ pub fn run_demo(
         let ts_heap = ts_heap.unwrap();
         let ts_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-        let ss_row_pitch = WIN_W * 4; // 5120, multiple of 256
+        let ss_row_pitch = WIN_W * 4;
         let ss_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, (ss_row_pitch * WIN_H) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-        let scene = build_vice_city_scene();
-        let proj = Mat4::perspective_lh(60.0f32.to_radians(), WIN_W as f32 / WIN_H as f32, 0.1, 200.0);
+        let proj = Mat4::perspective_lh(62.0f32.to_radians(), WIN_W as f32 / WIN_H as f32, 0.2, 260.0);
 
         let start_t = Instant::now();
+        let mut last_frame_t = Instant::now();
         let mut last_title_t = Instant::now();
         let mut measure_start: Option<Instant> = None;
         let mut measure_decode_sum = 0.0f64;
         let mut frame_count = 0u32;
         let mut fps_accum = 0u32;
-        let mut cpu_buf = vec![0u8; 8 * TEX_BC1_BYTES];
+        let mut cpu_buf = vec![0u8; NUM_TEX * TEX_BC1_BYTES];
+
+        // Free-cam state
+        let mut free_pos = [0.0f32, 4.5, -10.0];
+        let mut free_yaw = 0.0f32;
 
         println!("================================================================");
         match cfg.mode {
-            DemoMode::GpuOnly => println!("NEW GPU Demo (RTX 5080 HLSL SM 6.6) on: {}", ctx.adapter_name),
-            DemoMode::CpuOnly => println!("OLD CPU Demo (bcpack-rs on CPU) on: {}", ctx.adapter_name),
-            DemoMode::Toggleable => println!("BCPack GPU/CPU Live Demo on: {}", ctx.adapter_name),
+            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.2 (Dual-Chunk Wave32) on: {}", ctx.adapter_name),
+            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.2 (bcpack-rs) on: {}", ctx.adapter_name),
+            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.2 on: {}", ctx.adapter_name),
         }
         println!("Controls:");
         if cfg.mode == DemoMode::Toggleable {
@@ -739,7 +957,8 @@ pub fn run_demo(
         if cfg.mode != DemoMode::GpuOnly {
             println!("  [M]       Toggle CPU 1-Core <-> CPU Multi-Core");
         }
-        println!("  [UP/DOWN] Adjust streamed BC1 chunks/frame (8 .. 256)");
+        println!("  [C]       Camera Mode: Chase Car / Free Drive (WASD+QE) / Heli Orbit");
+        println!("  [UP/DOWN] Streamed 4K-tiles/frame (48..1024 = 1.5..32 MiB BC1/frame)");
         println!("  [ESC]     Exit");
         println!("================================================================");
 
@@ -756,45 +975,40 @@ pub fn run_demo(
                 break;
             }
 
-            let cur_chunks = wstate.chunks_per_frame;
-            let batch = &batches.iter().find(|(n, _)| *n == cur_chunks).unwrap().1;
-            let streamed_mb = (cur_chunks * TEX_BC1_BYTES) as f64 / (1024.0 * 1024.0);
+            let dt = last_frame_t.elapsed().as_secs_f32().min(0.1);
+            last_frame_t = Instant::now();
+
+            let cur_tiles = wstate.tiles_per_frame;
+            let batch = &batches.iter().find(|(n, _)| *n == cur_tiles).unwrap().1;
+            let streamed_mb = (cur_tiles * TILE_BC1_BYTES) as f64 / (1024.0 * 1024.0);
 
             let mut decomp_ms = 0.0f64;
             if !wstate.use_gpu {
-                // CPU decompression path (real bcpack-rs decode + upload to staging)
                 let t0 = Instant::now();
                 let decoded_list: Vec<Vec<u8>> = if wstate.multi_core_cpu {
-                    (0..cur_chunks)
+                    (0..cur_tiles)
                         .into_par_iter()
                         .map(|i| {
-                            bc1::decode(
-                                &assets[i % assets.len()].bcpack_bytes,
-                                NUM_BLOCKS,
-                                window_tbl,
-                                quads_tbl,
-                            )
-                            .unwrap()
-                            .blocks
+                            let tex_i = (i / TILE_STRIPS) % NUM_TEX;
+                            let strip = i % TILE_STRIPS;
+                            bc1::decode(&assets[tex_i].bcpack_tiles[strip], TILE_BLOCKS, window_tbl, quads_tbl)
+                                .unwrap()
+                                .blocks
                         })
                         .collect()
                 } else {
-                    (0..cur_chunks)
+                    (0..cur_tiles)
                         .map(|i| {
-                            bc1::decode(
-                                &assets[i % assets.len()].bcpack_bytes,
-                                NUM_BLOCKS,
-                                window_tbl,
-                                quads_tbl,
-                            )
-                            .unwrap()
-                            .blocks
+                            let tex_i = (i / TILE_STRIPS) % NUM_TEX;
+                            let strip = i % TILE_STRIPS;
+                            bc1::decode(&assets[tex_i].bcpack_tiles[strip], TILE_BLOCKS, window_tbl, quads_tbl)
+                                .unwrap()
+                                .blocks
                         })
                         .collect()
                 };
-                for ti in 0..8 {
-                    let src = &decoded_list[ti % cur_chunks];
-                    cpu_buf[ti * TEX_BC1_BYTES..(ti + 1) * TEX_BC1_BYTES].copy_from_slice(src);
+                for ti in 0..(NUM_TEX * TILE_STRIPS) {
+                    cpu_buf[ti * TILE_BC1_BYTES..(ti + 1) * TILE_BC1_BYTES].copy_from_slice(&decoded_list[ti]);
                 }
                 upload_slice(&cpu_upload_buf, &cpu_buf);
                 decomp_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -810,8 +1024,8 @@ pub fn run_demo(
                 cmd_list.ResolveQueryData(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &ts_readback, 0);
             }
 
-            // Copy decompressed BC1 blocks directly into all 8 live DXGI_FORMAT_BC1_UNORM textures
-            let mut to_copy = Vec::with_capacity(9);
+            // Copy all 48 decoded 4K tiles (12 textures x 4 strips) directly into the 12 DXGI_FORMAT_BC1_UNORM textures
+            let mut to_copy = Vec::with_capacity(NUM_TEX + 1);
             for t in &textures {
                 to_copy.push(transition_barrier(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
             }
@@ -826,33 +1040,36 @@ pub fn run_demo(
                 &cpu_upload_buf
             };
             for (ti, tex) in textures.iter().enumerate() {
-                let mut dst = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: ManuallyDrop::new(Some(tex.clone())),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-                };
-                let mut src = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: ManuallyDrop::new(Some(src_res.clone())),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                            Offset: (ti * TEX_BC1_BYTES) as u64,
-                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: DXGI_FORMAT_BC1_UNORM,
-                                Width: TEX_W as u32,
-                                Height: TEX_H as u32,
-                                Depth: 1,
-                                RowPitch: (TEX_W / 4 * 8) as u32, // 1024 bytes (aligned to 256)
+                for strip in 0..TILE_STRIPS {
+                    let tile_idx = ti * TILE_STRIPS + strip;
+                    let mut dst = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(tex.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let mut src = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(src_res.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: (tile_idx * TILE_BC1_BYTES) as u64,
+                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                    Format: DXGI_FORMAT_BC1_UNORM,
+                                    Width: TEX_W as u32,
+                                    Height: (TEX_H / TILE_STRIPS) as u32, // 128 px strip
+                                    Depth: 1,
+                                    RowPitch: (TEX_W / 4 * 8) as u32, // 1024 bytes
+                                },
                             },
                         },
-                    },
-                };
-                cmd_list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                let _ = ManuallyDrop::take(&mut dst.pResource);
-                let _ = ManuallyDrop::take(&mut src.pResource);
+                    };
+                    cmd_list.CopyTextureRegion(&dst, 0, (strip * (TEX_H / TILE_STRIPS)) as u32, 0, &src, None);
+                    let _ = ManuallyDrop::take(&mut dst.pResource);
+                    let _ = ManuallyDrop::take(&mut src.pResource);
+                }
             }
 
-            let mut to_srv = Vec::with_capacity(9);
+            let mut to_srv = Vec::with_capacity(NUM_TEX + 1);
             for t in &textures {
                 to_srv.push(transition_barrier(t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
             }
@@ -861,7 +1078,6 @@ pub fn run_demo(
             }
             cmd_barriers(&cmd_list, to_srv);
 
-            // Render 3D Vice-City sunset scene
             let bb_idx = swap_chain.GetCurrentBackBufferIndex();
             let bb = &backbuffers[bb_idx as usize];
             let mut b_rt = [transition_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)];
@@ -872,7 +1088,7 @@ pub fn run_demo(
                 ptr: rtv_base.ptr + (bb_idx * rtv_inc) as usize,
             };
             let dsv_handle = dsv_heap.GetCPUDescriptorHandleForHeapStart();
-            let clear_col = [0.24f32, 0.11, 0.30, 1.0];
+            let clear_col = [0.18f32, 0.08, 0.28, 1.0];
             cmd_list.ClearRenderTargetView(rtv_handle, &clear_col, None);
             cmd_list.ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, &[]);
             cmd_list.OMSetRenderTargets(1, Some(&rtv_handle), false, Some(&dsv_handle));
@@ -889,28 +1105,82 @@ pub fn run_demo(
             cmd_list.RSSetViewports(&[vp]);
             cmd_list.RSSetScissorRects(&[sc]);
 
+            let t_sec = if cfg.screenshot_path.is_some() {
+                1.65f32
+            } else {
+                start_t.elapsed().as_secs_f32()
+            };
+            let hero_z = t_sec * 18.0;
+
+            // Camera selection
+            let (eye, target) = match wstate.cam_mode {
+                0 => {
+                    // Chase Car Camera
+                    let hx = 2.4 + (t_sec * 0.7).sin() * 0.45;
+                    let eye = [hx - 0.6 + (t_sec * 0.35).sin() * 1.1, 3.6, hero_z - 9.2];
+                    let tgt = [hx * 0.65, 1.8, hero_z + 18.0];
+                    (eye, tgt)
+                }
+                1 => {
+                    // Free Drive Camera (WASD + QE + Left/Right)
+                    let spd = 22.0 * dt;
+                    let rot_spd = 1.6 * dt;
+                    if GetAsyncKeyState(VK_LEFT.0 as i32) < 0 { free_yaw -= rot_spd; }
+                    if GetAsyncKeyState(VK_RIGHT.0 as i32) < 0 { free_yaw += rot_spd; }
+                    let (sy, cy) = free_yaw.sin_cos();
+                    if GetAsyncKeyState(VK_W.0 as i32) < 0 { free_pos[0] += sy * spd; free_pos[2] += cy * spd; }
+                    if GetAsyncKeyState(VK_S.0 as i32) < 0 { free_pos[0] -= sy * spd; free_pos[2] -= cy * spd; }
+                    if GetAsyncKeyState(VK_D.0 as i32) < 0 { free_pos[0] += cy * spd; free_pos[2] -= sy * spd; }
+                    if GetAsyncKeyState(VK_A.0 as i32) < 0 { free_pos[0] -= cy * spd; free_pos[2] += sy * spd; }
+                    if GetAsyncKeyState(VK_E.0 as i32) < 0 { free_pos[1] += spd; }
+                    if GetAsyncKeyState(VK_Q.0 as i32) < 0 { free_pos[1] = (free_pos[1] - spd).max(0.8); }
+                    let tgt = [free_pos[0] + sy * 15.0, free_pos[1] - 1.2, free_pos[2] + cy * 15.0];
+                    (free_pos, tgt)
+                }
+                _ => {
+                    // Helicopter Orbit Camera
+                    let ang = t_sec * 0.32;
+                    let eye = [ang.sin() * 20.0 + 4.0, 12.5, hero_z - ang.cos() * 24.0];
+                    let tgt = [0.0, 3.5, hero_z + 8.0];
+                    (eye, tgt)
+                }
+            };
+
+            let view = Mat4::look_at_lh(eye, target, [0.0, 1.0, 0.0]);
+            let vp_mat = proj.mul(&view);
+            let inv_vp = vp_mat.inverse();
+
+            // 1. Draw Sunset Synthwave Sky Dome
+            cmd_list.SetGraphicsRootSignature(&sky_root_sig);
+            cmd_list.SetPipelineState(&sky_pso);
+            cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            let sky_cb = SkyConstants {
+                inv_view_proj: inv_vp.0,
+                camera_pos: eye,
+                time: t_sec,
+            };
+            cmd_list.SetGraphicsRoot32BitConstants(
+                0,
+                (size_of::<SkyConstants>() / 4) as u32,
+                &sky_cb as *const _ as *const c_void,
+                0,
+            );
+            cmd_list.DrawInstanced(3, 1, 0, 0);
+
+            // 2. Draw Highway, Art-Deco City, Curved Palms, Streetlamps, Hero & Traffic Cars
+            let (objs, point_lights, light_colors) = build_highway_frame(&meshes, t_sec, hero_z);
             cmd_list.SetGraphicsRootSignature(&gfx_root_sig);
             cmd_list.SetPipelineState(&gfx_pso);
             cmd_list.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
             cmd_list.SetGraphicsRootDescriptorTable(1, srv_heap.GetGPUDescriptorHandleForHeapStart());
-            cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cmd_list.IASetVertexBuffers(0, Some(&[vbv]));
             cmd_list.IASetIndexBuffer(Some(&ibv));
 
-            let t_sec = if cfg.screenshot_path.is_some() {
-                0.75f32
-            } else {
-                start_t.elapsed().as_secs_f32()
-            };
-            let cam_ang = t_sec * 0.28;
-            let eye = [cam_ang.sin() * 14.5, 6.8 + (t_sec * 0.4).sin() * 0.7, -cam_ang.cos() * 16.5];
-            let view = Mat4::look_at_lh(eye, [0.0, 2.8, 3.0], [0.0, 1.0, 0.0]);
-            let vp_mat = proj.mul(&view);
-
-            for obj in &scene {
-                let rot = if obj.spin { obj.rot_y + t_sec * 1.1 } else { obj.rot_y };
-                let model = Mat4::trs(obj.pos, rot, obj.scale);
+            for (di, obj) in objs.iter().take(MAX_DRAWS).enumerate() {
+                let model = Mat4::trs(obj.pos, obj.rot_y, obj.scale);
                 let mvp = vp_mat.mul(&model);
+                let mut lcols = light_colors;
+                lcols[0][3] = obj.spec_power;
                 let dc = DrawConstants {
                     mvp: mvp.0,
                     model: model.0,
@@ -918,14 +1188,17 @@ pub fn run_demo(
                     emissive: obj.emissive,
                     time: t_sec,
                     uv_scale: obj.uv_scale,
+                    camera_pos: [eye[0], eye[1], eye[2], 1.0],
+                    point_lights,
+                    light_colors: lcols,
                 };
-                cmd_list.SetGraphicsRoot32BitConstants(
-                    0,
-                    (size_of::<DrawConstants>() / 4) as u32,
-                    &dc as *const _ as *const c_void,
-                    0,
+                copy_nonoverlapping(
+                    &dc as *const DrawConstants as *const u8,
+                    cb_base_ptr.add(di * CB_STRIDE),
+                    size_of::<DrawConstants>(),
                 );
-                cmd_list.DrawIndexedInstanced(inds.len() as u32, 1, 0, 0, 0);
+                cmd_list.SetGraphicsRootConstantBufferView(0, cb_gpu_va + (di * CB_STRIDE) as u64);
+                cmd_list.DrawIndexedInstanced(obj.mesh.index_count, 1, obj.mesh.index_offset, 0, 0);
             }
 
             let take_shot = cfg.screenshot_path.is_some() && frame_count + 1 >= cfg.screenshot_frames;
@@ -1012,15 +1285,15 @@ pub fn run_demo(
                         let avg_fps = measured as f64 / secs;
                         let avg_dec = measure_decode_sum / measured as f64;
                         let mode_tag = if wstate.use_gpu {
-                            "NEW_GPU_RTX5080"
+                            "NEW_GPU_RTX5080_V2"
                         } else if wstate.multi_core_cpu {
                             "OLD_CPU_MULTICORE"
                         } else {
                             "OLD_CPU_1CORE"
                         };
                         println!(
-                            "[fps] mode={} chunks={} ({:.1} MiB/frame) frames={} avg_fps={:.2} avg_decode_ms={:.3}",
-                            mode_tag, cur_chunks, streamed_mb, measured, avg_fps, avg_dec
+                            "[fps] mode={} tiles={} ({:.1} MiB/frame) frames={} avg_fps={:.2} avg_decode_ms={:.3}",
+                            mode_tag, cur_tiles, streamed_mb, measured, avg_fps, avg_dec
                         );
                         break;
                     }
@@ -1036,20 +1309,20 @@ pub fn run_demo(
                     0.0
                 };
                 let mode_str = if wstate.use_gpu {
-                    "NEW: GPU HLSL SM6.6 (RTX 5080)"
+                    "NEW v0.2: GPU Dual-Chunk Wave32 (RTX 5080)"
                 } else if wstate.multi_core_cpu {
                     "OLD: CPU Multi-Core (bcpack-rs)"
                 } else {
                     "OLD: CPU 1-Core (bcpack-rs)"
                 };
-                let controls = match cfg.mode {
-                    DemoMode::GpuOnly => "[UP/DN]=Load [ESC]=Quit",
-                    DemoMode::CpuOnly => "[M]=1T/MT [UP/DN]=Load [ESC]=Quit",
-                    DemoMode::Toggleable => "[SPACE]=GPU/CPU [M]=1T/MT [UP/DN]=Load [ESC]=Quit",
+                let cam_str = match wstate.cam_mode {
+                    0 => "Chase",
+                    1 => "Free(WASD)",
+                    _ => "Orbit",
                 };
                 let title = format!(
-                    "{} | {:.1} FPS | {:.0} MB/frame ({} chunks) | Decode: {:.2} ms ({:.0} MB/s) | {}",
-                    mode_str, fps, streamed_mb, cur_chunks, decomp_ms, throughput, controls
+                    "{} | {:.1} FPS | {:.1} MB/frame ({}x4K tiles) | Decode: {:.2} ms ({:.0} MB/s) | Cam:[C]={} | [UP/DN]=Load [ESC]=Quit",
+                    mode_str, fps, streamed_mb, cur_tiles, decomp_ms, throughput, cam_str
                 );
                 let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));

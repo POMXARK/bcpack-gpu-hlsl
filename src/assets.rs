@@ -1,6 +1,10 @@
+// Open procedural 512x512 BC1 texture generator + BCPack BC1 encoder.
+// Uses clean-room BCPack tables and rANS encoder from Ahmet-Dedeler/bcpack-rs (MIT OR Apache-2.0).
+
 use bcpack::bc1::{self, QuadTable, Window, BC1_ALPHABET_BITS, ENDPOINT_WIDTHS};
 use bcpack::encode::{encode_lanes, Fragment};
 use bcpack::rans;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,26 +16,37 @@ pub const BLOCKS_Y: usize = TEX_H / 4; // 128
 pub const NUM_BLOCKS: usize = BLOCKS_X * BLOCKS_Y; // 16384
 pub const TEX_BC1_BYTES: usize = NUM_BLOCKS * 8; // 131072
 
-pub const ASSET_NAMES: [&str; 8] = [
-    "01_asphalt_road",
-    "02_neon_facade",
-    "03_pastel_hotel",
-    "04_brick_plaza",
-    "05_ocean_water",
-    "06_palm_canopy",
+pub const TILE_STRIPS: usize = 4;
+pub const TILE_BLOCKS: usize = NUM_BLOCKS / TILE_STRIPS; // 4096 blocks (512x128 strip)
+pub const TILE_BC1_BYTES: usize = TILE_BLOCKS * 8; // 32768 bytes
+
+pub const ASSET_NAMES: [&str; 12] = [
+    "01_highway_asphalt",
+    "02_neon_skyscraper",
+    "03_miami_hotel",
+    "04_promenade_tiles",
+    "05_ocean_waves",
+    "06_palm_fronds",
     "07_synthwave_billboard",
-    "08_calibration_checker",
+    "08_beach_sand",
+    "09_car_body_red",
+    "10_car_body_cyan",
+    "11_storefront_neon",
+    "12_concrete_rooftop",
 ];
 
 pub struct TextureAsset {
     pub name: &'static str,
     pub bcpack_bytes: Vec<u8>,
+    pub bcpack_tiles: [Vec<u8>; TILE_STRIPS],
     pub expected_bc1: Vec<u8>,
 }
 
 #[inline]
 fn hash2(x: i32, y: i32) -> u32 {
-    let mut h = (x as u32).wrapping_mul(374761393).wrapping_add((y as u32).wrapping_mul(668265263));
+    let mut h = (x as u32)
+        .wrapping_mul(374761393)
+        .wrapping_add((y as u32).wrapping_mul(668265263));
     h = (h ^ (h >> 13)).wrapping_mul(1274126177);
     h ^ (h >> 16)
 }
@@ -59,182 +74,216 @@ fn generate_rgba(idx: usize) -> Vec<u8> {
             let v = y as f32 / TEX_H as f32;
             let n = ((hash2(x as i32, y as i32) & 0xFF) as f32 / 255.0) - 0.5;
             let px = match idx {
-                // 01_asphalt_road: dark asphalt + double yellow center lines + white edge lines
+                // 01_highway_asphalt: coastal 4-lane highway with double yellow median & white lane dashes
                 0 => {
-                    let g = n * 24.0;
-                    let mut col = [34.0 + g, 36.0 + g, 44.0 + g];
-                    // Center double yellow stripes
-                    if (u - 0.475).abs() < 0.012 || (u - 0.525).abs() < 0.012 {
-                        col = [235.0 + g * 0.4, 185.0 + g * 0.4, 30.0];
+                    let g = n * 22.0;
+                    let wear = ((u * 12.0).sin().abs()) * 6.0;
+                    let mut col = [30.0 + g + wear, 32.0 + g + wear, 42.0 + g + wear];
+                    if (u - 0.48).abs() < 0.011 || (u - 0.52).abs() < 0.011 {
+                        col = [240.0 + g * 0.3, 188.0 + g * 0.3, 28.0];
                     }
-                    // Dashed lane dividers
-                    let dash = ((v * 8.0).fract()) < 0.55;
-                    if dash && ((u - 0.24).abs() < 0.01 || (u - 0.76).abs() < 0.01) {
-                        col = [230.0, 235.0, 245.0];
+                    let dash = ((v * 6.0).fract()) < 0.52;
+                    if dash && ((u - 0.24).abs() < 0.010 || (u - 0.76).abs() < 0.010) {
+                        col = [235.0, 238.0, 248.0];
                     }
-                    // Sidewalk curb edge
-                    if u < 0.04 || u > 0.96 {
-                        col = [120.0 + g, 115.0 + g, 128.0 + g];
+                    if u < 0.035 || u > 0.965 {
+                        col = [135.0 + g, 128.0 + g, 142.0 + g];
                     }
                     rgb(col[0], col[1], col[2])
                 }
-                // 02_neon_facade: dark skyscraper glass + glowing cyan & magenta Art-Deco neon trims
+                // 02_neon_skyscraper: Art-Deco glass facade with glowing cyan & magenta trims
                 1 => {
                     let gx = (x % 64) as f32 / 64.0;
                     let gy = (y % 64) as f32 / 64.0;
                     let cell_id = hash2((x / 64) as i32, (y / 64) as i32);
-                    let mut col = [18.0, 20.0, 42.0];
+                    let mut col = [16.0, 18.0, 38.0];
                     if gx > 0.14 && gx < 0.86 && gy > 0.16 && gy < 0.82 {
                         let lit = (cell_id & 7) < 3;
                         if lit {
                             let warm = (cell_id & 8) != 0;
                             col = if warm {
-                                [255.0 - gy * 50.0, 195.0 - gy * 40.0, 110.0]
+                                [255.0 - gy * 45.0, 195.0 - gy * 35.0, 110.0]
                             } else {
-                                [70.0, 220.0 - gy * 40.0, 255.0]
+                                [70.0, 225.0 - gy * 35.0, 255.0]
                             };
                         } else {
-                            col = [28.0 + gy * 25.0, 38.0 + gy * 30.0, 75.0 + gy * 35.0];
+                            col = [28.0 + gy * 25.0, 40.0 + gy * 30.0, 78.0 + gy * 35.0];
                         }
                     }
-                    // Neon horizontal strips
                     if (y % 128) < 6 {
-                        col = [0.0, 245.0, 255.0];
+                        col = [0.0, 248.0, 255.0];
                     } else if ((y + 64) % 128) < 5 {
-                        col = [255.0, 40.0, 190.0];
+                        col = [255.0, 45.0, 195.0];
                     }
-                    // Vertical Art-Deco neon pilaster
-                    if x < 10 || x > TEX_W - 10 {
-                        col = [255.0, 60.0, 200.0];
+                    if x < 9 || x > TEX_W - 9 {
+                        col = [255.0, 65.0, 205.0];
                     }
                     rgb(col[0] + n * 6.0, col[1] + n * 6.0, col[2] + n * 6.0)
                 }
-                // 03_pastel_hotel: Miami Art-Deco coral/teal stucco with lit windows
+                // 03_miami_hotel: Ocean Drive pastel coral & turquoise deco facade
                 2 => {
                     let mut col = [
-                        245.0 - v * 35.0 + n * 10.0,
-                        152.0 - v * 25.0 + n * 10.0,
-                        148.0 + v * 30.0 + n * 10.0,
+                        246.0 - v * 30.0 + n * 10.0,
+                        156.0 - v * 22.0 + n * 10.0,
+                        152.0 + v * 28.0 + n * 10.0,
                     ];
-                    // Teal horizontal deco bands
                     if (y % 128) < 12 || (y % 128) > 120 {
-                        col = [45.0, 205.0, 195.0];
+                        col = [40.0, 212.0, 200.0];
                     }
                     let wx = (x % 64) as f32 / 64.0;
                     let wy = (y % 128) as f32 / 128.0;
                     if wx > 0.22 && wx < 0.78 && wy > 0.22 && wy < 0.78 {
                         let glow = ((hash2((x / 64) as i32, (y / 128) as i32)) & 1) == 0;
-                        col = if glow { [255.0, 225.0, 140.0] } else { [35.0, 55.0, 82.0] };
+                        col = if glow { [255.0, 224.0, 138.0] } else { [34.0, 54.0, 82.0] };
                     }
                     if wx > 0.16 && wx < 0.84 && wy > 0.78 && wy < 0.85 {
-                        col = [250.0, 245.0, 240.0]; // window sill
+                        col = [250.0, 245.0, 240.0];
                     }
                     rgb(col[0], col[1], col[2])
                 }
-                // 04_brick_plaza: warm sandstone / terracotta sidewalk tiles
+                // 04_promenade_tiles: warm sandstone/terracotta oceanfront boardwalk
                 3 => {
                     let row = y / 32;
                     let sx = (x + if row % 2 == 1 { 32 } else { 0 }) % 64;
                     let sy = y % 32;
-                    let grout = sx < 3 || sy < 3;
-                    if grout {
+                    if sx < 3 || sy < 3 {
                         rgb(68.0 + n * 12.0, 58.0 + n * 12.0, 64.0 + n * 12.0)
                     } else {
                         let cid = hash2(((x + if row % 2 == 1 { 32 } else { 0 }) / 64) as i32, row as i32);
                         let tint = ((cid & 0x1F) as f32) - 16.0;
                         rgb(
-                            205.0 + tint + n * 14.0,
-                            135.0 + tint * 0.7 + n * 12.0,
-                            108.0 + tint * 0.5 + n * 12.0,
+                            210.0 + tint + n * 14.0,
+                            142.0 + tint * 0.7 + n * 12.0,
+                            115.0 + tint * 0.5 + n * 12.0,
                         )
                     }
                 }
-                // 05_ocean_water: turquoise Caribbean waves + pink/gold sunset specular
+                // 05_ocean_waves: turquoise bay water with sunset crests
                 4 => {
                     let w1 = (u * 18.0 + (v * 12.0).sin() * 1.4).sin();
                     let w2 = (v * 34.0 - u * 10.0).cos();
                     let wave = (w1 * 0.55 + w2 * 0.45) * 0.5 + 0.5;
                     let mut col = [
-                        lerp_u8(12.0, 48.0, wave) as f32,
-                        lerp_u8(95.0, 210.0, wave) as f32,
-                        lerp_u8(140.0, 235.0, wave) as f32,
+                        lerp_u8(12.0, 44.0, wave) as f32,
+                        lerp_u8(102.0, 218.0, wave) as f32,
+                        lerp_u8(148.0, 240.0, wave) as f32,
                     ];
-                    // Sunset highlight crest
-                    if wave > 0.83 {
-                        let t = (wave - 0.83) / 0.17;
+                    if wave > 0.82 {
+                        let t = (wave - 0.82) / 0.18;
                         col[0] += t * 210.0;
-                        col[1] += t * 65.0;
-                        col[2] += t * 20.0;
+                        col[1] += t * 75.0;
+                        col[2] += t * 25.0;
                     }
-                    rgb(col[0] + n * 6.0, col[1] + n * 6.0, col[2] + n * 6.0)
+                    rgb(col[0] + n * 5.0, col[1] + n * 5.0, col[2] + n * 5.0)
                 }
-                // 06_palm_canopy: lush tropical palm fronds
+                // 06_palm_fronds: striated tropical palm leaf blade
                 5 => {
-                    let dx = u - 0.5;
-                    let dy = v - 0.5;
-                    let ang = dy.atan2(dx);
-                    let r = (dx * dx + dy * dy).sqrt();
-                    let frond = ((ang * 7.0).sin() * 0.5 + 0.5) * (1.0 - r * 0.7);
-                    let rib = ((r * 45.0).sin().abs()) * 0.25;
-                    let g_base = 85.0 + frond * 145.0 + rib * 40.0 + n * 14.0;
-                    rgb(25.0 + frond * 55.0 + n * 8.0, g_base, 35.0 + frond * 40.0)
+                    let center = (u - 0.5).abs();
+                    let vein = ((v * 36.0 - center * 14.0).sin() * 0.5 + 0.5).powf(1.5);
+                    let rib = if center < 0.04 { 1.0 } else { 0.0 };
+                    rgb(
+                        32.0 + vein * 38.0 + rib * 65.0 + n * 10.0,
+                        105.0 + vein * 115.0 + rib * 40.0 + n * 12.0,
+                        28.0 + vein * 28.0 + n * 8.0,
+                    )
                 }
-                // 07_synthwave_billboard: classic retro Vice-City sunset disc + perspective neon grid
+                // 07_synthwave_billboard: glowing retro highway arch sign
                 6 => {
                     let dx = u - 0.5;
                     let dy = v - 0.42;
                     let r = (dx * dx + dy * dy).sqrt();
                     let mut col = [22.0, 8.0, 48.0];
-                    // Horizon glow
                     if v > 0.56 {
                         let hz = (v - 0.56) / 0.44;
                         let gx = ((u - 0.5) / (0.15 + hz * 1.4) * 8.0).fract().abs();
                         let gy = (hz * 10.0).fract().abs();
-                        if gx < 0.08 || gy < 0.09 {
-                            col = [255.0, 45.0, 210.0];
-                        } else {
-                            col = [26.0, 12.0, 56.0];
-                        }
+                        col = if gx < 0.08 || gy < 0.09 { [255.0, 45.0, 210.0] } else { [26.0, 12.0, 56.0] };
                     } else if r < 0.30 {
-                        // Striped sunset sun disc
                         let band = ((v * 28.0).sin() > -0.35) || v < 0.30;
                         if band {
                             let t = ((v - 0.12) / 0.30).clamp(0.0, 1.0);
                             col = [255.0, 235.0 - t * 185.0, 50.0 + t * 140.0];
                         }
-                    } else {
-                        // Starfield
-                        let star = (hash2((x / 2) as i32, (y / 2) as i32) & 255) == 0;
-                        if star {
-                            col = [210.0, 245.0, 255.0];
-                        }
+                    } else if (hash2((x / 2) as i32, (y / 2) as i32) & 255) == 0 {
+                        col = [210.0, 245.0, 255.0];
                     }
-                    // Cyan border frame
                     if x < 12 || x > TEX_W - 12 || y < 12 || y > TEX_H - 12 {
                         col = [0.0, 245.0, 255.0];
                     }
                     rgb(col[0], col[1], col[2])
                 }
-                // 08_calibration_checker: high-contrast RGB/CMY quadrants + crisp checkerboard
+                // 08_beach_sand: warm coastal sand ripples
+                7 => {
+                    let ripple = ((u * 22.0 + (v * 8.0).sin() * 0.8).sin() * 0.5 + 0.5) * 18.0;
+                    rgb(225.0 + ripple + n * 16.0, 192.0 + ripple * 0.8 + n * 14.0, 145.0 + ripple * 0.5 + n * 12.0)
+                }
+                // 09_car_body_red: glossy crimson/magenta sports car paint + white racing stripe + lights
+                8 => {
+                    let mut col = [215.0 + n * 6.0, 28.0 + n * 5.0, 72.0 + n * 6.0];
+                    // White-cyan racing twin stripes
+                    if (u - 0.43).abs() < 0.03 || (u - 0.57).abs() < 0.03 {
+                        col = [245.0, 248.0, 255.0];
+                    }
+                    // Headlight / taillight / wheel quad regions (matches meshes.rs UV rects)
+                    if u < 0.5 && v < 0.5 && (u - 0.14).abs() < 0.08 && (v - 0.25).abs() < 0.10 {
+                        col = [245.0, 250.0, 255.0]; // headlights
+                    }
+                    if u < 0.5 && v < 0.5 && (u - 0.36).abs() < 0.08 && (v - 0.25).abs() < 0.10 {
+                        col = [245.0, 250.0, 255.0];
+                    }
+                    if u > 0.5 && v > 0.5 && (v - 0.72).abs() < 0.08 {
+                        col = [255.0, 30.0, 45.0]; // full-width red taillight bar
+                    }
+                    if u > 0.72 && v > 0.72 {
+                        col = [26.0 + n * 8.0, 26.0 + n * 8.0, 32.0 + n * 8.0]; // tires
+                    }
+                    rgb(col[0], col[1], col[2])
+                }
+                // 10_car_body_cyan: electric Miami cyan/purple traffic coupe paint
+                9 => {
+                    let mut col = [24.0 + n * 6.0, 195.0 + n * 6.0, 240.0 + n * 6.0];
+                    if (u - 0.50).abs() < 0.045 {
+                        col = [255.0, 60.0, 210.0];
+                    }
+                    if u < 0.5 && v < 0.5 && ((u - 0.14).abs() < 0.08 || (u - 0.36).abs() < 0.08) && (v - 0.25).abs() < 0.10 {
+                        col = [255.0, 250.0, 215.0];
+                    }
+                    if u > 0.5 && v > 0.5 && (v - 0.72).abs() < 0.08 {
+                        col = [255.0, 35.0, 60.0];
+                    }
+                    if u > 0.72 && v > 0.72 {
+                        col = [24.0 + n * 8.0, 24.0 + n * 8.0, 30.0 + n * 8.0];
+                    }
+                    rgb(col[0], col[1], col[2])
+                }
+                // 11_storefront_neon: ground-floor oceanfront cafes, glowing signs & awnings
+                10 => {
+                    let mut col = [34.0 + n * 8.0, 26.0 + n * 8.0, 48.0 + n * 8.0];
+                    let sx = (x % 128) as f32 / 128.0;
+                    if v > 0.35 && v < 0.88 && sx > 0.10 && sx < 0.90 {
+                        // Warm lit shop interior
+                        col = [255.0 - v * 60.0, 185.0 - sx * 35.0, 95.0];
+                    }
+                    if (v - 0.26).abs() < 0.06 {
+                        // Striped beach awning
+                        col = if ((x / 16) % 2) == 0 { [255.0, 75.0, 145.0] } else { [245.0, 245.0, 245.0] };
+                    }
+                    if (v - 0.14).abs() < 0.03 {
+                        col = [40.0, 255.0, 215.0]; // neon sign tube
+                    }
+                    rgb(col[0], col[1], col[2])
+                }
+                // 12_concrete_rooftop: rooftop concrete + crisp calibration checker on center tile
                 _ => {
                     let cx = (x / 32) % 2;
                     let cy = (y / 32) % 2;
                     let chk = (cx ^ cy) == 0;
-                    let qx = x < TEX_W / 2;
-                    let qy = y < TEX_H / 2;
-                    let base = match (qx, qy) {
-                        (true, true) => [255.0, 55.0, 85.0],
-                        (false, true) => [40.0, 240.0, 255.0],
-                        (true, false) => [255.0, 220.0, 40.0],
-                        (false, false) => [170.0, 75.0, 255.0],
-                    };
-                    if x % 128 < 4 || y % 128 < 4 {
-                        rgb(255.0, 255.0, 255.0)
-                    } else if chk {
-                        rgb(base[0], base[1], base[2])
+                    let base = if (u - 0.5).abs() < 0.25 && (v - 0.5).abs() < 0.25 {
+                        if chk { [255.0, 60.0, 140.0] } else { [40.0, 240.0, 255.0] }
                     } else {
-                        rgb(base[0] * 0.16, base[1] * 0.16, base[2] * 0.16)
-                    }
+                        [76.0 + n * 16.0, 74.0 + n * 16.0, 88.0 + n * 16.0]
+                    };
+                    rgb(base[0], base[1], base[2])
                 }
             };
             let off = (y * TEX_W + x) * 4;
@@ -245,16 +294,11 @@ fn generate_rgba(idx: usize) -> Vec<u8> {
 }
 
 #[inline]
-fn to_565(r: u8, g: u8, b: u8) -> (u8, u8, u8, u16) {
+fn to_565(r: u8, g: u8, b: u8) -> u16 {
     let r5 = (r as u16 * 31 + 127) / 255;
     let g6 = (g as u16 * 63 + 127) / 255;
     let b5 = (b as u16 * 31 + 127) / 255;
-    (
-        r5 as u8,
-        g6 as u8,
-        b5 as u8,
-        (r5 << 11) | (g6 << 5) | b5,
-    )
+    (r5 << 11) | (g6 << 5) | b5
 }
 
 #[inline]
@@ -288,7 +332,6 @@ fn compress_rgba_to_bc1(rgba: &[u8]) -> Vec<u8> {
                 }
             }
 
-            // Inset bounding box slightly for cleaner 4-color BC1 fit
             let mut c_hi = [0u8; 3];
             let mut c_lo = [0u8; 3];
             for c in 0..3 {
@@ -297,8 +340,8 @@ fn compress_rgba_to_bc1(rgba: &[u8]) -> Vec<u8> {
                 c_lo[c] = min_rgb[c].saturating_add(inset);
             }
 
-            let (_, _, _, mut c0) = to_565(c_hi[0], c_hi[1], c_hi[2]);
-            let (_, _, _, mut c1) = to_565(c_lo[0], c_lo[1], c_lo[2]);
+            let mut c0 = to_565(c_hi[0], c_hi[1], c_hi[2]);
+            let mut c1 = to_565(c_lo[0], c_lo[1], c_lo[2]);
             if c0 < c1 {
                 std::mem::swap(&mut c0, &mut c1);
             } else if c0 == c1 {
@@ -449,7 +492,6 @@ pub fn encode_bc1_to_bcpack(raw_bc1: &[u8], window: &Window, quads: &QuadTable) 
             (c1 & 31) as u8,
         ];
 
-        // Evaluate d = 0 and d in 1..=32 (including preset window pre-start refs)
         let mut best_d = 0usize;
         let mut best_score = i32::MAX;
         for d in 0..=32usize {
@@ -532,45 +574,63 @@ pub fn load_or_generate_assets(
     force_regen: bool,
 ) -> Vec<TextureAsset> {
     fs::create_dir_all(assets_dir).expect("create assets dir");
-    let mut result = Vec::with_capacity(ASSET_NAMES.len());
 
-    for (idx, &name) in ASSET_NAMES.iter().enumerate() {
-        let bcpack_path: PathBuf = assets_dir.join(format!("{name}.bcpack"));
-        let raw_path: PathBuf = assets_dir.join(format!("{name}.bc1"));
+    ASSET_NAMES
+        .par_iter()
+        .enumerate()
+        .map(|(idx, &name)| {
+            let bcpack_path: PathBuf = assets_dir.join(format!("{name}.bcpack"));
+            let raw_path: PathBuf = assets_dir.join(format!("{name}.bc1"));
+            let tile_paths: [PathBuf; TILE_STRIPS] =
+                std::array::from_fn(|t| assets_dir.join(format!("{name}_t{t}.bcpack")));
 
-        if !force_regen && bcpack_path.exists() && raw_path.exists() {
-            let bcpack_bytes = fs::read(&bcpack_path).expect("read .bcpack");
-            let expected_bc1 = fs::read(&raw_path).expect("read .bc1");
-            if expected_bc1.len() == TEX_BC1_BYTES {
-                result.push(TextureAsset {
-                    name,
-                    bcpack_bytes,
-                    expected_bc1,
-                });
-                continue;
+            let all_exist = !force_regen
+                && bcpack_path.exists()
+                && raw_path.exists()
+                && tile_paths.iter().all(|p| p.exists());
+
+            if all_exist {
+                let bcpack_bytes = fs::read(&bcpack_path).expect("read .bcpack");
+                let expected_bc1 = fs::read(&raw_path).expect("read .bc1");
+                if expected_bc1.len() == TEX_BC1_BYTES {
+                    let bcpack_tiles: [Vec<u8>; TILE_STRIPS] =
+                        std::array::from_fn(|t| fs::read(&tile_paths[t]).expect("read tile .bcpack"));
+                    return TextureAsset {
+                        name,
+                        bcpack_bytes,
+                        bcpack_tiles,
+                        expected_bc1,
+                    };
+                }
             }
-        }
 
-        println!("[assets] Generating procedural 512x512 texture & encoding BCPack: {name} ...");
-        let rgba = generate_rgba(idx);
-        let expected_bc1 = compress_rgba_to_bc1(&rgba);
-        let bcpack_bytes = encode_bc1_to_bcpack(&expected_bc1, window, quads);
+            let rgba = generate_rgba(idx);
+            let expected_bc1 = compress_rgba_to_bc1(&rgba);
+            let bcpack_bytes = encode_bc1_to_bcpack(&expected_bc1, window, quads);
+            let bcpack_tiles: [Vec<u8>; TILE_STRIPS] = std::array::from_fn(|t| {
+                let slice = &expected_bc1[t * TILE_BC1_BYTES..(t + 1) * TILE_BC1_BYTES];
+                encode_bc1_to_bcpack(slice, window, quads)
+            });
 
-        fs::write(&bcpack_path, &bcpack_bytes).expect("write .bcpack");
-        fs::write(&raw_path, &expected_bc1).expect("write .bc1");
-        println!(
-            "[assets]   {name}: {} bytes raw BC1 -> {} bytes BCPack ({:.2}x compression)",
-            expected_bc1.len(),
-            bcpack_bytes.len(),
-            expected_bc1.len() as f64 / bcpack_bytes.len() as f64
-        );
+            fs::write(&bcpack_path, &bcpack_bytes).expect("write .bcpack");
+            fs::write(&raw_path, &expected_bc1).expect("write .bc1");
+            for t in 0..TILE_STRIPS {
+                fs::write(&tile_paths[t], &bcpack_tiles[t]).expect("write tile .bcpack");
+            }
+            println!(
+                "[assets] Generated {}: 131072 B BC1 -> {} B mono ({:.2}x), {} B 4x4K tiles",
+                name,
+                bcpack_bytes.len(),
+                expected_bc1.len() as f64 / bcpack_bytes.len() as f64,
+                bcpack_tiles.iter().map(|v| v.len()).sum::<usize>()
+            );
 
-        result.push(TextureAsset {
-            name,
-            bcpack_bytes,
-            expected_bc1,
-        });
-    }
-
-    result
+            TextureAsset {
+                name,
+                bcpack_bytes,
+                bcpack_tiles,
+                expected_bc1,
+            }
+        })
+        .collect()
 }
