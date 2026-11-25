@@ -1,4 +1,4 @@
-# Community Outreach Templates (`v0.9.0`) & Target Repositories
+# Community Outreach Templates (`v0.10.0`) & Target Repositories
 
 Ready-to-post technical integration proposals and verified open-source target repositories for Xbox Series X|S compatibility layers and RAGE 9 / BCPack tooling. See [`AI_ARCHITECTURE.md`](AI_ARCHITECTURE.md) for the machine-readable architecture & invariants breakdown.
 
@@ -20,18 +20,19 @@ Ready-to-post technical integration proposals and verified open-source target re
 
 ## Option A: Ready-to-Post RFC (`xcl-dev/xcl`, `OpenScarlett`, `ScarlettX`, `AnyXboxX`)
 
-**Title:** `[Contribution] Zero-Copy Shared-Device Xbox Series BCPack (MDU rANS) GPU Decoder + 1.25M Descriptor Paging (DX12 HLSL SM 6.6, v0.9.0)`
+**Title:** `[Contribution] Zero-Copy Shared-Device + Direct 2D Texture Xbox Series BCPack GPU Decoder + Vulkan 1.3 SPIR-V + 1.25M Descriptor Paging (v0.10.0)`
 
 ```markdown
 Hi team!
 
-To help eliminate CPU decompression bottlenecks (`IDStorageQueueX` / `BCPack` rANS) and NVIDIA's ~1M `shader-visible` descriptor heap limit in open-world Xbox Series X|S translation layers, I built a **clean-room, MIT/Apache-2.0 licensed DirectX 12 HLSL SM 6.6 implementation** with a **zero-copy C-ABI DLL (`bcpack_gpu.dll`)** and a full `v0.9.0` 4K AAA streaming benchmark:
+To help eliminate CPU decompression bottlenecks (`IDStorageQueueX` / `BCPack` rANS) and NVIDIA's ~1M `shader-visible` descriptor heap limit in open-world Xbox Series X|S translation layers, I built a **clean-room, MIT/Apache-2.0 licensed DX12 HLSL SM 6.6 + Vulkan 1.3 SPIR-V implementation** with a **zero-copy C-ABI DLL (`bcpack_gpu.dll`)** and a full `v0.10.0` 4K AAA streaming benchmark:
 
-- **Repository:** https://github.com/POMXARK/bcpack-gpu-hlsl (prebuilt `v0.9.0` SDK & demo zips on Releases)
+- **Repository:** https://github.com/POMXARK/bcpack-gpu-hlsl (prebuilt `v0.10.0` DXIL + SPIR-V SDK & demo zips on Releases)
 - **AI / Systems Architecture Doc:** `docs/AI_ARCHITECTURE.md` (exact register bindings, invariants & C-ABI contract)
 
-### Key Verified Highlights (Bit-Exact 18/18 PASS on RTX 5080, DX12 Debug Layer Clean — 0 errors)
-- **Zero-Copy Shared-Device C-ABI (`include/bcpack_gpu.h`, `src/ffi.rs`):** Pass your engine's existing `ID3D12Device*` (+ optional Compute queue) to `bcpack_gpu_create_from_device(...)`, decode + Gfx10-detile directly into a caller-owned `ID3D12Resource*` via `BcPackDecodeToBuffer(...)`, and synchronize purely on GPU via `direct_queue->Wait((ID3D12Fence*)BcPackGetComputeFence(ctx), fence)` — **zero CPU readback**.
+### Key Verified Highlights (Bit-Exact 19/19 PASS on RTX 5080, DX12 Debug Layer Clean — 0 errors)
+- **Zero-Copy Shared-Device & Direct 2D Texture C-ABI (`include/bcpack_gpu.h`, `src/ffi.rs`):** Pass your engine's existing `ID3D12Device*` (+ optional Compute queue) to `bcpack_gpu_create_from_device(...)`, decode + Gfx10-detile directly into a caller-owned buffer (`BcPackDecodeToBuffer`) or **directly into any `DXGI_FORMAT_BC1_UNORM` 2D texture mip** (`BcPackDecodeToTexture2D` with automatic 256B row-pitch padding), and synchronize purely on GPU (`Queue::Wait`) — **zero CPU readback**.
+- **Official Vulkan 1.3 SPIR-V Kernels (`shaders/spirv/*.spv`, `shaders/compile_spirv.sh`):** All 7 core compute kernels (`bcpack_decode.spv`, `bcpack_bc7_rans.spv`, `bc16_pack.spv`, `gfx10_detile.spv`, `hiz_build.spv`, `crowd_skin.spv`, `bindless_paging.spv`) precompiled via Microsoft DXC `v1.9.2609` (`-spirv -fspv-target-env=vulkan1.3`) for Vulkan / Linux Proton translation layers (`OpenScarlett`).
 - **Zero-Barrier Wave32 Multi-Lane rANS (`shaders/bcpack_decode.hlsl`, `shaders/bcpack_bc7_rans.hlsl`):**
   - Dual-chunk Wave32 packing (`24/32` lanes BC1, `32/32 = 100%` Wave32 BC7), register-resident 64B stream window, `WaveReadLaneAt` symbol handoff (**0 barriers in the hot loop**), and explicit `WaveActiveBallot` workaround for the DXC 1.8 `-O3` prefix-count miscompile.
   - Reaches **11,327.6 MB/s (11.33 GB/s — 282.1× vs 1T CPU)** on BC1 and **6,024.0 MB/s equiv (247.1× vs 1T CPU)** on 16-lane BC7 rANS.

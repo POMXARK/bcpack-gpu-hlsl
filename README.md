@@ -1,7 +1,7 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
 [![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1-2f80ed)](shaders/bcpack_decode.hlsl)
-[![v0.9.0](https://img.shields.io/badge/v0.9.0-Zero--Copy%20C--ABI%20%7C%2018%2F18%20PASS%20%7C%20150.6%20FPS-ff4081)](#open-aaa-benchmark-v080--4k-bc7bc5--active-sfs--1241m-mesh-shader-city--500-npcs--dxr-11--taa)
+[![v0.10.0](https://img.shields.io/badge/v0.10.0-Tex2D%20C--ABI%20%7C%20SPIR--V%20%7C%2019%2F19%20PASS-ff4081)](#verified-bit-exactness-bcpack-gpu-demo---verify--1919-pass)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
@@ -89,9 +89,9 @@ flowchart LR
 
 ---
 
-## Verified Bit-Exactness (`bcpack-gpu-demo --verify` — 18/18 PASS)
+## Verified Bit-Exactness (`bcpack-gpu-demo --verify` — 19/19 PASS)
 
-Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Queue** enabled (`v0.9.0` — **18/18 PASS**, `0` mismatches):
+Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Queue** enabled (`v0.10.0` — **19/19 PASS**, `0` mismatches):
 1. **PASS 1/18 — BC1 synthetic streams** (`5` chunks, `21,824` blocks, odd chunk count): `0` byte mismatches
 2. **PASS 2/18 — BC1 monolithic 512×512 textures** (`12` textures = `1.50 MiB`): `0` byte mismatches
 3. **PASS 3/18 — BC1 tiled 4K-block strips** (`48` tiles = `1.50 MiB`): `0` byte mismatches
@@ -109,7 +109,8 @@ Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Qu
 15. **PASS 15/18 — Jet-Flight 64×64 Supersonic World Grid Streaming** (`64×64 = 4,096` sectors / `256 km²`, `360` frames Mach 1/2 sweep, `14,500` tiles / `453.1 MiB` streamed, `1,487` LRU evictions, `512`-tile `16.0 MiB` burst, `960 MB/s` peak, `0` mismatches, [`src/world_streaming.rs`](src/world_streaming.rs))
 16. **PASS 16/18 — Two-Pass Hi-Z Occlusion Culling over 12.04M-Tri Skyline** (`159,171` meshlets, `45,585` frustum culled, `113,348` Hi-Z occluded = `8.53M` tris, `build=0.009 ms`, `cull=0.006 ms`, `0` mismatches, [`src/hiz_culling.rs`](src/hiz_culling.rs) + [`shaders/hiz_{build,cull}.hlsl`](shaders/hiz_cull.hlsl))
 17. **PASS 17/18 — 500 GPU-Skinned NPC Crowd Compute (4-Bone LBS)** (`500 × 1,024 = 512k` verts, `32,000` bones, `4,096` CPU-oracle samples verified, `max_err=7.63e-6`, `GPU=0.075 ms`, `0` mismatches, [`src/crowd_skinning.rs`](src/crowd_skinning.rs) + [`shaders/crowd_skin.hlsl`](shaders/crowd_skin.hlsl))
-18. **PASS 18/18 — Zero-Copy Shared-Device C-ABI (`bcpack_gpu_create_from_device` + `BcPackDecodeToBuffer` + GPU `Queue::Wait`):** Shares caller `ID3D12Device*`, decodes + Gfx10 `SW_64KB_D`-detiles directly into a caller GPU buffer (`D3D12_HEAP_TYPE_DEFAULT`), and syncs cross-queue via `BcPackGetComputeFence` with `0` byte mismatches ([`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`src/ffi.rs`](src/ffi.rs)).
+18. **PASS 18/19 — Zero-Copy Shared-Device C-ABI (`bcpack_gpu_create_from_device` + `BcPackDecodeToBuffer` + GPU `Queue::Wait`):** Shares caller `ID3D12Device*`, decodes + Gfx10 `SW_64KB_D`-detiles directly into a caller GPU buffer (`D3D12_HEAP_TYPE_DEFAULT`), and syncs cross-queue via `BcPackGetComputeFence` with `0` byte mismatches ([`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`src/ffi.rs`](src/ffi.rs)).
+19. **PASS 19/19 — Direct 2D Texture C-ABI (`BcPackDecodeToTexture2D`):** Decodes + Gfx10-detiles directly into a caller `DXGI_FORMAT_BC1_UNORM` `Texture2D` subresource (Mip 0 `512×512 SW_64KB_D` + Mip 3 `64×64` with automatic `256B` row-pitch padding), `0` byte mismatches.
 
 ---
 
@@ -190,16 +191,16 @@ target\release\bcpack-aaa-demo.exe --aaa-dir aaa_assets
 target\release\bcpack-aaa-demo.exe --aaa-dir aaa_assets --flush-bench
 ```
 
-Precompiled `bcpack_gpu.dll`, `bcpack_gpu.dll.lib`, and [`include/bcpack_gpu.h`](include/bcpack_gpu.h) are built in `target\release\` (and attached to GitHub Release `v0.9.0`) for zero-copy C/C++ integration into `IDStorageQueueX` wrappers:
+Precompiled `bcpack_gpu.dll`, `bcpack_gpu.dll.lib`, [`include/bcpack_gpu.h`](include/bcpack_gpu.h), `.dxil`, and **Vulkan 1.3 SPIR-V ([`shaders/spirv/*.spv`](shaders/compile_spirv.sh))** are built in `target\release\` (and attached to GitHub Release `v0.10.0`) for zero-copy C/C++ integration into `IDStorageQueueX` / `OpenScarlett` wrappers:
 ```c
 #include "bcpack_gpu.h"
-// Zero-copy shared-device mode (zero CPU readback):
+// Zero-copy shared-device Texture2D mode (zero CPU readback):
 BcPackContext* ctx = bcpack_gpu_create_from_device(d3d12_device, NULL, 2048, 8388608, 96 * 1024 * 1024);
 uint64_t fence = 0;
-BcPackDecodeToBuffer(ctx, stream, stream_len, num_blocks,
-                     BCPACK_FORMAT_BC1, BCPACK_SWIZZLE_GFX10_64KB_D,
-                     128, 128, caller_gpu_buf, 0, &fence);
-direct_queue->Wait((ID3D12Fence*)BcPackGetComputeFence(ctx), fence);
+BcPackDecodeToTexture2D(ctx, stream, stream_len, num_blocks,
+                        BCPACK_FORMAT_BC1, BCPACK_SWIZZLE_GFX10_64KB_D,
+                        128, 128, caller_tex2d, 0, 0, 0, &fence);
+direct_queue->Wait((ID3D12Fence*)BcPackGetDirectFence(ctx), fence);
 ```
 
 To recompile all 25 HLSL shader outputs yourself (requires Windows 10/11 SDK `dxc.exe`):

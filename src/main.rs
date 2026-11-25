@@ -12,9 +12,10 @@ use bcpack_gpu::demo_scene::{run_demo, DemoConfig, DemoMode};
 use bcpack_gpu::descriptor_paging::run_descriptor_paging_verify;
 use bcpack_gpu::ffi::{
     bcpack_gpu_create, bcpack_gpu_create_from_device, bcpack_gpu_destroy, BcPackDecodeAsync,
-    BcPackDecodeToBuffer, BcPackGetComputeFence, BcPackGetLastTimingMs, BcPackWaitFence,
-    BCPACK_FORMAT_BC1, BCPACK_FORMAT_BC7_RANS, BCPACK_SWIZZLE_GFX10_4KB_S,
-    BCPACK_SWIZZLE_GFX10_64KB_D, BCPACK_SWIZZLE_LINEAR,
+    BcPackDecodeToBuffer, BcPackDecodeToTexture2D, BcPackGetComputeFence, BcPackGetDirectFence,
+    BcPackGetLastTimingMs, BcPackWaitDirectFence, BcPackWaitFence, BCPACK_FORMAT_BC1,
+    BCPACK_FORMAT_BC7_RANS, BCPACK_SWIZZLE_GFX10_4KB_S, BCPACK_SWIZZLE_GFX10_64KB_D,
+    BCPACK_SWIZZLE_LINEAR,
 };
 use bcpack_gpu::gltf_loader::run_aaa_2k_bcpack_verify;
 use bcpack_gpu::gpu_decoder::{
@@ -90,7 +91,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         offset += byte_len;
     }
     println!(
-        "[verify] PASS 1/18 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 1/19 BC1 synthetic streams ({} chunks, {} blocks, Async Compute GPU={:.3} ms, 0 byte mismatches)",
         cases.len(),
         cases.iter().map(|c| c.1).sum::<usize>(),
         gpu_ms
@@ -110,7 +111,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 2/18 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 2/19 BC1 monolithic 512x512 textures ({} textures = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         assets.len(),
         tex_gpu_ms
     );
@@ -135,7 +136,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         }
     }
     println!(
-        "[verify] PASS 3/18 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 3/19 BC1 tiled 4K-block strips ({} tiles = 1.50 MiB, GPU={:.3} ms, 0 byte mismatches)",
         total_tiles,
         tile_gpu_ms
     );
@@ -179,7 +180,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         row_off += *rows;
     }
     println!(
-        "[verify] PASS 4/18 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
+        "[verify] PASS 4/19 BC7 16-lane rANS (100% Wave32 32/32 threads, {} chunks, {} symbol-rows, GPU={:.3} ms, 0 symbol mismatches)",
         bc7_cases.len(),
         total_sym_rows,
         bc7_gpu_ms
@@ -202,7 +203,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         let (detiled, det_ms) = detile.detile_and_readback(&mut ctx, &gpu_swizzled_out, w_blk as u32, h_blk as u32, tile_mode, 8);
         assert_eq!(detiled.as_slice(), linear_bc1.as_slice(), "FAIL Gfx10 detile mismatch on {name}");
         println!(
-            "[verify] PASS 5/18 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
+            "[verify] PASS 5/19 Gfx10 {name} Swizzle->BCPack->GPU Decode({dec_ms:.3} ms)->Detile({det_ms:.3} ms) (0 byte mismatches)"
         );
     }
 
@@ -222,7 +223,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         m_off += byte_len;
     }
     println!(
-        "[verify] PASS 6/18 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
+        "[verify] PASS 6/19 Mipmap Chain + Packed Mip Tail ({} chunks: 512x512..64x64 + 85-block tail, GPU={:.3} ms, 0 byte mismatches)",
         mip_chain.len(),
         mip_ms
     );
@@ -293,27 +294,27 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
         assert_eq!(BcPackGetLastTimingMs(ffi_ctx, &mut kms), 0);
         bcpack_gpu_destroy(ffi_ctx);
         println!(
-            "[verify] PASS 7/18 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
+            "[verify] PASS 7/19 C-ABI FFI BcPackDecodeAsync (Linear BC1 + Fused Gfx10 SW_64KB_D + Async BC7 16-lane, last_kernel={kms:.3} ms, 0 mismatches)"
         );
     }
 
     // 8) DXR 1.1 Hardware BVH + Inline RayQuery verification on RT Cores
     let rt_ms = run_rt_verify(&mut ctx);
     println!(
-        "[verify] PASS 8/18 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
+        "[verify] PASS 8/19 DXR 1.1 Hardware BLAS/TLAS + Inline RayQuery (4 analytical rays, GPU={rt_ms:.3} ms, 0 mismatches)"
     );
 
     // 9) World Grid 32x32 Streaming + LRU VRAM Residency Manager verification
     let ws = run_world_stream_verify(&mut ctx, &mut gpu_dec, &assets);
     println!(
-        "[verify] PASS 9/18 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 9/19 World Grid 32x32 Streaming + LRU VRAM Residency ({} frames, {} tiles decoded, {} evictions, turn_burst={}t, peak={:.0} MB/s, GPU={:.3} ms, 0 mismatches)",
         ws.frames, ws.verified_tiles, ws.total_evictions, ws.turn_burst_tiles, ws.peak_mbs, ws.gpu_ms
     );
 
     // 10) DX12 Ultimate Mesh Shaders (as_6_5 / ms_6_5) + GPU Frustum Culling + 4M+ Tris City verification
     let ms = run_mesh_shader_verify(&mut ctx);
     println!(
-        "[verify] PASS 10/18 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
+        "[verify] PASS 10/19 Hardware Mesh Shaders (4.0M+ Tris City: total={:.2}M tris, work={}, vis={} / cull={}, vis_tris={:.2}M, lit_px={}, 0 mismatches)",
         ms.total_tris as f64 / 1e6,
         ms.total_work_items,
         ms.visible_meshlets,
@@ -325,14 +326,14 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 11) DXR 1.1 Scale (1,536-Instance TLAS) + 2-Pass A-Trous Bilateral RTGI Denoiser verification
     let gi = run_rtgi_verify(&mut ctx);
     println!(
-        "[verify] PASS 11/18 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
+        "[verify] PASS 11/19 DXR 1.1 Scale ({} TLAS instances, build={:.3} ms) + RTGI Denoiser (var {:.4} -> {:.4}, edge_jump={:.2}, 0 mismatches)",
         gi.tlas_instances, gi.tlas_ms, gi.raw_var, gi.denoised_var, gi.edge_jump
     );
 
     // 12) BCPack 8B Quantized Meshlet Geometry Vertex Compression -> GPU Async Decode verification
     let gb = run_geom_bcpack_verify(&mut ctx, &mut gpu_dec, &window, &quads);
     println!(
-        "[verify] PASS 12/18 BCPack 8B Meshlet Geometry ({} verts = {} KiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 12/19 BCPack 8B Meshlet Geometry ({} verts = {} KiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
         gb.vertices, gb.raw_bytes / 1024, gb.ratio, gb.gpu_ms
     );
 
@@ -340,7 +341,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     let aaa = run_aaa_2k_bcpack_verify(&mut ctx, &mut gpu_dec, assets_dir, &window, &quads);
     let ratio = aaa.raw_bytes as f64 / aaa.comp_bytes.max(1) as f64;
     println!(
-        "[verify] PASS 13/18 AAA glTF+4K PBR BCPack BC7/BC5 (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 13/19 AAA glTF+4K PBR BCPack BC7/BC5 (real={}, verts={}, tris={}, submeshes={} [glass={}], {} tex / {} tiles = {:.2} MiB, ratio={:.2}x, GPU={:.3} ms, 0 mismatches)",
         aaa.real_assets,
         aaa.verts,
         aaa.tris,
@@ -356,7 +357,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 14) RAGE-Scale Virtual Descriptor Paging (1.25M Virtual -> 262,144 Physical ResourceDescriptorHeap[] SM 6.6)
     let dp = run_descriptor_paging_verify(&mut ctx);
     println!(
-        "[verify] PASS 14/18 Virtual Descriptor Paging ({:.2}M virt -> {} phys slots, {} ops, {} evictions, copy={:.2} ms, GPU={:.3} ms, {} samples, 0 mismatches)",
+        "[verify] PASS 14/19 Virtual Descriptor Paging ({:.2}M virt -> {} phys slots, {} ops, {} evictions, copy={:.2} ms, GPU={:.3} ms, {} samples, 0 mismatches)",
         dp.virtual_count as f64 / 1e6,
         dp.physical_slots,
         dp.accesses,
@@ -369,7 +370,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 15) 64x64 World Grid Supersonic Jet-Flight Streaming (4,096 sectors = 256 km^2, 512-tile 16 MiB bursts)
     let jf = run_jet_flight_verify(&mut ctx, &mut gpu_dec, &assets);
     println!(
-        "[verify] PASS 15/18 Jet-Flight 64x64 World Grid ({}x{} = {} sectors / {:.0} km^2, {}f, {}t streamed, {} evictions, max_burst={}t, peak={:.0} MB/s, GPU={}t={:.3} ms, 0 mismatches)",
+        "[verify] PASS 15/19 Jet-Flight 64x64 World Grid ({}x{} = {} sectors / {:.0} km^2, {}f, {}t streamed, {} evictions, max_burst={}t, peak={:.0} MB/s, GPU={}t={:.3} ms, 0 mismatches)",
         jf.grid_dim,
         jf.grid_dim,
         jf.total_sectors,
@@ -386,7 +387,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 16) Two-Pass Hi-Z Occlusion Culling over 12M+ Triangle City
     let hiz = run_hiz_12m_verify(&mut ctx);
     println!(
-        "[verify] PASS 16/18 Two-Pass Hi-Z Occlusion Culling ({:.2}M tris / {} meshlets, vis={} ({:.2}M tris), frustum_cull={}, hiz_occluded={} ({:.2}M tris), build={:.3} ms, cull={:.3} ms, 0 mismatches)",
+        "[verify] PASS 16/19 Two-Pass Hi-Z Occlusion Culling ({:.2}M tris / {} meshlets, vis={} ({:.2}M tris), frustum_cull={}, hiz_occluded={} ({:.2}M tris), build={:.3} ms, cull={:.3} ms, 0 mismatches)",
         hiz.total_tris as f64 / 1e6,
         hiz.total_work_items,
         hiz.visible_meshlets,
@@ -401,7 +402,7 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
     // 17) 500 GPU-Skinned NPC Crowd Compute (512,000 verts, 32,000 bones)
     let crowd = run_crowd_skinning_verify(&mut ctx);
     println!(
-        "[verify] PASS 17/18 GPU Crowd Skinning ({} NPCs x 1024v = {}k verts, {} bones, {} samples checked, max_err={:.2e}, GPU={:.3} ms, 0 mismatches)",
+        "[verify] PASS 17/19 GPU Crowd Skinning ({} NPCs x 1024v = {}k verts, {} bones, {} samples checked, max_err={:.2e}, GPU={:.3} ms, 0 mismatches)",
         crowd.npc_count,
         crowd.total_verts / 1000,
         crowd.total_bones,
@@ -496,7 +497,167 @@ fn run_verify(assets_dir: &PathBuf, force_regen: bool) {
 
         bcpack_gpu_destroy(shared_ctx);
         println!(
-            "[verify] PASS 18/18 Zero-Copy Shared-Device C-ABI (bcpack_gpu_create_from_device + BcPackDecodeToBuffer + GPU Queue::Wait, 128x128 SW_64KB_D, 0 byte mismatches)"
+            "[verify] PASS 18/19 Zero-Copy Shared-Device C-ABI (bcpack_gpu_create_from_device + BcPackDecodeToBuffer + GPU Queue::Wait, 128x128 SW_64KB_D, 0 byte mismatches)"
+        );
+    }
+
+    // 19) Direct 2D Texture C-ABI (BcPackDecodeToTexture2D: Mip 0 SW_64KB_D 512x512 + Mip 3 64x64 non-256B row padding)
+    unsafe {
+        use std::mem::ManuallyDrop;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC1_UNORM, DXGI_SAMPLE_DESC};
+
+        let shared_ctx = bcpack_gpu_create_from_device(
+            ctx.device.as_raw(),
+            std::ptr::null_mut(),
+            64,
+            65536,
+            16 * 1024 * 1024,
+        );
+        assert!(!shared_ctx.is_null(), "bcpack_gpu_create_from_device returned null (tex2d)");
+
+        let tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 512,
+            Height: 512,
+            DepthOrArraySize: 1,
+            MipLevels: 4,
+            Format: DXGI_FORMAT_BC1_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let heap_default = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 0,
+            VisibleNodeMask: 0,
+        };
+        let mut caller_tex_opt: Option<ID3D12Resource> = None;
+        ctx.device
+            .CreateCommittedResource(
+                &heap_default,
+                D3D12_HEAP_FLAG_NONE,
+                &tex_desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut caller_tex_opt,
+            )
+            .expect("CreateCommittedResource caller Texture2D");
+        let caller_tex = caller_tex_opt.unwrap();
+
+        // Subresource 0: 512x512 SW_64KB_D (256B-aligned row pitch = 1024)
+        let mip0_swizzled = swizzle_gfx10_cpu(&assets[3].expected_bc1, 128, 128, 0, 8);
+        let mip0_stream = encode_bc1_to_bcpack(&mip0_swizzled, &window, &quads);
+        let mut df0 = 0u64;
+        let rc0 = BcPackDecodeToTexture2D(
+            shared_ctx,
+            mip0_stream.as_ptr(),
+            mip0_stream.len() as u32,
+            (mip0_swizzled.len() / 8) as u32,
+            BCPACK_FORMAT_BC1,
+            BCPACK_SWIZZLE_GFX10_64KB_D,
+            128,
+            128,
+            caller_tex.as_raw(),
+            0,
+            0,
+            0,
+            &mut df0,
+        );
+        assert_eq!(rc0, 0, "BcPackDecodeToTexture2D Mip 0 failed: {rc0}");
+
+        // Subresource 3: 64x64 linear (16x16 blocks, raw row = 128B < 256B -> exercises automatic row-pitch padding)
+        let mip_chain_3 = generate_mip_chain_bc1(3, &window, &quads);
+        let mip3 = &mip_chain_3[3]; // 64x64
+        let mut df3 = 0u64;
+        let rc3 = BcPackDecodeToTexture2D(
+            shared_ctx,
+            mip3.bcpack.as_ptr(),
+            mip3.bcpack.len() as u32,
+            mip3.blocks as u32,
+            BCPACK_FORMAT_BC1,
+            BCPACK_SWIZZLE_LINEAR,
+            16,
+            16,
+            caller_tex.as_raw(),
+            3,
+            0,
+            0,
+            &mut df3,
+        );
+        assert_eq!(rc3, 0, "BcPackDecodeToTexture2D Mip 3 failed: {rc3}");
+        assert_eq!(BcPackWaitDirectFence(shared_ctx, df3, 5000), 0);
+
+        let raw_df = BcPackGetDirectFence(shared_ctx);
+        assert!(!raw_df.is_null());
+        let direct_fence: ID3D12Fence = (*ManuallyDrop::new(ID3D12Fence::from_raw(raw_df))).clone();
+        ctx.queue.Wait(&direct_fence, df3).expect("caller queue Wait direct_fence");
+
+        // Readback Mip 0 & Mip 3 on caller's queue and verify bit-exact
+        let rb_mip0 = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, TEX_BC1_BYTES as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let rb_mip3 = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, 256 * 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        let c_alloc: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let c_cmd: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &c_alloc, None).unwrap();
+        cmd_barriers(&c_cmd, vec![transition_barrier(&caller_tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+
+        let mut copy_mip = |sub: u32, w_blk: u32, h_blk: u32, pitch: u32, dst_rb: &ID3D12Resource| {
+            let mut dloc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(dst_rb.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_BC1_UNORM,
+                            Width: w_blk * 4,
+                            Height: h_blk * 4,
+                            Depth: 1,
+                            RowPitch: pitch,
+                        },
+                    },
+                },
+            };
+            let mut sloc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(caller_tex.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+            };
+            c_cmd.CopyTextureRegion(&dloc, 0, 0, 0, &sloc, None);
+            let _ = ManuallyDrop::take(&mut dloc.pResource);
+            let _ = ManuallyDrop::take(&mut sloc.pResource);
+        };
+        copy_mip(0, 128, 128, 128 * 8, &rb_mip0);
+        copy_mip(3, 16, 16, 256, &rb_mip3);
+
+        cmd_barriers(&c_cmd, vec![transition_barrier(&caller_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+        c_cmd.Close().unwrap();
+        let lists = [Some(c_cmd.cast::<ID3D12CommandList>().unwrap())];
+        ctx.queue.ExecuteCommandLists(&lists);
+        ctx.signal_and_wait();
+
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        rb_mip0.Map(0, Some(&D3D12_RANGE { Begin: 0, End: TEX_BC1_BYTES }), Some(&mut ptr)).unwrap();
+        let got0 = std::slice::from_raw_parts(ptr as *const u8, TEX_BC1_BYTES).to_vec();
+        rb_mip0.Unmap(0, None);
+        assert_eq!(got0, assets[3].expected_bc1, "Direct Texture2D Mip 0 mismatch");
+
+        rb_mip3.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 256 * 16 }), Some(&mut ptr)).unwrap();
+        let padded3 = std::slice::from_raw_parts(ptr as *const u8, 256 * 16);
+        let mut got3 = Vec::with_capacity(mip3.expected_bc1.len());
+        for r in 0..16usize {
+            got3.extend_from_slice(&padded3[r * 256..r * 256 + 128]);
+        }
+        rb_mip3.Unmap(0, None);
+        assert_eq!(&got3, &mip3.expected_bc1, "Direct Texture2D Mip 3 (padded row pitch) mismatch");
+
+        bcpack_gpu_destroy(shared_ctx);
+        println!(
+            "[verify] PASS 19/19 Direct 2D Texture C-ABI (BcPackDecodeToTexture2D: Mip 0 512x512 SW_64KB_D + Mip 3 64x64 auto-padded 256B RowPitch, 0 byte mismatches)"
         );
     }
 

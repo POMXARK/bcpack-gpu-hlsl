@@ -57,6 +57,15 @@ BCPACK_API void bcpack_gpu_destroy(BcPackContext* ctx);
 // so callers can execute GPU-side direct_queue->Wait((ID3D12Fence*)BcPackGetComputeFence(ctx), fence_value) without CPU stalls.
 BCPACK_API void* BcPackGetComputeFence(const BcPackContext* ctx);
 
+// Returns the internal DIRECT queue ID3D12Fence* signaled after BcPackDecodeToTexture2D completes CopyTextureRegion.
+BCPACK_API void* BcPackGetDirectFence(const BcPackContext* ctx);
+
+// Waits on CPU for a DIRECT fence value returned by BcPackDecodeToTexture2D (0 = signaled, 1 = timeout, <0 = error).
+BCPACK_API int32_t BcPackWaitDirectFence(
+    BcPackContext* ctx,
+    uint64_t fence_value,
+    uint32_t timeout_ms);
+
 // Zero-copy async decode directly into a caller-owned ID3D12Resource* buffer on the shared device (zero CPU readback).
 // - dst_d3d12_resource MUST live on the same ID3D12Device passed to bcpack_gpu_create_from_device and be in D3D12_RESOURCE_STATE_COMMON on entry (restored to COMMON on exit).
 // - Signals *out_fence_value on BcPackGetComputeFence(ctx). Returns 0 on success, < 0 on error.
@@ -71,6 +80,26 @@ BCPACK_API int32_t BcPackDecodeToBuffer(
     uint32_t height_blocks,
     void* dst_d3d12_resource,
     uint64_t dst_byte_offset,
+    uint64_t* out_fence_value);
+
+// Zero-copy async decode (+ optional Gfx10 detile) directly into a 2D DXGI_FORMAT_BC1_UNORM ID3D12Resource* subresource.
+// - Executes BCPack decode (+ detile) on the Async Compute queue, performs GPU Queue::Wait onto DIRECT, and issues CopyTextureRegion
+//   (automatically padding row pitches to 256B for small mip levels).
+// - dst_texture2d MUST live on the shared device and enter in D3D12_RESOURCE_STATE_COMMON (restored to COMMON on exit).
+// - Signals *out_fence_value on BcPackGetDirectFence(ctx). Only BCPACK_FORMAT_BC1 is currently supported for direct Texture2D upload.
+BCPACK_API int32_t BcPackDecodeToTexture2D(
+    BcPackContext* ctx,
+    const uint8_t* compressed_data,
+    uint32_t compressed_size,
+    uint32_t num_blocks,
+    uint32_t format,
+    uint32_t swizzle_mode,
+    uint32_t width_blocks,
+    uint32_t height_blocks,
+    void* dst_texture2d,
+    uint32_t subresource_index,
+    uint32_t dst_x_blocks,
+    uint32_t dst_y_blocks,
     uint64_t* out_fence_value);
 
 // Submits a BCPack chunk onto the DX12 D3D12_COMMAND_LIST_TYPE_COMPUTE Async Compute Queue.

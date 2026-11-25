@@ -21,9 +21,10 @@
    - **500 пешеходов на тротуарах** (`154 000` вершин/кадр, скиннинг в Compute `crowd_skin.dxil`) + 6 припаркованных спорткаров + 60-секундный прогон `--benchmark-run` (**`START_AAA_BENCHMARK.bat`** для запуска в два клика).
 4. **Интерактивные ползунки FPS Cap и скорости симуляции (`[H]` HUD):**
    - В левом нижнем углу шоурума отображается HUD-панель с двумя перетаскиваемыми мышью ползунками: **FPS Cap** (`15–300 FPS / VSync / MAX`, клавиши `[` / `]`, CLI `--fps-cap <N>`) и **скорость симуляции** (`0.00x–4.00x` для трафика и NPC с паузой `[P]`, `-` / `=`, сброс `[0]`, CLI `--sim-speed <F>`).
-5. **Замеры и тесты `v0.9.0` на NVIDIA GeForce RTX 5080 (1920×1080 HDR, DX12 Debug Layer чист — 0 ошибок):**
+5. **Замеры и тесты `v0.10.0` на NVIDIA GeForce RTX 5080 (1920×1080 HDR, DX12 Debug Layer чист — 0 ошибок):**
    - **`--benchmark-run` (60.0s, 9 026 кадров):** **150.61 FPS** ср. (`6.64 мс`) | **1% Low: 87.07 FPS** | **0.1% Low: 43.37 FPS** | SFS VRAM: **86.2 / 204.7 MiB** (экономия **118.5 MiB**) | Mesh Shaders + Hi-Z: **12.41M → 0.99M** ср. видимых | **500 NPC**.
-   - **Zero-Copy Shared-Device C-ABI (`v0.9.0`, `--verify` 18/18 PASS):** добавлены `bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer` и `BcPackGetComputeFence` ([`include/bcpack_gpu.h`](include/bcpack_gpu.h)) — декодирование и Gfx10 detile напрямую в GPU-буфер эмулятора на общем `ID3D12Device` с кросс-очередной GPU-синхронизацией `Queue::Wait` (без чтения на CPU).
+   - **Zero-Copy Shared-Device & Direct Texture2D C-ABI (`v0.10.0`, `--verify` 19/19 PASS):** `bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D` ([`include/bcpack_gpu.h`](include/bcpack_gpu.h)) — декодирование и Gfx10 detile напрямую в GPU-буфер или 2D-текстуру `DXGI_FORMAT_BC1_UNORM` эмулятора (включая авто-выравнивание RowPitch до 256B для мелких мипов, `0` расхождений).
+   - **Vulkan 1.3 SPIR-V (`shaders/spirv/*.spv`, [`shaders/compile_spirv.sh`](shaders/compile_spirv.sh)):** 7 ключевых Compute-шейдеров скомпилированы официальным DXC `v1.9.2609` для Linux/Vulkan-трансляторов.
 6. **Архитектура и оптимизации для нейросетей и контрибьюторов:**
    - Машиночитаемая спецификация 11 уникальных оптимизаций, обходов багов DXC/драйвера и C-ABI контракта: [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md).
    - Проверенные целевые open-source проекты для контрибуций и готовые RFC-шаблоны: [`docs/OUTREACH_PITCH.md`](docs/OUTREACH_PITCH.md).
