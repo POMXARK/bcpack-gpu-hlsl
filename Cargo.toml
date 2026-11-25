@@ -1,6 +1,6 @@
 [package]
 name = "bcpack-gpu-hlsl"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Clean-room Xbox Series BCPack (MDU rANS) GPU Compute Shader decoder in DirectX 12 HLSL SM 6.6 (Wave32)"

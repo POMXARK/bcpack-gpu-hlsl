@@ -11,6 +11,8 @@ fn main() {
     let start_rtgi_enabled = start_rt_enabled && !args.iter().any(|a| a == "--no-rtgi");
     let start_world_stream = args.iter().any(|a| a == "--world-stream");
     let start_mesh_shaders = !args.iter().any(|a| a == "--no-mesh-shaders");
+    let render_1440p = args.iter().any(|a| a == "--1440p");
+    let nvme_stream = args.iter().any(|a| a == "--nvme-stream");
     let mut vram_cap_mb = 32usize;
     let mut measure_frames: Option<u32> = None;
     let mut assets_dir = PathBuf::from("assets");
@@ -51,6 +53,9 @@ fn main() {
             start_rtgi_enabled,
             start_world_stream,
             start_mesh_shaders,
+            render_1440p,
+            nvme_stream,
+            assets_dir: assets_dir.clone(),
             vram_cap_mb,
             screenshot_path: None,
             screenshot_frames: 20,

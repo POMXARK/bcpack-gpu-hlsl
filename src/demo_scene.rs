@@ -17,8 +17,8 @@ use crate::world_streaming::WorldStreamManager;
 use bcpack::bc1::{self, QuadTable, Window};
 use rayon::prelude::*;
 use std::ffi::c_void;
-use std::fs::File;
-use std::io::BufWriter;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, ManuallyDrop};
 use std::path::PathBuf;
 use std::ptr::copy_nonoverlapping;
@@ -204,6 +204,9 @@ pub struct DemoConfig {
     pub start_rtgi_enabled: bool,
     pub start_world_stream: bool,
     pub start_mesh_shaders: bool,
+    pub render_1440p: bool,
+    pub nvme_stream: bool,
+    pub assets_dir: PathBuf,
     pub vram_cap_mb: usize,
     pub screenshot_path: Option<PathBuf>,
     pub screenshot_frames: u32,
@@ -600,12 +603,13 @@ pub fn run_demo(
             backbuffers.push(bb);
         }
 
-        // Depth buffer
+        // Depth buffer (matches internal HDR render resolution: 1280x720 default or 2560x1440 via --1440p)
+        let (render_w, render_h) = if cfg.render_1440p { (2560u32, 1440u32) } else { (WIN_W, WIN_H) };
         let depth_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Alignment: 0,
-            Width: WIN_W as u64,
-            Height: WIN_H,
+            Width: render_w as u64,
+            Height: render_h,
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: DXGI_FORMAT_D32_FLOAT,
@@ -983,10 +987,50 @@ pub fn run_demo(
 
         // Build Hardware DXR 1.1 BLAS/TLAS scene (up to 2,048 instances) + 16-bit HDR RTGI Denoiser Pipeline
         let rt_scene = RayTracingScene::new(&mut ctx, &vb_buf, &ib_buf, &meshes);
-        let rtgi_pipe = RtgiPipeline::new(&ctx, WIN_W, WIN_H);
+        let rtgi_pipe = RtgiPipeline::new(&ctx, render_w, render_h);
         wstate.rt_enabled = cfg.start_rt_enabled && rt_scene.is_some();
         wstate.rtgi_enabled = cfg.start_rtgi_enabled && rt_scene.is_some();
         let mut tlas_inst_count = 0usize;
+
+        // Optional real NVMe .bcpack_pkg container streaming (out-of-order disk seeks every frame)
+        let mut nvme_pkg: Option<(File, Vec<(u64, u32)>, Vec<Vec<u8>>)> = if cfg.nvme_stream {
+            let pkg_path = cfg.assets_dir.join("world_sectors.bcpack_pkg");
+            let mut idx = Vec::with_capacity(768);
+            let need_build = match std::fs::metadata(&pkg_path) {
+                Ok(m) => m.len() < 1024 * 1024,
+                Err(_) => true,
+            };
+            if need_build {
+                std::fs::create_dir_all(&cfg.assets_dir).ok();
+                let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&pkg_path).expect("create world_sectors.bcpack_pkg");
+                for rep in 0..16usize {
+                    for ti in 0..NUM_TEX {
+                        for strip in 0..TILE_STRIPS {
+                            let bytes = &assets[ti].bcpack_tiles[strip];
+                            f.write_all(bytes).unwrap();
+                            let _ = rep;
+                        }
+                    }
+                }
+                f.flush().unwrap();
+            }
+            let mut off = 0u64;
+            for _ in 0..16usize {
+                for ti in 0..NUM_TEX {
+                    for strip in 0..TILE_STRIPS {
+                        let len = assets[ti].bcpack_tiles[strip].len() as u32;
+                        idx.push((off, len));
+                        off += len as u64;
+                    }
+                }
+            }
+            let f = File::open(&pkg_path).expect("open world_sectors.bcpack_pkg");
+            let scratch = (0..1024).map(|_| Vec::with_capacity(32768)).collect();
+            Some((f, idx, scratch))
+        } else {
+            None
+        };
+        let mut last_nvme_ms = 0.0f64;
 
         // Build Hardware DX12 Ultimate Mesh Shader City Pipeline (as_6_5 / ms_6_5, 4.5M+ triangles)
         let meshlet_lib = build_city_meshlet_library();
@@ -1037,9 +1081,9 @@ pub fn run_demo(
 
         println!("================================================================");
         match cfg.mode {
-            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.5 (Zero-Barrier + Ping-Pong Async Compute + DXR 1.1) on: {}", ctx.adapter_name),
-            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.5 (bcpack-rs) on: {}", ctx.adapter_name),
-            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.5 on: {}", ctx.adapter_name),
+            DemoMode::GpuOnly => println!("NEW GPU Coastal Highway Demo v0.6 ({render_w}x{render_h} HDR + Mesh Shaders + DXR 1.1 RTGI) on: {}", ctx.adapter_name),
+            DemoMode::CpuOnly => println!("OLD CPU Coastal Highway Demo v0.6 (bcpack-rs) on: {}", ctx.adapter_name),
+            DemoMode::Toggleable => println!("BCPack Coastal Highway Live Demo v0.6 ({render_w}x{render_h} HDR) on: {}", ctx.adapter_name),
         }
         println!("Controls:");
         if cfg.mode == DemoMode::Toggleable {
@@ -1149,15 +1193,48 @@ pub fn run_demo(
                 if world_tile_pairs.len() > max_tiles {
                     world_tile_pairs.truncate(max_tiles);
                 }
-                dyn_batch = pack_batch(
-                    world_tile_pairs
-                        .iter()
-                        .map(|&(tex_i, strip)| (assets[tex_i].bcpack_tiles[strip].as_slice(), TILE_BLOCKS)),
-                );
+                if let Some((ref mut pkg_file, ref pkg_idx, ref mut scratch)) = nvme_pkg {
+                    let tn = Instant::now();
+                    for (k, &(tex_i, strip)) in world_tile_pairs.iter().enumerate() {
+                        let slot = (((frame_count as usize + k) % 16) * NUM_TEX + tex_i) * TILE_STRIPS + strip;
+                        let (off, len) = pkg_idx[slot % pkg_idx.len()];
+                        scratch[k].resize(len as usize, 0);
+                        pkg_file.seek(SeekFrom::Start(off)).unwrap();
+                        pkg_file.read_exact(&mut scratch[k]).unwrap();
+                    }
+                    last_nvme_ms = tn.elapsed().as_secs_f64() * 1000.0;
+                    dyn_batch = pack_batch(
+                        scratch[..world_tile_pairs.len()]
+                            .iter()
+                            .map(|b| (b.as_slice(), TILE_BLOCKS)),
+                    );
+                } else {
+                    dyn_batch = pack_batch(
+                        world_tile_pairs
+                            .iter()
+                            .map(|&(tex_i, strip)| (assets[tex_i].bcpack_tiles[strip].as_slice(), TILE_BLOCKS)),
+                    );
+                }
                 (&dyn_batch, world_tile_pairs.len())
             } else {
-                let target_tiles = wstate.tiles_per_frame;
-                if let Some((_, b)) = batches.iter().find(|(n, _)| *n == target_tiles) {
+                let target_tiles = wstate.tiles_per_frame.min(max_tiles);
+                if let Some((ref mut pkg_file, ref pkg_idx, ref mut scratch)) = nvme_pkg {
+                    let tn = Instant::now();
+                    for k in 0..target_tiles {
+                        let slot = (k * 137 + (frame_count as usize) * 29) % pkg_idx.len();
+                        let (off, len) = pkg_idx[slot];
+                        scratch[k].resize(len as usize, 0);
+                        pkg_file.seek(SeekFrom::Start(off)).unwrap();
+                        pkg_file.read_exact(&mut scratch[k]).unwrap();
+                    }
+                    last_nvme_ms = tn.elapsed().as_secs_f64() * 1000.0;
+                    dyn_batch = pack_batch(
+                        scratch[..target_tiles]
+                            .iter()
+                            .map(|b| (b.as_slice(), TILE_BLOCKS)),
+                    );
+                    (&dyn_batch, target_tiles)
+                } else if let Some((_, b)) = batches.iter().find(|(n, _)| *n == target_tiles) {
                     (b, target_tiles)
                 } else {
                     dyn_batch = pack_batch((0..target_tiles).map(|i| {
@@ -1697,7 +1774,7 @@ pub fn run_demo(
                             }
                         }
                         let rtgi_on = rt_scene.is_some() && wstate.rtgi_enabled;
-                        if wstate.sfs_enabled || use_meshlets || rtgi_on {
+                        if wstate.sfs_enabled || use_meshlets || rtgi_on || cfg.render_1440p || cfg.nvme_stream {
                             let ms_total_m = meshlet_pipe.as_ref().map(|m| m.total_tris as f64 / 1e6).unwrap_or(0.0);
                             let ms_vis_m = last_cull_stats.1 as f64 / 1e6;
                             let ms_cull_pct = if last_cull_stats.0 + last_cull_stats.2 > 0 {
@@ -1706,6 +1783,12 @@ pub fn run_demo(
                                 0.0
                             };
                             let mut extra = String::new();
+                            if cfg.render_1440p {
+                                extra.push_str(&format!(" Res:{}x{}_HDR", render_w, render_h));
+                            }
+                            if cfg.nvme_stream {
+                                extra.push_str(&format!(" NVMe:{:.2}ms", last_nvme_ms));
+                            }
                             if wstate.sfs_enabled {
                                 extra.push_str(&format!(
                                     " Grid:32x32 Res:{:.1}/{:.0}MiB Evict:{} Frag:{:.0}% Peak:{:.0}MB/s",

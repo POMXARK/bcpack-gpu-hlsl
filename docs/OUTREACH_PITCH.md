@@ -16,7 +16,8 @@ Open-world texture streaming on Xbox Series X|S builds (`IDStorageQueueX` / BCPa
 I built a **100% clean-room, bit-exact GPU BCPack decompressor** in **DX12 HLSL Shader Model 6.6 (Wave32)** + Rust (`cdylib`) to eliminate CPU decompression and unpacked PCIe transfers:
 
 - **Repository:** https://github.com/POMXARK/bcpack-gpu-hlsl (MIT OR Apache-2.0, zero copyrighted game assets)
-- **Prebuilt binaries (`v0.5.0` Release):** `bcpack_gpu.dll`, `bcpack_gpu.dll.lib`, `include/bcpack_gpu.h`, and precompiled `.dxil` compute shaders (`bcpack-gpu-dxil-v0.5.0.zip`).
+- **Prebuilt binaries (`v0.6.0` Release):** `bcpack_gpu.dll`, `bcpack_gpu.dll.lib`, `include/bcpack_gpu.h`, and 14 precompiled `.dxil` shaders (`bcpack-gpu-dxil-v0.6.0.zip`).
+- **New in `v0.6.0` Stress Suite (verified `12/12 PASS` on RTX 5080):** `32×32` World Grid LRU Residency + `.bcpack_pkg` NVMe streaming (`155.35 FPS`), Hardware Mesh Shaders (`4.01M` tris / `52,949` meshlets), `1,536`-instance DXR 1.1 TLAS + 1-spp Diffuse RTGI + 2-Pass A-Trous Denoiser (`152.99 FPS` @ 720p HDR / `128.62 FPS` @ 2560×1440 HDR), and BCPack 8B quantized geometry (`6,241 MB/s`).
 
 ### Verified Benchmarks on NVIDIA RTX 5080 (vs `Ahmet-Dedeler/bcpack-rs`, `0` byte/symbol mismatches)
 | Workload | CPU 1-Core | CPU Multi-Core | `bcpack_gpu` Zero-Barrier GPU | Speedup |

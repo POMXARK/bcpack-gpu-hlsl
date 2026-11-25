@@ -1,7 +1,9 @@
+use crate::assets::{encode_bc1_to_bcpack, TILE_BC1_BYTES, TILE_BLOCKS};
 use crate::gpu_decoder::{
-    cmd_barriers, create_committed_buffer, drop_barriers, heap_props, transition_barrier,
-    uav_barrier, upload_slice, GpuContext,
+    cmd_barriers, create_committed_buffer, drop_barriers, heap_props, pack_batch,
+    transition_barrier, uav_barrier, upload_slice, BcpackGpuDecoder, GpuContext,
 };
+use bcpack::bc1::{QuadTable, Window};
 use std::ffi::c_void;
 use std::mem::{size_of, ManuallyDrop};
 use windows::core::Interface;
@@ -1365,6 +1367,93 @@ pub fn run_mesh_shader_verify(ctx: &mut GpuContext) -> MeshShaderVerifyStats {
             culled_meshlets,
             lit_pixels,
         }
+    }
+}
+
+/// Packs meshlet vertices into 8-byte blocks (UNORM16 quantized XYZ + packed 8-bit normal + 4+4-bit UV)
+/// matching the 64-bit block width of BCPack BC1 rANS streams.
+pub fn pack_quantized_meshlet_vertices(verts: &[MeshletVertex], count: usize) -> Vec<u8> {
+    let mut min_p = [f32::MAX; 3];
+    let mut max_p = [f32::MIN; 3];
+    for v in verts {
+        for k in 0..3 {
+            min_p[k] = min_p[k].min(v.pos[k]);
+            max_p[k] = max_p[k].max(v.pos[k]);
+        }
+    }
+    let span = [
+        (max_p[0] - min_p[0]).max(1e-4),
+        (max_p[1] - min_p[1]).max(1e-4),
+        (max_p[2] - min_p[2]).max(1e-4),
+    ];
+
+    let mut out = Vec::with_capacity(count * 8);
+    let n = verts.len().max(1);
+    for i in 0..count {
+        let v = &verts[i % n];
+        let qx = (((v.pos[0] - min_p[0]) / span[0]).clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let qy = (((v.pos[1] - min_p[1]) / span[1]).clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let qz = (((v.pos[2] - min_p[2]) / span[2]).clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let nx = ((v.normal[0] * 0.5 + 0.5).clamp(0.0, 1.0) * 7.0).round() as u8;
+        let ny = ((v.normal[1] * 0.5 + 0.5).clamp(0.0, 1.0) * 7.0).round() as u8;
+        let nz_sign = if v.normal[2] >= 0.0 { 1u8 } else { 0u8 };
+        let pn = (nx & 7) | ((ny & 7) << 3) | (nz_sign << 6);
+        let u4 = ((v.uv[0].fract().abs()).clamp(0.0, 1.0) * 15.0).round() as u8;
+        let v4 = ((v.uv[1].fract().abs()).clamp(0.0, 1.0) * 15.0).round() as u8;
+        let puv = (u4 & 15) | ((v4 & 15) << 4);
+        out.extend_from_slice(&qx.to_le_bytes());
+        out.extend_from_slice(&qy.to_le_bytes());
+        out.extend_from_slice(&qz.to_le_bytes());
+        out.push(pn);
+        out.push(puv);
+    }
+    out
+}
+
+pub struct GeomBcpackVerifyStats {
+    pub vertices: usize,
+    pub raw_bytes: usize,
+    pub comp_bytes: usize,
+    pub ratio: f64,
+    pub gpu_ms: f64,
+}
+
+pub fn run_geom_bcpack_verify(
+    ctx: &mut GpuContext,
+    gpu_dec: &mut BcpackGpuDecoder,
+    window: &Window,
+    quads: &QuadTable,
+) -> GeomBcpackVerifyStats {
+    let lib = build_city_meshlet_library();
+    let vertices = 16_384usize; // 4 x 4096-block chunks = 128 KiB quantized geometry
+    let raw = pack_quantized_meshlet_vertices(&lib.vertices, vertices);
+
+    let mut chunks = Vec::with_capacity(4);
+    let mut comp_bytes = 0usize;
+    for c in 0..4 {
+        let slice = &raw[c * TILE_BC1_BYTES..(c + 1) * TILE_BC1_BYTES];
+        let enc = encode_bc1_to_bcpack(slice, window, quads);
+        comp_bytes += enc.len();
+        chunks.push(enc);
+    }
+
+    let batch = pack_batch(chunks.iter().map(|c| (c.as_slice(), TILE_BLOCKS)));
+    let (gpu_out, statuses, gpu_ms, _) = gpu_dec.decode_batch_and_readback(ctx, &batch);
+    for (ci, st) in statuses.iter().enumerate() {
+        assert_eq!(st.code, 0, "GPU status error on geom BCPack chunk {ci}: {st:?}");
+    }
+    assert_eq!(
+        gpu_out.as_slice(),
+        raw.as_slice(),
+        "FAIL 8B quantized geometry BCPack mismatch against source vertex buffer"
+    );
+
+    GeomBcpackVerifyStats {
+        vertices,
+        raw_bytes: raw.len(),
+        comp_bytes,
+        ratio: raw.len() as f64 / comp_bytes as f64,
+        gpu_ms,
     }
 }
 

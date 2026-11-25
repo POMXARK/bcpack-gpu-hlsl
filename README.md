@@ -1,26 +1,28 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
-[![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20Wave32%20%2B%20DXR%201.1-2f80ed)](shaders/bcpack_decode.hlsl)
-[![v0.5.0](https://img.shields.io/badge/v0.5.0-11.33%20GB%2Fs%20%7C%20171%20FPS%20w%2F%20RT-ff4081)](#v040--v050-performance-leap--benchmarks-rtx-5080)
+[![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1-2f80ed)](shaders/bcpack_decode.hlsl)
+[![v0.6.0](https://img.shields.io/badge/v0.6.0-11.33%20GB%2Fs%20%7C%204M%20Tris%20%2B%20RTGI-ff4081)](#v040--v060-performance-leap--benchmarks-rtx-5080)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
 
-**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor written in zero-barrier HLSL Shader Model 6.6 Compute Shaders + DirectX 12 Ping-Pong Async Compute + DXR 1.1 Hardware Inline Ray Tracing (`RayQuery`), reaching 11,327.6 MB/s (11.33 GB/s — 279.0× faster than 1-core CPU) on BC1, 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 189.36 FPS live (zero-barrier Ping-Pong), and 171.45 FPS live with real-time DXR 1.1 shadows + wet-asphalt reflections on an NVIDIA RTX 5080.**
+**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor & Open-World Streaming Stress Suite in DX12 HLSL SM 6.6 (Wave32) + Mesh Shaders (`as_6_5`/`ms_6_5`) + DXR 1.1 Inline Ray Tracing & RTGI — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1) vs 1-core CPU, 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 189.36 FPS live (Ping-Pong), and 128.62 FPS @ 2560×1440 HDR / 139.41 FPS @ 1280×720 HDR with 4.01M-tri Mesh Shaders + 1,536-instance TLAS + 1-spp Diffuse RTGI + 2-Pass Bilateral Denoiser on an NVIDIA RTX 5080.**
 
 > Clean-room implementation using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. Built on the format specification and CPU oracle from [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) and Microsoft's MIT-licensed [`microsoft/silicon-rans`](https://github.com/microsoft/silicon-rans).
 
 ---
 
-## Live 3D Streaming Demo: Ping-Pong Async Compute + DXR 1.1 (`v0.5.0` — 171.5 FPS Live w/ RT)
+## Live 3D Open-World Stress Demo (`v0.6.0` — 4.01M Tris + 1,536-TLAS RTGI + 32×32 LRU Streaming)
+
+![v0.6.0 Open-World City: 4.01M Tris Mesh Shaders + 1536-TLAS DXR 1.1 Shadows, Reflections & Denoised RTGI](media/city_rtgi_v6.png)
 
 ![Coastal Highway 3D Live GPU BCPack + DXR 1.1 Streaming Demo](media/highway_demo.gif)
 
-![v0.5.0 High-Res Screenshot with Hardware DXR 1.1 Reflections and Sun Shadows](media/highway_rt_v5.png)
-
-Every frame decompresses **256–1,024 compressed 4K-block `.bcpack` tiles (8–32 MiB of BC1 output per frame!)** on the DX12 **Async Compute Queue** synchronized via cross-queue `ID3D12Fence` with the Direct graphics queue, rebuilding a dynamic hardware **DXR 1.1 TLAS** over 5 static BLAS geometries (`src/raytracing.rs`) and tracing inline rays in `shaders/scene.hlsl`:
-- **Hardware DXR 1.1 Sun Shadows + Glossy Reflections (`[R]`):** `RayQuery` (`ps_6_5`) traces shadows and reflections across wet coastal asphalt, ocean waves, neon Art-Deco towers, hero car, and **10 animated traffic coupes**
-- **Sampler Feedback Streaming (`[F]`):** distance-LOD residency budgeting mode (dynamically modulates streamed tiles from landmark proximity)
+What `v0.6.0` adds to stress-test full Xbox Series X open-world workloads every frame alongside **Async Compute BCPack decompression**:
+- **Hardware DX12 Ultimate Mesh Shaders (`[N]`, `shaders/meshlet_{as,ms,ps}.hlsl`):** Wave32 Amplification Shader frustum + distance culling (`~37%` culled) feeding a single `DispatchMesh` across **52,949 meshlets / 4.01M triangles** (6 Art-Deco skyline avenues, beachfront hotels, high-poly curved palms, streetlamps, and **101 animated supercars**).
+- **1,536-Instance TLAS + 1-spp Diffuse RTGI (`[G]`, `src/rtgi.rs`):** 16-bit HDR 3-MRT G-Buffer (`R16G16B16A16_FLOAT`) with spatiotemporal IGN cosine-weighted diffuse bounce rays, **2-pass A-Trous normal/depth bilateral denoiser** (`rtgi_denoise.hlsl`), and HDR composite (`rtgi_composite.hlsl`).
+- **32×32 World Grid LRU Residency + NVMe Streaming (`[F]`, `--world-stream --nvme-stream`):** 250 m sector grid with `LOD0 / LOD1 / HLOD` visibility rings, frustum-turn priority bursts (`509–1062 MB/s` peaks), slab page fragmentation tracking, and real out-of-order `.bcpack_pkg` SSD reads (`0.05 ms/frame`).
+- **1440p Internal HDR (`--1440p`) & BCPack 8B Quantized Geometry:** Full `2560×1440` internal G-buffer + RTGI (`128.62 FPS` on RTX 5080) plus **8-byte UNORM16/OctN/UV meshlet vertex decompression (`1.20x` ratio, `6,241.2 MB/s` GPU)**.
 - **Camera Modes (`[C]`):** **Chase Cam** / **Free Drive (`WASD` + `QE`)** / **Helicopter Orbit**
 
 ### Side-by-Side v0.1 Comparison Video (GPU vs 1-Core CPU: 45 FPS vs 5 FPS)
@@ -67,19 +69,23 @@ flowchart LR
 
 ## Verified Bit-Exactness (`bcpack-gpu-demo --verify`)
 
-Tested on **NVIDIA GeForce RTX 5080 (Driver 621.24)** with **DX12 Debug Layer + Async Compute Queue** enabled (`v0.4.0`):
-1. **PASS 1/7 — BC1 synthetic streams** (`5` chunks, `21,824` blocks, odd chunk count): `0` byte mismatches (`16.021 ms`)
-2. **PASS 2/7 — BC1 monolithic 512×512 textures** (`12` textures = `1.50 MiB`): `0` byte mismatches (`18.574 ms`)
-3. **PASS 3/7 — BC1 tiled 4K-block strips** (`48` tiles = `1.50 MiB`): `0` byte mismatches (`4.785 ms`)
-4. **PASS 4/7 — BC7 16-lane rANS (100% Wave32 32/32)** (`5` chunks, `14,976` symbol-rows across Standard, High-Entropy Normal, and Sharp UI profiles): `0` symbol mismatches (`9.910 ms`)
-5. **PASS 5/7 — AMD Gfx10 Swizzle → BCPack → Async GPU Decode → GPU Detile → Linear BC1**: both `SW_64KB_D` (`512×512`) and `SW_4KB_S` (`256×256`) match original BC1 with `0` byte mismatches (`0.002–0.003 ms` detile)
-6. **PASS 6/7 — Full Mipmap Chain + Packed Mip Tail** (`512×512 .. 64×64` + `85`-block packed tail `32..4`): `0` byte mismatches (`17.012 ms`)
-7. **PASS 7/7 — C-ABI FFI `BcPackDecodeAsync` Smoke Test**: Linear BC1 + Fused Gfx10 `SW_64KB_D` + Non-blocking Async BC7 16-lane: `0` mismatches
-8. **PASS 8/8 — DXR 1.1 Hardware BLAS/TLAS + Inline `RayQuery`** (`4` analytical rays against unit box BVH, `0.003 ms`, `0` mismatches)
+Tested on **NVIDIA GeForce RTX 5080** with **DX12 Debug Layer + Async Compute Queue** enabled (`v0.6.0` — **12/12 PASS**, `0` mismatches):
+1. **PASS 1/12 — BC1 synthetic streams** (`5` chunks, `21,824` blocks, odd chunk count): `0` byte mismatches (`16.126 ms`)
+2. **PASS 2/12 — BC1 monolithic 512×512 textures** (`12` textures = `1.50 MiB`): `0` byte mismatches (`18.710 ms`)
+3. **PASS 3/12 — BC1 tiled 4K-block strips** (`48` tiles = `1.50 MiB`): `0` byte mismatches (`4.822 ms`)
+4. **PASS 4/12 — BC7 16-lane rANS (100% Wave32 32/32)** (`5` chunks, `14,976` symbol-rows across Standard, High-Entropy Normal, and Sharp UI profiles): `0` symbol mismatches (`9.979 ms`)
+5. **PASS 5/12 — AMD Gfx10 Swizzle → BCPack → Async GPU Decode → GPU Detile → Linear BC1**: both `SW_64KB_D` (`512×512`) and `SW_4KB_S` (`256×256`) match original BC1 with `0` byte mismatches (`0.002 ms` detile)
+6. **PASS 6/12 — Full Mipmap Chain + Packed Mip Tail** (`512×512 .. 64×64` + `85`-block packed tail `32..4`): `0` byte mismatches (`17.132 ms`)
+7. **PASS 7/12 — C-ABI FFI `BcPackDecodeAsync` Smoke Test**: Linear BC1 + Fused Gfx10 `SW_64KB_D` + Non-blocking Async BC7 16-lane: `0` mismatches
+8. **PASS 8/12 — DXR 1.1 Hardware BLAS/TLAS + Inline `RayQuery`** (`4` analytical rays against unit box BVH, `0.004 ms`, `0` mismatches)
+9. **PASS 9/12 — World Grid 32×32 Streaming + LRU VRAM Residency** (`180` frames simulated, `256` tiles GPU-verified, `242` evictions, `320`-tile turn burst, `480 MB/s` peak, `0` mismatches)
+10. **PASS 10/12 — Hardware Mesh Shaders (`as_6_5`/`ms_6_5`) + Frustum Culling** (`4.01M` city tris, `52,949` meshlets, `27,023` visible / `25,926` culled, `2.02M` visible tris, `25,783` lit FP16 pixels, `0` mismatches)
+11. **PASS 11/12 — DXR 1.1 Scale (1,536-Instance TLAS) + Bilateral RTGI Denoiser** (`0.095 ms` TLAS build; noisy FP16 variance `0.0324 -> 0.0000`, `edge_jump = 0.83`, `0` mismatches)
+12. **PASS 12/12 — BCPack 8B Quantized Meshlet Geometry** (`16,384` verts = `128 KiB`, ratio `1.20x`, GPU `4.852 ms`, `0` mismatches)
 
 ---
 
-## v0.4.0–v0.5.0 Performance Leap & Benchmarks (RTX 5080)
+## v0.4.0–v0.6.0 Performance Leap & Benchmarks (RTX 5080)
 
 ### 1. Headless Compute Benchmarks (`bcpack-gpu-demo --bench`)
 
@@ -124,6 +130,9 @@ Tested on **NVIDIA GeForce RTX 5080 (Driver 621.24)** with **DX12 Debug Layer + 
 | `bcpack-demo-gpu.exe --chunks 1024` (**v0.4 32 MiB/frame!**) | 1024 tiles (32.0 MiB) | **171.86 FPS** | **5.15 ms** |
 | `bcpack-demo-gpu.exe` (**v0.5 + Hardware DXR 1.1 RT Shadows & Reflections**) | 256 tiles (8.0 MiB) | **171.45 FPS** | **4.77 ms** |
 | `bcpack-demo-gpu.exe --no-rt` (**v0.5 binary w/ DXR OFF**) | 256 tiles (8.0 MiB) | **172.98 FPS** | **4.86 ms** |
+| `bcpack-demo-gpu.exe` (**v0.6: 4.01M Mesh Shaders + 1536-TLAS + RT + RTGI**) | 256 tiles (8.0 MiB) | **152.99 FPS** | **4.77 ms** |
+| `bcpack-demo-gpu.exe --1440p --debug` (**v0.6: 2560×1440 HDR + 4M MS + RTGI**) | 256 tiles (8.0 MiB) | **128.62 FPS** | **4.76 ms** |
+| `bcpack-demo-gpu.exe --world-stream --nvme-stream` (**v0.6: 32×32 LRU + SSD**) | Dynamic (`0.1–8 MiB`) | **155.35 FPS** | **4.79 ms** |
 
 ---
 

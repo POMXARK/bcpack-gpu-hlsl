@@ -1,8 +1,23 @@
-# bcpack-gpu-hlsl v0.5.0 — WaveReadLaneAt + Ping-Pong + DXR 1.1 RayQuery (11.33 GB/s, 171 FPS с RT / 189 FPS без RT)
+# bcpack-gpu-hlsl v0.6.0 — Стресс-стенд Xbox Series X: 4M Mesh Shaders + 1536-TLAS RTGI + 32×32 LRU + 11.33 GB/s
+
+![Скриншот v0.6.0: мегаполис на 4.01M полигонов (Mesh Shaders) + 1536 инстансов TLAS + 1-spp Diffuse RTGI + двусторонний денойзер](media/city_rtgi_v6.png)
 
 ![Живая 3D-сцена Coastal Highway с аппаратным DXR 1.1 и распаковкой BCPack на лету](media/highway_demo.gif)
 
-![Скриншот v0.5.0: отражения в мокром асфальте/океане и тени от солнца через DXR 1.1 RayQuery](media/highway_rt_v5.png)
+---
+
+## Что нового в v0.6.0 (Эмуляция открытого мира Xbox Series X)
+
+1. **Стриминг секторов мира 32×32 + LRU-менеджер VRAM ([`src/world_streaming.rs`](src/world_streaming.rs)):**
+   - Город разбит на тороидальную сетку `32×32` квартала по `250×250 м` с тремя кольцами видимости (`LOD0 ≤ 250 м`, `LOD1 ≤ 800 м`, `HLOD ≤ 2500 м`).
+   - Приоритет видимости по конусу камеры, жёсткий лимит резидентной памяти `--vram-cap-mb` с LRU-вытеснением, трекингом фрагментации слэб-аллокатора и реальным чтением чанков с NVMe SSD (`--nvme-stream`, `0.05 мс/кадр`).
+2. **Аппаратный конвейер Mesh Shaders (`as_6_5`/`ms_6_5`) на 4.01M треугольников ([`src/meshlets.rs`](src/meshlets.rs), [`shaders/meshlet_as.hlsl`](shaders/meshlet_as.hlsl), [`shaders/meshlet_ms.hlsl`](shaders/meshlet_ms.hlsl)):**
+   - Один `DispatchMesh` рендерит плотный мегаполис из **52 949 мешлетов / 4.01 млн треугольников** (6 линий небоскрёбов Art-Deco, отели, изогнутые пальмы, фонари, **101 анимированный спорткар**) с Wave32 GPU Frustum + Distance Culling (`~37%` отсекается до растеризации).
+3. **Масштабирование DXR 1.1 TLAS до 1 536 инстансов + 1-spp RTGI + A-Trous денойзер ([`src/rtgi.rs`](src/rtgi.rs), [`shaders/rtgi_denoise.hlsl`](shaders/rtgi_denoise.hlsl), [`shaders/rtgi_composite.hlsl`](shaders/rtgi_composite.hlsl)):**
+   - 3× `R16G16B16A16_FLOAT` HDR G-Buffer (`directHDR`, `rawRTGI`, `normalDepth`), косинусные диффузные лучи `RayQuery` с пространственно-временным IGN-шумом, 2-проходный edge-aware денойзер и клавиша **`[G]`** для живого переключения.
+4. **Режим `--1440p` (внутренний 2560×1440 HDR) и 8-байтная геометрия BCPack (`PASS 12/12`):**
+   - Квантованные вершины мешлетов (`UNORM16 XYZ + OctNormal + UV`) сжимаются `bcpack::bc1` со степенью **`1.20x`** и декодируются на GPU за `5.127 мс` (**`6 241.2 MB/s`**, `0` расхождений).
+   - **RTX 5080 Замеры v0.6.0:** `--verify` **12/12 PASS (`0` расхождений, DX12 Debug Layer чист)**; `1280×720` полный стек **152.99 FPS**; `2560×1440 HDR` (`--1440p --debug`) **128.62 FPS**; `--world-stream --nvme-stream` **155.35 FPS** (пики стриминга `745–1062 MB/s`).
 
 ---
 
