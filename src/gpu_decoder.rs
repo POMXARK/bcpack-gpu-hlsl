@@ -19,12 +19,8 @@ pub const DECODE_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_decode.dxil"
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ModelDataGpu {
-    pub thr: [u32; 10],
-    pub base: [u32; 10],
-    pub freq: [u32; 10],
-    pub rf: [u32; 10],
-    pub rs: [u32; 10],
-    pub rn: [u32; 10],
+    pub bf: [u32; 10],    // low16 = base, high16 = freq
+    pub rfrsn: [u32; 10], // bits 0..15 = rf, bits 16..20 = rs, bit 21 = rn
 }
 
 #[repr(C)]
@@ -48,6 +44,7 @@ pub struct ChunkStatusGpu {
 pub struct BatchPayload {
     pub stream_bytes: Vec<u8>,
     pub chunks: Vec<ChunkDescGpu>,
+    pub real_chunk_count: usize,
     pub total_blocks: usize,
 }
 
@@ -74,16 +71,25 @@ where
         });
         total_blocks += blocks;
     }
+    let real_chunk_count = chunks.len();
+    if chunks.len() % 2 == 1 {
+        chunks.push(ChunkDescGpu {
+            stream_offset: 0,
+            stream_len: 0,
+            blocks: 0,
+            out_block_offset: 0,
+        });
+    }
     while stream_bytes.len() % 4 != 0 {
         stream_bytes.push(0);
     }
-    if stream_bytes.is_empty() {
-        stream_bytes.resize(4, 0);
-    }
+    // 256-byte safety tail so coalesced 64-byte stream_cache loads never read past buffer end
+    stream_bytes.resize(stream_bytes.len() + 256, 0);
 
     BatchPayload {
         stream_bytes,
         chunks,
+        real_chunk_count,
         total_blocks,
     }
 }
@@ -408,27 +414,23 @@ impl BcpackGpuDecoder {
                 .CreateComputePipelineState(&pso_desc)
                 .expect("CreateComputePipelineState (bcpack_decode.dxil)");
 
-            // Build static model tables (9 x 16 = 144)
+            // Build packed 80-byte model tables (9 x 16 = 144)
             let mut models = Vec::with_capacity(144);
             for eab in 0..9 {
                 for q in 0..16 {
                     let mut md = ModelDataGpu {
-                        thr: [0x10000; 10],
-                        base: [0; 10],
-                        freq: [0; 10],
-                        rf: [0; 10],
-                        rs: [0; 10],
-                        rn: [0; 10],
+                        bf: [0; 10],
+                        rfrsn: [0; 10],
                     };
                     for k in 0..10 {
-                        if k >= 1 && k < eab + 2 {
-                            md.thr[k] = BASE_TABLE[eab][q][k] as u32;
-                        }
-                        md.base[k] = BASE_TABLE[eab][q][k] as u32;
-                        md.freq[k] = FREQ_TABLE[eab][q][k] as u32;
-                        md.rf[k] = RF_TABLE[eab][q][k] as u32;
-                        md.rs[k] = RS_TABLE[eab][q][k] as u32;
-                        md.rn[k] = RN_TABLE[eab][q][k] as u32;
+                        let base = BASE_TABLE[eab][q][k] as u32;
+                        let freq = FREQ_TABLE[eab][q][k] as u32;
+                        let rf = RF_TABLE[eab][q][k] as u32;
+                        let rs = RS_TABLE[eab][q][k] as u32;
+                        let rn = RN_TABLE[eab][q][k] as u32;
+                        debug_assert!(rs <= 31 && rn <= 1);
+                        md.bf[k] = base | (freq << 16);
+                        md.rfrsn[k] = rf | (rs << 16) | (rn << 21);
                     }
                     models.push(md);
                 }
@@ -488,7 +490,8 @@ impl BcpackGpuDecoder {
             let streams_upload = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, max_stream_bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
             let streams_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, max_stream_bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-            let chunks_bytes = (max_chunks * size_of::<ChunkDescGpu>()) as u64;
+            let padded_max_chunks = max_chunks + 2;
+            let chunks_bytes = (padded_max_chunks * size_of::<ChunkDescGpu>()) as u64;
             let chunks_upload = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, chunks_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
             let chunks_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, chunks_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -496,7 +499,7 @@ impl BcpackGpuDecoder {
             let out_blocks_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, out_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             let out_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, out_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-            let status_bytes = (max_chunks * size_of::<ChunkStatusGpu>()) as u64;
+            let status_bytes = (padded_max_chunks * size_of::<ChunkStatusGpu>()) as u64;
             let status_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, status_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             let status_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, status_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
@@ -519,7 +522,7 @@ impl BcpackGpuDecoder {
                 window_buf,
                 quads_buf,
                 cap_stream_bytes: max_stream_bytes,
-                cap_chunks: max_chunks,
+                cap_chunks: padded_max_chunks,
                 cap_blocks: max_blocks,
                 streams_upload,
                 streams_default,
@@ -584,7 +587,7 @@ impl BcpackGpuDecoder {
         if let Some(qh) = ts_heap {
             cmd.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, ts_start_idx);
         }
-        cmd.Dispatch(batch.chunks.len() as u32, 1, 1);
+        cmd.Dispatch((batch.chunks.len() / 2) as u32, 1, 1);
         if let Some(qh) = ts_heap {
             cmd.EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, ts_end_idx);
         }
@@ -641,7 +644,7 @@ impl BcpackGpuDecoder {
 
             let r_st = D3D12_RANGE { Begin: 0, End: status_bytes as usize };
             self.status_readback.Map(0, Some(&r_st), Some(&mut ptr)).expect("Map status");
-            let statuses = std::slice::from_raw_parts(ptr as *const ChunkStatusGpu, batch.chunks.len()).to_vec();
+            let statuses = std::slice::from_raw_parts(ptr as *const ChunkStatusGpu, batch.real_chunk_count).to_vec();
             self.status_readback.Unmap(0, None);
 
             let r_ts = D3D12_RANGE { Begin: 0, End: 16 };
