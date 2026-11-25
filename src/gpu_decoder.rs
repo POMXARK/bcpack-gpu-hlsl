@@ -438,6 +438,77 @@ impl GpuContext {
         }
     }
 
+    /// Creates a `GpuContext` sharing an already-existing caller `ID3D12Device` (and optional `COMPUTE` queue).
+    pub fn from_external_device(
+        device: ID3D12Device,
+        external_compute_queue: Option<ID3D12CommandQueue>,
+    ) -> Self {
+        unsafe {
+            let factory: IDXGIFactory6 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("CreateDXGIFactory2");
+
+            let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    &mut opts1 as *mut _ as *mut c_void,
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>() as u32,
+                )
+                .expect("CheckFeatureSupport OPTIONS1");
+            assert!(opts1.WaveOps.as_bool(), "GPU does not support HLSL WaveOps");
+
+            let direct_desc = D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+                Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+                NodeMask: 0,
+            };
+            let queue: ID3D12CommandQueue =
+                device.CreateCommandQueue(&direct_desc).expect("CreateCommandQueue DIRECT (shared)");
+            let timestamp_freq = queue.GetTimestampFrequency().expect("GetTimestampFrequency DIRECT");
+            let fence: ID3D12Fence = device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("CreateFence DIRECT (shared)");
+            let fence_event = CreateEventW(None, false, false, None).expect("CreateEventW DIRECT");
+
+            let compute_queue: ID3D12CommandQueue = external_compute_queue.unwrap_or_else(|| {
+                let compute_desc = D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                    Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+                    Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+                    NodeMask: 0,
+                };
+                device
+                    .CreateCommandQueue(&compute_desc)
+                    .expect("CreateCommandQueue COMPUTE (shared)")
+            });
+            let compute_timestamp_freq = compute_queue
+                .GetTimestampFrequency()
+                .expect("GetTimestampFrequency COMPUTE");
+            let compute_fence: ID3D12Fence = device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("CreateFence COMPUTE (shared)");
+            let compute_fence_event =
+                CreateEventW(None, false, false, None).expect("CreateEventW COMPUTE");
+
+            Self {
+                adapter_name: "External ID3D12Device".to_string(),
+                factory,
+                device,
+                queue,
+                timestamp_freq,
+                fence,
+                fence_value: 0,
+                fence_event,
+                compute_queue,
+                compute_timestamp_freq,
+                compute_fence,
+                compute_fence_value: 0,
+                compute_fence_event,
+            }
+        }
+    }
+
     pub fn signal_direct_async(&mut self) -> u64 {
         unsafe {
             self.fence_value += 1;
@@ -1099,6 +1170,43 @@ impl Bc7RansGpuDecoder {
             self.cmd_list.Reset(&self.cmd_alloc, None).unwrap();
             self.record_dispatch(&self.cmd_list, batch);
             self.cmd_list.ResolveQueryData(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.ts_readback, 0);
+            self.cmd_list.Close().unwrap();
+            let lists = [Some(self.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+            ctx.compute_queue.ExecuteCommandLists(&lists);
+            ctx.signal_compute()
+        }
+    }
+
+    pub fn submit_async_to_buffer(
+        &mut self,
+        ctx: &mut GpuContext,
+        batch: &BatchPayload,
+        dst: &ID3D12Resource,
+        dst_offset: u64,
+    ) -> u64 {
+        unsafe {
+            self.upload_batch(batch);
+            self.cmd_alloc.Reset().unwrap();
+            self.cmd_list.Reset(&self.cmd_alloc, None).unwrap();
+            self.record_dispatch(&self.cmd_list, batch);
+
+            let out_bytes = (batch.total_blocks * 32) as u64;
+            cmd_barriers(
+                &self.cmd_list,
+                vec![
+                    transition_barrier(&self.out_syms_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition_barrier(dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+                ],
+            );
+            self.cmd_list.CopyBufferRegion(dst, dst_offset, &self.out_syms_default, 0, out_bytes);
+            self.cmd_list.ResolveQueryData(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.ts_readback, 0);
+            cmd_barriers(
+                &self.cmd_list,
+                vec![
+                    transition_barrier(&self.out_syms_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    transition_barrier(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+                ],
+            );
             self.cmd_list.Close().unwrap();
             let lists = [Some(self.cmd_list.cast::<ID3D12CommandList>().unwrap())];
             ctx.compute_queue.ExecuteCommandLists(&lists);

@@ -1,4 +1,4 @@
-# Community Outreach Templates (`v0.8.0`) & Target Repositories
+# Community Outreach Templates (`v0.9.0`) & Target Repositories
 
 Ready-to-post technical integration proposals and verified open-source target repositories for Xbox Series X|S compatibility layers and RAGE 9 / BCPack tooling. See [`AI_ARCHITECTURE.md`](AI_ARCHITECTURE.md) for the machine-readable architecture & invariants breakdown.
 
@@ -20,36 +20,36 @@ Ready-to-post technical integration proposals and verified open-source target re
 
 ## Option A: Ready-to-Post RFC (`xcl-dev/xcl`, `OpenScarlett`, `ScarlettX`, `AnyXboxX`)
 
-**Title:** `[Contribution] Hardware-Accelerated Xbox Series BCPack (MDU rANS) GPU Decoder + 1.25M Descriptor Paging (DX12 HLSL SM 6.6, v0.8.0)`
+**Title:** `[Contribution] Zero-Copy Shared-Device Xbox Series BCPack (MDU rANS) GPU Decoder + 1.25M Descriptor Paging (DX12 HLSL SM 6.6, v0.9.0)`
 
 ```markdown
 Hi team!
 
-To help eliminate CPU decompression bottlenecks (`IDStorageQueueX` / `BCPack` rANS) and NVIDIA's ~1M `shader-visible` descriptor heap limit in open-world Xbox Series X|S translation layers, I built a **clean-room, MIT/Apache-2.0 licensed DirectX 12 HLSL SM 6.6 implementation** with a drop-in C-ABI DLL (`bcpack_gpu.dll`) and a full `v0.8.0` 4K AAA streaming benchmark:
+To help eliminate CPU decompression bottlenecks (`IDStorageQueueX` / `BCPack` rANS) and NVIDIA's ~1M `shader-visible` descriptor heap limit in open-world Xbox Series X|S translation layers, I built a **clean-room, MIT/Apache-2.0 licensed DirectX 12 HLSL SM 6.6 implementation** with a **zero-copy C-ABI DLL (`bcpack_gpu.dll`)** and a full `v0.9.0` 4K AAA streaming benchmark:
 
-- **Repository:** https://github.com/POMXARK/bcpack-gpu-hlsl
+- **Repository:** https://github.com/POMXARK/bcpack-gpu-hlsl (prebuilt `v0.9.0` SDK & demo zips on Releases)
 - **AI / Systems Architecture Doc:** `docs/AI_ARCHITECTURE.md` (exact register bindings, invariants & C-ABI contract)
 
-### Key Verified Highlights (Bit-Exact 17/17 PASS on RTX 5080, DX12 Debug Layer Clean — 0 errors)
+### Key Verified Highlights (Bit-Exact 18/18 PASS on RTX 5080, DX12 Debug Layer Clean — 0 errors)
+- **Zero-Copy Shared-Device C-ABI (`include/bcpack_gpu.h`, `src/ffi.rs`):** Pass your engine's existing `ID3D12Device*` (+ optional Compute queue) to `bcpack_gpu_create_from_device(...)`, decode + Gfx10-detile directly into a caller-owned `ID3D12Resource*` via `BcPackDecodeToBuffer(...)`, and synchronize purely on GPU via `direct_queue->Wait((ID3D12Fence*)BcPackGetComputeFence(ctx), fence)` — **zero CPU readback**.
 - **Zero-Barrier Wave32 Multi-Lane rANS (`shaders/bcpack_decode.hlsl`, `shaders/bcpack_bc7_rans.hlsl`):**
   - Dual-chunk Wave32 packing (`24/32` lanes BC1, `32/32 = 100%` Wave32 BC7), register-resident 64B stream window, `WaveReadLaneAt` symbol handoff (**0 barriers in the hot loop**), and explicit `WaveActiveBallot` workaround for the DXC 1.8 `-O3` prefix-count miscompile.
   - Reaches **11,327.6 MB/s (11.33 GB/s — 282.1× vs 1T CPU)** on BC1 and **6,024.0 MB/s equiv (247.1× vs 1T CPU)** on 16-lane BC7 rANS.
 - **Fused AMD Gfx10 Swizzle -> Linear Detile (`shaders/gfx10_detile.hlsl`):**
   - Inline Async Compute pass for `SW_64KB_D` (8B/16B) and `SW_4KB_S` (8B) running at **432.6 GB/s** (`0.144 ms` for `64 MiB`).
 - **1.25M Virtual `ResourceDescriptorHeap[]` Paging (`src/descriptor_paging.rs`, `shaders/bindless_paging.hlsl`):**
-  - Pages `1,250,000` virtual resource IDs onto `262,144` physical Tier-3 GPU heap slots via `CopyDescriptorsSimple` in **`0.061 ms`** (`65,536` verified readbacks, `0` mismatches) — avoiding NVIDIA `E_OUTOFMEMORY`.
-- **Full `v0.8.0` Open AAA Showcase (`150.61 FPS` Avg over 60s @ 1080p HDR):**
+  - Pages `1,250,000` virtual resource IDs onto `262,144` physical Tier-3 GPU heap slots via `CopyDescriptorsSimple` in **`0.062 ms`** (`65,536` verified readbacks, `0` mismatches) — avoiding NVIDIA `E_OUTOFMEMORY`.
+- **Full `v0.9.0` Open AAA Showcase (`150.61 FPS` Avg over 60s @ 1080p HDR):**
   - 4K (`4096×4096`) BC7 Mode 6 / BC5 GPU tile streaming + active pixel-shader Sampler Feedback (`g_SfsFeedback` saving **118.5 MiB** VRAM live via `ResourceMinLODClamp`), **12.41M-tri** modular Mesh Shaders (`as_6_5`/`ms_6_5`) + 6-mip Hi-Z, `500` Compute-skinned NPCs, DXR 1.1 + TAA + AgX.
-- **Drop-In `IDStorageQueueX` C-ABI Wrapper (`include/bcpack_gpu.h`, `src/ffi.rs`):**
 
 ```c
 #include "bcpack_gpu.h"
-BcPackContext* ctx = bcpack_gpu_create(2048, 8388608, 96 * 1024 * 1024);
+BcPackContext* ctx = bcpack_gpu_create_from_device(my_d3d12_device, NULL, 2048, 8388608, 96 * 1024 * 1024);
 uint64_t fence = 0;
-BcPackDecodeAsync(ctx, stream_ptr, stream_len, num_blocks,
-                  BCPACK_FORMAT_BC1, BCPACK_SWIZZLE_GFX10_64KB_D,
-                  width_blocks, height_blocks, NULL, 0, &fence);
-BcPackWaitFence(ctx, fence, UINT32_MAX);
+BcPackDecodeToBuffer(ctx, stream_ptr, stream_len, num_blocks,
+                     BCPACK_FORMAT_BC1, BCPACK_SWIZZLE_GFX10_64KB_D,
+                     width_blocks, height_blocks, caller_gpu_buf, 0, &fence);
+direct_queue->Wait((ID3D12Fence*)BcPackGetComputeFence(ctx), fence);
 ```
 
 Happy to help integrate `BcPackDecodeAsync`, `VirtualDescriptorPager`, or the HLSL SM 6.6 shaders directly into your `IDStorageQueueX` / `d3d12_xs` / `xgcore` pipelines!

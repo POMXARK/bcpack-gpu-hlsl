@@ -40,8 +40,38 @@ BCPACK_API BcPackContext* bcpack_gpu_create(
     uint32_t max_blocks,
     uint32_t max_stream_bytes);
 
+// Creates a zero-copy GPU decompression context sharing an existing caller ID3D12Device*.
+// - d3d12_device: non-null ID3D12Device* (COM refcount incremented via AddRef; caller keeps ownership).
+// - d3d12_compute_queue: optional ID3D12CommandQueue* (type COMPUTE); pass NULL to create an internal compute queue on d3d12_device.
+BCPACK_API BcPackContext* bcpack_gpu_create_from_device(
+    void* d3d12_device,
+    void* d3d12_compute_queue,
+    uint32_t max_chunks,
+    uint32_t max_blocks,
+    uint32_t max_stream_bytes);
+
 // Destroys the DX12 context and frees GPU heaps/queues.
 BCPACK_API void bcpack_gpu_destroy(BcPackContext* ctx);
+
+// Returns the underlying ID3D12Fence* signaled by the compute queue after BcPackDecodeToBuffer / BcPackDecodeAsync
+// so callers can execute GPU-side direct_queue->Wait((ID3D12Fence*)BcPackGetComputeFence(ctx), fence_value) without CPU stalls.
+BCPACK_API void* BcPackGetComputeFence(const BcPackContext* ctx);
+
+// Zero-copy async decode directly into a caller-owned ID3D12Resource* buffer on the shared device (zero CPU readback).
+// - dst_d3d12_resource MUST live on the same ID3D12Device passed to bcpack_gpu_create_from_device and be in D3D12_RESOURCE_STATE_COMMON on entry (restored to COMMON on exit).
+// - Signals *out_fence_value on BcPackGetComputeFence(ctx). Returns 0 on success, < 0 on error.
+BCPACK_API int32_t BcPackDecodeToBuffer(
+    BcPackContext* ctx,
+    const uint8_t* compressed_data,
+    uint32_t compressed_size,
+    uint32_t num_blocks,
+    uint32_t format,
+    uint32_t swizzle_mode,
+    uint32_t width_blocks,
+    uint32_t height_blocks,
+    void* dst_d3d12_resource,
+    uint64_t dst_byte_offset,
+    uint64_t* out_fence_value);
 
 // Submits a BCPack chunk onto the DX12 D3D12_COMMAND_LIST_TYPE_COMPUTE Async Compute Queue.
 // - For BCPACK_FORMAT_BC1: num_blocks is BC1 block count (width_blocks * height_blocks), output = num_blocks * 8 bytes.

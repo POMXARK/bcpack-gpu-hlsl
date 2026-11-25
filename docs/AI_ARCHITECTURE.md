@@ -1,4 +1,4 @@
-# `bcpack-gpu-hlsl` — AI/LLM Machine-Readable Architecture & Optimization Reference (`v0.8.0`)
+# `bcpack-gpu-hlsl` — AI/LLM Machine-Readable Architecture & Optimization Reference (`v0.9.0`)
 
 > **Target audience:** Coding agents, automated integration planners, and GPU systems engineers working on Xbox Series X|S compatibility layers (`xcl-dev/xcl`, `OpenScarlett`, `ScarlettX`, `AnyXboxX`, `rebox`) or clean-room BCPack / DirectStorage / RAGE9 pipelines (`bcpack-rs`, `rage-texture`, `bcpack-decoder`).
 > **License & Provenance:** `MIT OR Apache-2.0`. 100% clean-room implementation derived from public specs (`Ahmet-Dedeler/bcpack-rs`, `microsoft/silicon-rans`) and CC0/CC-BY 4.0 open assets. Zero proprietary/copyrighted game assets or SDK binaries.
@@ -9,7 +9,7 @@
 
 | Layer | File Path | Responsibility | Key Types / Entrypoints / Bindings |
 |---|---|---|---|
-| **C-ABI Header** | [`include/bcpack_gpu.h`](../include/bcpack_gpu.h) | Drop-in `IDStorageQueueX` / C++ wrapper API | `bcpack_gpu_create`, `bcpack_gpu_destroy`, `BcPackDecodeAsync`, `BcPackWaitFence`, `BcPackGetLastTimingMs` |
+| **C-ABI Header** | [`include/bcpack_gpu.h`](../include/bcpack_gpu.h) | Drop-in `IDStorageQueueX` / zero-copy C++ wrapper API | `bcpack_gpu_create`, `bcpack_gpu_create_from_device`, `bcpack_gpu_destroy`, `BcPackDecodeAsync`, `BcPackDecodeToBuffer`, `BcPackGetComputeFence`, `BcPackWaitFence`, `BcPackGetLastTimingMs` |
 | **FFI Implementation** | [`src/ffi.rs`](../src/ffi.rs) | Thread-safe DX12 Async Compute wrapper (`cdylib`) | `BcPackFormat::{Bc1=0, Bc7Rans=1}`, `BcPackSwizzle::{Linear=0, Gfx10_64KbD=1, Gfx10_4KbS=2}` |
 | **GPU Decoder Core** | [`src/gpu_decoder.rs`](../src/gpu_decoder.rs) | DX12 Device, Compute+Direct Queues, Ping-Pong `Bc1SlotResources`, `Bc16GpuStreamer`, Gfx10 detile | `GpuContext`, `submit_slot_async_compute`, `Bc16GpuStreamer`, `pack_batch`, `uav_barrier_all` |
 | **BC1 Wave32 Shader** | [`shaders/bcpack_decode.hlsl`](../shaders/bcpack_decode.hlsl) | Dual-chunk (`2×12` lanes) zero-barrier rANS + predictor + quad reconstruction | `[WaveSize(32)]`, `ModelData` (`t0`), `g_Streams` (`t3`), `g_Chunks` (`t4`), `g_OutBlocks` (`u0`) |
@@ -97,33 +97,34 @@
 ## 3. Drop-In C-ABI Contract (`include/bcpack_gpu.h`)
 
 ```c
-// Zero-allocation per-frame hook for Xbox Series IDStorageQueueX custom decompression:
-BcPackContext* ctx = bcpack_gpu_create(2048, 8388608, 96u * 1024u * 1024u);
-
-// 1. Synchronous readback into CPU buffer (pass non-NULL out_host_buffer):
+// Option A: Shared Caller ID3D12Device Zero-Copy Mode (zero CPU readback, GPU-only queue Wait):
+BcPackContext* ctx = bcpack_gpu_create_from_device(d3d12_device, NULL /*or compute_queue*/, 2048, 8388608, 96u * 1024u * 1024u);
 uint64_t fence = 0;
-BcPackDecodeAsync(ctx, compressed_ptr, compressed_size, num_blocks,
+BcPackDecodeToBuffer(ctx, compressed_ptr, compressed_size, num_blocks,
+                     BCPACK_FORMAT_BC1, BCPACK_SWIZZLE_GFX10_64KB_D,
+                     width_blocks, height_blocks, caller_gpu_buf, 0, &fence);
+ID3D12Fence* cfence = (ID3D12Fence*)BcPackGetComputeFence(ctx);
+direct_queue->Wait(cfence, fence); // Caller consumes caller_gpu_buf directly on GPU
+
+// Option B: Standalone Context with Host Readback or Async Fence:
+BcPackContext* standalone = bcpack_gpu_create(2048, 8388608, 96u * 1024u * 1024u);
+BcPackDecodeAsync(standalone, compressed_ptr, compressed_size, num_blocks,
                   BCPACK_FORMAT_BC1, BCPACK_SWIZZLE_GFX10_64KB_D,
                   width_blocks, height_blocks, out_linear_bc1, out_cap, &fence);
-
-// 2. Non-blocking async mode (pass out_host_buffer = NULL, wait later via BcPackWaitFence):
-BcPackDecodeAsync(ctx, compressed_ptr, compressed_size, num_blocks,
-                  BCPACK_FORMAT_BC7_RANS, BCPACK_SWIZZLE_LINEAR,
-                  width_blocks, height_blocks, NULL, 0, &fence);
-BcPackWaitFence(ctx, fence, UINT32_MAX);
 ```
 
-- **Thread safety:** `BcPackContext` serializes submissions internally via Rust `Mutex`; returns `0` on success (`< 0` on invalid size/capacity/DX12 error, `1` on wait timeout).
+- **Resource state contract (`BcPackDecodeToBuffer`):** `dst_d3d12_resource` MUST live on `d3d12_device` and enter in `D3D12_RESOURCE_STATE_COMMON` (restored to `D3D12_RESOURCE_STATE_COMMON` before signaling `fence`).
+- **Thread safety:** Wait before reusing allocator slots; `bcpack_gpu_destroy` drains `compute_fence_value` before teardown.
 - **BC7 output layout:** `BCPACK_FORMAT_BC7_RANS` emits `2 * num_blocks` rows of `uint16[16]` (`64B` per BC7 block). Chain `shaders/bc16_pack.hlsl` to collapse to final `16B` BC7/BC5 blocks.
 
 ---
 
 ## 4. Verification Oracle & Benchmark Numbers (NVIDIA RTX 5080, Driver 621.24)
 
-- **`bcpack-gpu-demo.exe --verify`:** **17/17 bit-exact PASS** (`0` byte/symbol mismatches, DX12 Debug Layer clean):
+- **`bcpack-gpu-demo.exe --verify`:** **18/18 bit-exact PASS** (`0` byte/symbol mismatches, DX12 Debug Layer clean):
   - Tests `1..7`: BC1 synthetic, monolithic `512×512`, `4K`-block tiles, BC7 16-lane rANS (Normal/UI/Albedo), Gfx10 `SW_64KB_D` + `SW_4KB_S` detile, Full 10-level Mipmap + Packed Mip Tail, and C-ABI FFI smoke test.
   - Tests `8..13`: DXR 1.1 analytical BVH rays, `32×32` LRU world streaming, `4.01M` Mesh Shaders + culling, `1,536`-TLAS + RTGI denoiser, 8B quantized meshlet geometry, `CarConcept.glb` + Poly Haven PBR.
-  - Tests `14..17`: **`1.25M` Virtual Descriptor Paging** (`0.061 ms`), **`64×64` Supersonic Jet-Flight Streaming** (`960 MB/s`), **`12.04M` Two-Pass Hi-Z Culling** (`0.016 ms`), **`500`-NPC GPU LBS Skinning** (`0.075 ms`).
+  - Tests `14..18`: **`1.25M` Virtual Descriptor Paging** (`0.062 ms`), **`64×64` Supersonic Jet-Flight Streaming** (`960 MB/s`), **`12.04M` Two-Pass Hi-Z Culling** (`0.015 ms`), **`500`-NPC GPU LBS Skinning** (`0.075 ms`), and **`Zero-Copy Shared-Device C-ABI`** (`bcpack_gpu_create_from_device` + `BcPackDecodeToBuffer` + GPU `Queue::Wait`, `0` mismatches).
 - **`bcpack-aaa-demo.exe --benchmark-run --benchmark-secs 60` (`1920×1080` HDR):**
   - **`150.61 FPS` Avg** (`6.64 ms`, `9,026` frames) | **`87.07 FPS` 1% Low** | **`43.37 FPS` 0.1% Low**
   - **Active SFS VRAM:** **`86.2 / 204.7 MiB`** (`118.5 MiB` saved)
