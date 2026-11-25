@@ -10,7 +10,8 @@
 - AMD Gfx10 / RDNA2 hardware swizzle `SW_64KB_D` / `SW_4KB_S` -> GPU Compute detile (`432.6 GB/s`)
 - Zero-copy DX12 C-ABI texture upload (`bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D`)
 - HLSL SM 6.6 -> Vulkan 1.3 SPIR-V (`dxc -spirv -fspv-target-env=vulkan1.3`, `VK_EXT_subgroup_size_control`)
-- GPU Sampler Feedback Streaming (`g_SfsFeedback` + `ResourceMinLODClamp` saving `118.5 MiB` VRAM live)
+- GPU Sampler Feedback Streaming (`g_SfsFeedback` + `ResourceMinLODClamp` saving `118.5-151.0 MiB` VRAM live) + anti-thrash hysteresis
+- Low-VRAM 8GB GPU scaling (`--preset auto|low|medium|ultra`, `IDXGIAdapter3::QueryVideoMemoryInfo`): `50%/67%/100%` Catmull-Rom TAAU upscaler (`aaa_taa.hlsl`) + Hardware VRS Tier 2 (`aaa_vrs.hlsl`, `aaa_vrs.spv`, `+30.1%` FPS on `ultra`, `394.2 FPS` `medium`, `551.5 FPS` `low`)
 - Hardware Mesh Shaders (`as_6_5`/`ms_6_5`) + 6-Mip Conservative Hi-Z Occlusion Culling (`12.41M -> 0.99M` tris)
 
 ## Canonical Files for AI Agents

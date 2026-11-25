@@ -50,6 +50,7 @@ pub const AAA_PBR_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_pbr_ps.dxil");
 pub const AAA_BLOOM_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_bloom.dxil");
 pub const AAA_TAA_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_taa.dxil");
 pub const AAA_AUTOEXP_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_autoexp.dxil");
+pub const AAA_VRS_CS_DXIL: &[u8] = include_bytes!("../shaders/aaa_vrs.dxil");
 pub const AAA_COMP_VS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_vs.dxil");
 pub const AAA_COMP_PS_DXIL: &[u8] = include_bytes!("../shaders/aaa_comp_ps.dxil");
 
@@ -98,6 +99,12 @@ pub struct AaaDemoConfig {
     pub fps_cap: u32,
     pub sim_speed: f32,
     pub show_hud: Option<bool>,
+    pub preset: String,
+    pub render_scale: Option<f32>,
+    pub vrs_override: Option<bool>,
+    pub no_rt_explicit: bool,
+    pub no_rtgi_explicit: bool,
+    pub vram_budget_explicit: bool,
 }
 
 impl Default for AaaDemoConfig {
@@ -129,6 +136,12 @@ impl Default for AaaDemoConfig {
             fps_cap: 0,
             sim_speed: 1.0,
             show_hud: None,
+            preset: "auto".to_string(),
+            render_scale: None,
+            vrs_override: None,
+            no_rt_explicit: false,
+            no_rtgi_explicit: false,
+            vram_budget_explicit: false,
         }
     }
 }
@@ -172,6 +185,8 @@ struct WindowState {
     xray_enabled: bool,
     vsync_enabled: bool,
     sfs_enabled: bool,
+    vrs_enabled: bool,
+    vrs_supported: bool,
     cam_mode: u32, // 0=Showroom 3/4 Orbit, 1=Chase Drive, 2=Free Cam
     fps_cap: u32,  // 0 = MAX/VSync, 15..=300 = capped FPS
     sim_speed: f32,
@@ -455,6 +470,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             x if x == b'F' as u32 => st.sfs_enabled = !st.sfs_enabled,
             x if x == b'R' as u32 => st.rt_enabled = !st.rt_enabled,
             x if x == b'G' as u32 => st.rtgi_enabled = !st.rtgi_enabled,
+            x if x == b'K' as u32 && st.vrs_supported => st.vrs_enabled = !st.vrs_enabled,
             x if x == b'C' as u32 => st.cam_mode = (st.cam_mode + 1) % 3,
             x if x == b'H' as u32 => st.hud_visible = !st.hud_visible,
             x if x == b'P' as u32 => {
@@ -817,13 +833,16 @@ impl SfsResidencyManager {
                 continue;
             }
             let need = self.tex[hi].mip0_bytes;
+            if self.lower_vram_bytes + need > self.budget_bytes {
+                continue;
+            }
             while self.planned_vram_bytes() + need > self.budget_bytes {
                 let victim = (0..self.tex.len())
                     .filter(|&i| i != hi && (self.tex[i].queued || self.tex[i].mip0_resident_strips > 0))
                     .filter(|&i| {
                         self.tex[i].pixel_hits == 0
-                            || self.tex[i].last_hot_frame < self.tex[hi].last_hot_frame
-                            || self.tex[i].desired_mip > self.tex[hi].desired_mip + 0.35
+                            || (self.tex[i].last_hot_frame + 45 < frame_idx && self.tex[i].last_hot_frame < self.tex[hi].last_hot_frame)
+                            || self.tex[i].desired_mip > self.tex[hi].desired_mip + 0.75
                     })
                     .min_by(|&a, &b| {
                         self.tex[a]
@@ -1291,8 +1310,17 @@ fn static_sampler(
 struct AaaPostPipeline {
     width: u32,
     height: u32,
+    out_w: u32,
+    out_h: u32,
     half_w: u32,
     half_h: u32,
+    vrs_w: u32,
+    vrs_h: u32,
+    vrs_tile_size: u32,
+    vrs_tier2: bool,
+    vrs_allow_4x4: bool,
+    vrs_aggressive: bool,
+    vrs_ready: bool,
     direct_hdr: ID3D12Resource,
     raw_rtgi: ID3D12Resource,
     normal_depth: ID3D12Resource,
@@ -1303,6 +1331,7 @@ struct AaaPostPipeline {
     exposure_buf: ID3D12Resource,
     bloom_a: ID3D12Resource,
     bloom_b: ID3D12Resource,
+    vrs_tex: ID3D12Resource,
     gbuf_rtv_heap: ID3D12DescriptorHeap,
     rtv_inc: u32,
     denoise_root_sig: ID3D12RootSignature,
@@ -1313,6 +1342,8 @@ struct AaaPostPipeline {
     autoexp_pso: ID3D12PipelineState,
     bloom_root_sig: ID3D12RootSignature,
     bloom_pso: ID3D12PipelineState,
+    vrs_root_sig: ID3D12RootSignature,
+    vrs_pso: ID3D12PipelineState,
     comp_root_sig: ID3D12RootSignature,
     comp_pso: ID3D12PipelineState,
     // Descriptor indices inside main_srv_heap (starting at slot 74):
@@ -1326,19 +1357,30 @@ struct AaaPostPipeline {
     // 97 = bloom_a SRV, 98 = bloom_b SRV, 99 = bloom_a UAV, 100 = bloom_b UAV
     // 101..103 = Composite0 (hist0, bloom_a, exposure_buf)
     // 104..106 = Composite1 (hist1, bloom_a, exposure_buf)
+    // 120..121 = VRS0 SRVs (motion_vec, hist0), 122..123 = VRS1 SRVs (motion_vec, hist1), 124 = vrs_tex UAV
     srv_inc: u32,
 }
 
 impl AaaPostPipeline {
+    #[allow(clippy::too_many_arguments)]
     unsafe fn new(
         device: &ID3D12Device,
         width: u32,
         height: u32,
+        out_w: u32,
+        out_h: u32,
         main_srv_heap: &ID3D12DescriptorHeap,
         srv_inc: u32,
+        vrs_tier2: bool,
+        vrs_tile_size: u32,
+        vrs_allow_4x4: bool,
+        vrs_aggressive: bool,
     ) -> Self {
-        let half_w = (width / 2).max(1);
-        let half_h = (height / 2).max(1);
+        let half_w = (out_w / 2).max(1);
+        let half_h = (out_h / 2).max(1);
+        let tile_sz = vrs_tile_size.max(8);
+        let vrs_w = width.div_ceil(tile_sz).max(1);
+        let vrs_h = height.div_ceil(tile_sz).max(1);
         let srv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let direct_hdr = create_fp16_tex(
             device, width, height,
@@ -1368,8 +1410,8 @@ impl AaaPostPipeline {
         let denoise_a = create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
         let denoise_b = create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
         let taa_hist = [
-            create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, srv_state, None),
-            create_fp16_tex(device, width, height, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, srv_state, None),
+            create_fp16_tex(device, out_w, out_h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, srv_state, None),
+            create_fp16_tex(device, out_w, out_h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, srv_state, None),
         ];
         let exposure_buf = create_committed_buffer(
             device,
@@ -1380,6 +1422,15 @@ impl AaaPostPipeline {
         );
         let bloom_a = create_fp16_tex(device, half_w, half_h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
         let bloom_b = create_fp16_tex(device, half_w, half_h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, None);
+        let vrs_tex = create_tex2d_fmt(
+            device,
+            vrs_w,
+            vrs_h,
+            DXGI_FORMAT_R8_UINT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+        );
 
         let gbuf_rtv_heap: ID3D12DescriptorHeap = device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -1484,6 +1535,19 @@ impl AaaPostPipeline {
         device.CreateShaderResourceView(&bloom_a, Some(&srv_desc), cpu_at(105));
         device.CreateShaderResourceView(&exposure_buf, Some(&exp_srv), cpu_at(106));
 
+        // VRS Slots 120..124 (after Hi-Z slots 107..119)
+        let mut vrs_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        vrs_uav.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
+        device.CreateShaderResourceView(&motion_vec, Some(&mv_srv), cpu_at(120));
+        device.CreateShaderResourceView(&taa_hist[0], Some(&srv_desc), cpu_at(121));
+        device.CreateShaderResourceView(&motion_vec, Some(&mv_srv), cpu_at(122));
+        device.CreateShaderResourceView(&taa_hist[1], Some(&srv_desc), cpu_at(123));
+        device.CreateUnorderedAccessView(&vrs_tex, None, Some(&vrs_uav), cpu_at(124));
+
         let clamp_samp = static_sampler(0, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 1);
 
         // Helper closure-style root sig builder for compute post passes
@@ -1532,7 +1596,7 @@ impl AaaPostPipeline {
         let denoise_root_sig = make_cs_rs(4, 2, false);
         let denoise_pso = create_compute_pso_local(device, &denoise_root_sig, RTGI_DENOISE_CS_DXIL);
 
-        let taa_root_sig = make_cs_rs(8, 5, true);
+        let taa_root_sig = make_cs_rs(12, 5, true);
         let taa_pso = create_compute_pso_local(device, &taa_root_sig, AAA_TAA_CS_DXIL);
 
         let autoexp_root_sig = make_cs_rs(4, 1, true);
@@ -1540,6 +1604,9 @@ impl AaaPostPipeline {
 
         let bloom_root_sig = make_cs_rs(4, 1, true);
         let bloom_pso = create_compute_pso_local(device, &bloom_root_sig, AAA_BLOOM_CS_DXIL);
+
+        let vrs_root_sig = make_cs_rs(8, 2, true);
+        let vrs_pso = create_compute_pso_local(device, &vrs_root_sig, AAA_VRS_CS_DXIL);
 
         // Composite root sig (CB b0 + SRV range(3) t0..t2 + clamp sampler s0)
         let c_srv_rng = D3D12_DESCRIPTOR_RANGE {
@@ -1603,8 +1670,17 @@ impl AaaPostPipeline {
         Self {
             width,
             height,
+            out_w,
+            out_h,
             half_w,
             half_h,
+            vrs_w,
+            vrs_h,
+            vrs_tile_size: tile_sz,
+            vrs_tier2,
+            vrs_allow_4x4,
+            vrs_aggressive,
+            vrs_ready: false,
             direct_hdr,
             raw_rtgi,
             normal_depth,
@@ -1615,6 +1691,7 @@ impl AaaPostPipeline {
             exposure_buf,
             bloom_a,
             bloom_b,
+            vrs_tex,
             gbuf_rtv_heap,
             rtv_inc,
             denoise_root_sig,
@@ -1625,6 +1702,8 @@ impl AaaPostPipeline {
             autoexp_pso,
             bloom_root_sig,
             bloom_pso,
+            vrs_root_sig,
+            vrs_pso,
             comp_root_sig,
             comp_pso,
             srv_inc,
@@ -1660,15 +1739,15 @@ impl AaaPostPipeline {
 
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_post_and_composite(
-        &self,
+        &mut self,
         cmd: &ID3D12GraphicsCommandList,
         main_srv_heap: &ID3D12DescriptorHeap,
         backbuffer_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
-        out_w: u32,
-        out_h: u32,
         rtgi_enabled: bool,
+        vrs_enabled: bool,
         frame_idx: u32,
         sun_screen_dir: [f32; 2],
+        jitter_ndc: [f32; 2],
         time: f32,
         hud: [f32; 8],
     ) {
@@ -1760,11 +1839,17 @@ impl AaaPostPipeline {
             cmd_barriers(cmd, vec![transition_barrier(&self.denoise_b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
         }
 
-        // 2. Screen-Space Contact Shadows + Variance-Clipped YCoCg TAA
+        // 2. Screen-Space Contact Shadows + Temporal Upscaling (TAAU 50%-100% + Catmull-Rom History)
         cmd_barriers(cmd, vec![transition_barrier(&self.taa_hist[cur], srv_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
         cmd.SetComputeRootSignature(&self.taa_root_sig);
         cmd.SetPipelineState(&self.taa_pso);
-        let taa_cb: [u32; 8] = [
+        let out_gx = self.out_w.div_ceil(8);
+        let out_gy = self.out_h.div_ceil(8);
+        let upscale_factor = (self.out_w as f32) / (self.width.max(1) as f32);
+        let jitter_uv = [jitter_ndc[0] * 0.5, -jitter_ndc[1] * 0.5];
+        let taa_cb: [u32; 12] = [
+            self.out_w,
+            self.out_h,
             self.width,
             self.height,
             frame_idx,
@@ -1772,12 +1857,14 @@ impl AaaPostPipeline {
             sun_screen_dir[0].to_bits(),
             sun_screen_dir[1].to_bits(),
             1.0f32.to_bits(),
-            0u32,
+            jitter_uv[0].to_bits(),
+            jitter_uv[1].to_bits(),
+            upscale_factor.to_bits(),
         ];
-        cmd.SetComputeRoot32BitConstants(0, 8, taa_cb.as_ptr() as *const c_void, 0);
+        cmd.SetComputeRoot32BitConstants(0, 12, taa_cb.as_ptr() as *const c_void, 0);
         cmd.SetComputeRootDescriptorTable(1, gpu_at(82 + cur * 6));
         cmd.SetComputeRootDescriptorTable(2, gpu_at(87 + cur * 6));
-        cmd.Dispatch(gx, gy, 1);
+        cmd.Dispatch(out_gx, out_gy, 1);
 
         cmd_barriers(
             cmd,
@@ -1789,10 +1876,44 @@ impl AaaPostPipeline {
             ],
         );
 
+        // 2b. VRS Tier 2 Rate Image Generator (before motion_vec returns to RENDER_TARGET)
+        if vrs_enabled && self.vrs_tier2 {
+            let prev_vrs_state = if self.vrs_ready {
+                D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE
+            } else {
+                D3D12_RESOURCE_STATE_COMMON
+            };
+            cmd_barriers(cmd, vec![transition_barrier(&self.vrs_tex, prev_vrs_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            cmd.SetComputeRootSignature(&self.vrs_root_sig);
+            cmd.SetPipelineState(&self.vrs_pso);
+            let vrs_cb: [u32; 8] = [
+                self.vrs_w,
+                self.vrs_h,
+                self.width,
+                self.height,
+                self.vrs_tile_size,
+                if self.vrs_allow_4x4 { 1u32 } else { 0u32 },
+                if self.vrs_aggressive { 1u32 } else { 0u32 },
+                0u32,
+            ];
+            cmd.SetComputeRoot32BitConstants(0, 8, vrs_cb.as_ptr() as *const c_void, 0);
+            cmd.SetComputeRootDescriptorTable(1, gpu_at(120 + cur * 2));
+            cmd.SetComputeRootDescriptorTable(2, gpu_at(124));
+            cmd.Dispatch(self.vrs_w.div_ceil(8), self.vrs_h.div_ceil(8), 1);
+            cmd_barriers(
+                cmd,
+                vec![
+                    uav_barrier(&self.vrs_tex),
+                    transition_barrier(&self.vrs_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE),
+                ],
+            );
+            self.vrs_ready = true;
+        }
+
         // 3. Log-Average Histogram Auto-Exposure
         cmd.SetComputeRootSignature(&self.autoexp_root_sig);
         cmd.SetPipelineState(&self.autoexp_pso);
-        let exp_cb = [self.width, self.height, frame_idx, 0.06f32.to_bits()];
+        let exp_cb = [self.out_w, self.out_h, frame_idx, 0.06f32.to_bits()];
         cmd.SetComputeRoot32BitConstants(0, 4, exp_cb.as_ptr() as *const c_void, 0);
         cmd.SetComputeRootDescriptorTable(1, gpu_at(95 + cur));
         cmd.SetComputeRootDescriptorTable(2, gpu_at(94));
@@ -1856,17 +1977,23 @@ impl AaaPostPipeline {
             ],
         );
 
-        // 5. Final Composite Pass: TAA + Bloom + Auto-Exposure + AgX Filmic + CAS Sharpen
+        // 5. Final Composite Pass: Reset VRS to 1x1 before full-res TAAU + Bloom + Auto-Exposure + AgX + CAS + HUD
+        if self.vrs_tier2 {
+            if let Ok(cmd5) = cmd.cast::<ID3D12GraphicsCommandList5>() {
+                cmd5.RSSetShadingRate(D3D12_SHADING_RATE_1X1, None);
+                cmd5.RSSetShadingRateImage(None);
+            }
+        }
         cmd.OMSetRenderTargets(1, Some(&backbuffer_rtv), false, None);
         let vp = D3D12_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
-            Width: out_w as f32,
-            Height: out_h as f32,
+            Width: SWAP_W as f32,
+            Height: SWAP_H as f32,
             MinDepth: 0.0,
             MaxDepth: 1.0,
         };
-        let sc = RECT { left: 0, top: 0, right: out_w as i32, bottom: out_h as i32 };
+        let sc = RECT { left: 0, top: 0, right: SWAP_W as i32, bottom: SWAP_H as i32 };
         cmd.RSSetViewports(&[vp]);
         cmd.RSSetScissorRects(&[sc]);
 
@@ -1989,6 +2116,33 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
     unsafe {
         let mut ctx = GpuContext::new(cfg.enable_debug);
+        let effective_preset = match cfg.preset.as_str() {
+            "low" => "low",
+            "medium" | "med" => "medium",
+            "ultra" | "high" => "ultra",
+            _ => {
+                if ctx.dedicated_vram_mb > 0 && ctx.dedicated_vram_mb <= 8192 {
+                    "low"
+                } else {
+                    "ultra"
+                }
+            }
+        };
+        let (preset_scale, preset_rt, preset_rtgi, preset_budget_mb, preset_vrs, vrs_aggressive) = match effective_preset {
+            "low" => (0.50f32, false, false, 64usize, ctx.vrs_tier2, true),
+            "medium" => (2.0f32 / 3.0f32, true, false, 96usize, ctx.vrs_tier2, false),
+            _ => (1.0f32, true, true, 128usize, false, false),
+        };
+        let eff_scale = cfg.render_scale.unwrap_or(preset_scale).clamp(0.4, 1.0);
+        let eff_rt = if cfg.no_rt_explicit { !cfg.no_rt } else { preset_rt && !cfg.no_rt };
+        let eff_rtgi = if cfg.no_rtgi_explicit {
+            eff_rt && !cfg.no_rtgi
+        } else {
+            eff_rt && preset_rtgi && !cfg.no_rtgi
+        };
+        let eff_budget_mb = if cfg.vram_budget_explicit { cfg.vram_budget_mb } else { preset_budget_mb };
+        let eff_vrs = cfg.vrs_override.unwrap_or(preset_vrs) && ctx.vrs_tier2;
+
         let mut gpu_dec = Bc16GpuStreamer::new(
             &mut ctx,
             MAX_BATCH_TILES,
@@ -2030,11 +2184,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let hud_default = cfg.screenshot_path.is_none() && cfg.record_dir.is_none();
         let mut wstate = Box::new(WindowState {
             use_gpu: !cfg.start_cpu,
-            rt_enabled: !cfg.no_rt,
-            rtgi_enabled: !cfg.no_rt && !cfg.no_rtgi,
+            rt_enabled: eff_rt,
+            rtgi_enabled: eff_rtgi,
             xray_enabled: cfg.xray_mode,
             vsync_enabled: if cfg.fps_cap > 0 { false } else { cfg.vsync },
-            sfs_enabled: cfg.vram_budget_mb > 0,
+            sfs_enabled: eff_budget_mb > 0,
+            vrs_enabled: eff_vrs,
+            vrs_supported: ctx.vrs_tier2,
             cam_mode: 0,
             fps_cap: cfg.fps_cap,
             sim_speed: cfg.sim_speed.clamp(0.0, 4.0),
@@ -2106,7 +2262,9 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             backbuffers.push(bb);
         }
 
-        let (render_w, render_h) = if cfg.render_1440p { (2560u32, 1440u32) } else { (SWAP_W, SWAP_H) };
+        let (out_w, out_h) = if cfg.render_1440p { (2560u32, 1440u32) } else { (SWAP_W, SWAP_H) };
+        let render_w = (((out_w as f32) * eff_scale).round() as u32).clamp(640, out_w) & !1;
+        let render_h = (((out_h as f32) * eff_scale).round() as u32).clamp(360, out_h) & !1;
         let depth_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: render_w as u64,
@@ -2445,7 +2603,19 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             ctx.device.CreateShaderResourceView(&ib_def, Some(&ib_sd), cpu_at(base + 36));
         }
 
-        let post = AaaPostPipeline::new(&ctx.device, render_w, render_h, &main_srv_heap, srv_inc);
+        let mut post = AaaPostPipeline::new(
+            &ctx.device,
+            render_w,
+            render_h,
+            out_w,
+            out_h,
+            &main_srv_heap,
+            srv_inc,
+            ctx.vrs_tier2,
+            ctx.vrs_tile_size,
+            ctx.vrs_additional_rates,
+            vrs_aggressive,
+        );
 
         // Sky PSO
         let sky_srv_rng = D3D12_DESCRIPTOR_RANGE {
@@ -2670,7 +2840,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
 
-        let budget_bytes = cfg.vram_budget_mb * 1024 * 1024;
+        let budget_bytes = eff_budget_mb * 1024 * 1024;
         let mut residency = SfsResidencyManager::new(&pack.textures, budget_bytes);
         // Kickstart initial Mip-0 stream with hero car paint & 4K road asphalt before first frame SFS feedback arrives
         for seed_idx in [
@@ -2731,7 +2901,23 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         ]
         .to_vec();
 
-        println!("=== BCPack AAA Showcase v0.8.0 ===");
+        println!("=== BCPack AAA Showcase v0.11.0 ===");
+        println!(
+            "  GPU: {} ({} MiB VRAM, {} MiB OS Budget) | Preset: {} | Render: {}x{} -> Output: {}x{} (TAAU {:.0}%) | VRS Tier2: {} ({}x{} tiles, active={})",
+            ctx.adapter_name,
+            ctx.dedicated_vram_mb,
+            ctx.os_vram_budget_mb,
+            effective_preset.to_ascii_uppercase(),
+            render_w,
+            render_h,
+            out_w,
+            out_h,
+            eff_scale * 100.0,
+            if ctx.vrs_tier2 { "YES" } else { "NO" },
+            ctx.vrs_tile_size,
+            ctx.vrs_tile_size,
+            wstate.vrs_enabled
+        );
         println!(
             "  Assets: CarConcept.glb ({} tris, {} submeshes + 6 parked) + 9x Poly Haven 4K PBR (BC7/BC5) + 2K Sunset HDRI",
             pack.car.indices.len() / 3,
@@ -2754,9 +2940,9 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             pack.total_mip0_bytes as f64 / (1024.0 * 1024.0),
             pack.total_vram_bytes as f64 / (1024.0 * 1024.0),
             pack.total_bcpack_bytes as f64 / (1024.0 * 1024.0),
-            cfg.vram_budget_mb
+            eff_budget_mb
         );
-        println!("  Controls: [H] HUD Sliders (FPS Cap + Sim Speed) | [/] FPS | -/= Sim | [P] Pause | [T] Flush | [V] X-Ray | [F] SFS | [L] VSync | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Cam | [ESC] Quit");
+        println!("  Controls: [H] HUD Sliders | [K] VRS Tier2 | [/] FPS | -/= Sim | [P] Pause | [T] Flush | [V] X-Ray | [F] SFS | [L] VSync | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Cam | [ESC] Quit");
 
         let mut frame_fences = [0u64; 2];
         let mut frame_count: u32 = 0;
@@ -2940,7 +3126,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 }
                 r
             };
-            let j_idx = (frame_count % 8) + 1;
+            let j_idx = (frame_count % 16) + 1;
             let jit_x = (halton(j_idx, 2) - 0.5) * (2.0 / render_w as f32);
             let jit_y = (halton(j_idx, 3) - 0.5) * (2.0 / render_h as f32);
 
@@ -3196,6 +3382,21 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             // Begin 4-MRT G-Buffer pass (DirectHDR + RawRTGI + NormalDepth + MotionVec)
             post.begin_gbuffer(cmd, dsv_handle);
+            if wstate.vrs_enabled && post.vrs_ready {
+                if let Ok(cmd5) = cmd.cast::<ID3D12GraphicsCommandList5>() {
+                    let combiners = [
+                        D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+                        D3D12_SHADING_RATE_COMBINER_OVERRIDE,
+                    ];
+                    cmd5.RSSetShadingRate(D3D12_SHADING_RATE_1X1, Some(combiners.as_ptr()));
+                    cmd5.RSSetShadingRateImage(&post.vrs_tex);
+                }
+            } else if post.vrs_tier2 {
+                if let Ok(cmd5) = cmd.cast::<ID3D12GraphicsCommandList5>() {
+                    cmd5.RSSetShadingRate(D3D12_SHADING_RATE_1X1, None);
+                    cmd5.RSSetShadingRateImage(None);
+                }
+            }
             let gpu_base = main_srv_heap.GetGPUDescriptorHandleForHeapStart();
             let table_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
                 ptr: gpu_base.ptr + ((slot * SRV_TABLE_STRIDE) * srv_inc as usize) as u64,
@@ -3436,11 +3637,11 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 cmd,
                 &main_srv_heap,
                 bb_rtv,
-                SWAP_W,
-                SWAP_H,
                 wstate.rtgi_enabled,
+                wstate.vrs_enabled,
                 frame_count,
                 sun_screen_dir,
+                [jit_x, jit_y],
                 t_sec,
                 hud_cb,
             );
@@ -3665,11 +3866,16 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     String::new()
                 };
                 let title = format!(
-                    "BCPack AAA v0.8.0 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x) | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
+                    "BCPack AAA v0.11.0 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x) | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
                     mode_str,
                     fps_val,
                     cap_str,
                     wstate.sim_speed,
+                    render_w,
+                    render_h,
+                    out_w,
+                    out_h,
+                    if wstate.vrs_enabled { "ON" } else { "OFF" },
                     city_str,
                     if crowd_renderer.is_some() { CROWD_NPCS } else { 0 },
                     if wstate.sfs_enabled { "ON" } else { "OFF" },
@@ -3699,7 +3905,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 let p999_ms = bench_frame_ms[((n as f64 * 0.999) as usize).min(n - 1)];
                 let pre_tris = meshlet_city.as_ref().map(|c| c.total_tris).unwrap_or(0);
                 let fc = frame_count.max(1) as f64;
-                println!("=== BCPack AAA Benchmark v0.8.0 Summary ({:.1}s sim, {}x{}) ===", t_sec, render_w, render_h);
+                println!("=== BCPack AAA Benchmark v0.11.0 Summary ({:.1}s sim, Preset={}, {}x{} -> {}x{}, VRS={}) ===",
+                    t_sec, effective_preset, render_w, render_h, out_w, out_h, if wstate.vrs_enabled { "ON" } else { "OFF" });
                 println!("  Frames: {} | Average FPS: {:.2} ({:.2} ms) | Peak (1% High): {:.2} FPS ({:.2} ms) | 1% Low: {:.2} FPS ({:.2} ms) | 0.1% Low: {:.2} FPS ({:.2} ms)",
                     frame_count, 1000.0 / avg_ms.max(0.01), avg_ms, 1000.0 / p01_ms.max(0.01), p01_ms, 1000.0 / p99_ms.max(0.01), p99_ms, 1000.0 / p999_ms.max(0.01), p999_ms);
                 println!("  GPU BCPack Peak Throughput (Live 64K BC7/BC5 Tiles): {:.2} GB/s", bench_peak_gbps);

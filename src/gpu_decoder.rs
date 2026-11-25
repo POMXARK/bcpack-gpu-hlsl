@@ -9,8 +9,9 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
+    CreateDXGIFactory2, IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
     DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+    DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 
@@ -327,6 +328,11 @@ unsafe fn create_compute_pso(
 
 pub struct GpuContext {
     pub adapter_name: String,
+    pub dedicated_vram_mb: u64,
+    pub os_vram_budget_mb: u64,
+    pub vrs_tier2: bool,
+    pub vrs_tile_size: u32,
+    pub vrs_additional_rates: bool,
     pub factory: IDXGIFactory6,
     pub device: ID3D12Device,
     pub queue: ID3D12CommandQueue,
@@ -358,7 +364,7 @@ impl GpuContext {
             let factory: IDXGIFactory6 =
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("CreateDXGIFactory2");
 
-            let mut chosen: Option<(IDXGIAdapter1, String)> = None;
+            let mut chosen: Option<(IDXGIAdapter1, String, u64)> = None;
             let mut idx = 0u32;
             while let Ok(adapter) =
                 factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(idx, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
@@ -367,13 +373,24 @@ impl GpuContext {
                 if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
                     let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
                     let name = String::from_utf16_lossy(&desc.Description[..end]);
-                    chosen = Some((adapter, name));
+                    let vram_mb = (desc.DedicatedVideoMemory as u64) / (1024 * 1024);
+                    chosen = Some((adapter, name, vram_mb));
                     break;
                 }
                 idx += 1;
             }
 
-            let (adapter, adapter_name) = chosen.expect("No hardware DXGI adapter found");
+            let (adapter, adapter_name, dedicated_vram_mb) = chosen.expect("No hardware DXGI adapter found");
+            let os_vram_budget_mb = if let Ok(a3) = adapter.cast::<IDXGIAdapter3>() {
+                let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                if a3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).is_ok() {
+                    info.Budget / (1024 * 1024)
+                } else {
+                    dedicated_vram_mb
+                }
+            } else {
+                dedicated_vram_mb
+            };
             let mut device: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
                 .expect("D3D12CreateDevice");
@@ -388,6 +405,18 @@ impl GpuContext {
                 )
                 .expect("CheckFeatureSupport OPTIONS1");
             assert!(opts1.WaveOps.as_bool(), "GPU does not support HLSL WaveOps");
+
+            let mut opts6 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+            let opts6_ok = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS6,
+                    &mut opts6 as *mut _ as *mut c_void,
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>() as u32,
+                )
+                .is_ok();
+            let vrs_tier2 = opts6_ok && opts6.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_2;
+            let vrs_tile_size = if vrs_tier2 { opts6.ShadingRateImageTileSize.max(8) } else { 16 };
+            let vrs_additional_rates = vrs_tier2 && opts6.AdditionalShadingRatesSupported.as_bool();
 
             let direct_desc = D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -422,6 +451,11 @@ impl GpuContext {
 
             Self {
                 adapter_name,
+                dedicated_vram_mb,
+                os_vram_budget_mb,
+                vrs_tier2,
+                vrs_tile_size,
+                vrs_additional_rates,
                 factory,
                 device,
                 queue,
@@ -491,8 +525,25 @@ impl GpuContext {
             let compute_fence_event =
                 CreateEventW(None, false, false, None).expect("CreateEventW COMPUTE");
 
+            let mut opts6 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+            let opts6_ok = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS6,
+                    &mut opts6 as *mut _ as *mut c_void,
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>() as u32,
+                )
+                .is_ok();
+            let vrs_tier2 = opts6_ok && opts6.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_2;
+            let vrs_tile_size = if vrs_tier2 { opts6.ShadingRateImageTileSize.max(8) } else { 16 };
+            let vrs_additional_rates = vrs_tier2 && opts6.AdditionalShadingRatesSupported.as_bool();
+
             Self {
                 adapter_name: "External ID3D12Device".to_string(),
+                dedicated_vram_mb: 0,
+                os_vram_budget_mb: 0,
+                vrs_tier2,
+                vrs_tile_size,
+                vrs_additional_rates,
                 factory,
                 device,
                 queue,

@@ -18,8 +18,14 @@ fn main() {
             "--xray" => cfg.xray_mode = true,
             "--vsync" => cfg.vsync = true,
             "--no-vsync" => cfg.vsync = false,
-            "--no-rt" => cfg.no_rt = true,
-            "--no-rtgi" => cfg.no_rtgi = true,
+            "--no-rt" => {
+                cfg.no_rt = true;
+                cfg.no_rt_explicit = true;
+            }
+            "--no-rtgi" => {
+                cfg.no_rtgi = true;
+                cfg.no_rtgi_explicit = true;
+            }
             "--tiles-per-frame" if i + 1 < args.len() => {
                 cfg.tiles_per_frame = args[i + 1].parse().unwrap_or(256);
                 i += 1;
@@ -42,8 +48,19 @@ fn main() {
             }
             "--vram-budget-mb" if i + 1 < args.len() => {
                 cfg.vram_budget_mb = args[i + 1].parse().unwrap_or(128);
+                cfg.vram_budget_explicit = true;
                 i += 1;
             }
+            "--preset" if i + 1 < args.len() => {
+                cfg.preset = args[i + 1].to_ascii_lowercase();
+                i += 1;
+            }
+            "--scale" if i + 1 < args.len() => {
+                cfg.render_scale = Some(args[i + 1].parse::<f32>().unwrap_or(1.0).clamp(0.4, 1.0));
+                i += 1;
+            }
+            "--vrs" => cfg.vrs_override = Some(true),
+            "--no-vrs" => cfg.vrs_override = Some(false),
             "--benchmark-run" => {
                 cfg.benchmark_run = true;
                 cfg.vsync = false;

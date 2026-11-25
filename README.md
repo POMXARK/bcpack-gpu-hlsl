@@ -1,14 +1,41 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
-[![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1-2f80ed)](shaders/bcpack_decode.hlsl)
-[![v0.10.0](https://img.shields.io/badge/v0.10.0-Tex2D%20C--ABI%20%7C%20SPIR--V%20%7C%2019%2F19%20PASS-ff4081)](#verified-bit-exactness-bcpack-gpu-demo---verify--1919-pass)
+[![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1%20%2B%20VRS%20Tier2-2f80ed)](shaders/bcpack_decode.hlsl)
+[![v0.11.0](https://img.shields.io/badge/v0.11.0-VRS%20Tier2%20%2B%20TAAU%20%7C%2019%2F19%20PASS-ff4081)](#whats-new-in-v0110--low-vram-scaling-taau-upscaler--hardware-vrs-tier-2)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
 
-**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor, Zero-Copy DirectX 12 C-ABI (`bcpack_gpu.dll`), precompiled Vulkan 1.3 SPIR-V compute kernels (`dxc -spirv`), `1.25M` Virtual `ResourceDescriptorHeap[]` Paging (`0.064 ms`), & `v0.10.0` Open AAA 4K PBR Benchmark — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1), 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 432.6 GB/s AMD Gfx10 Swizzle->Linear detile, `150.61 FPS` avg (60s `--benchmark-run`) @ 1080p HDR (`12.41M` Mesh Shaders + Hi-Z, `500` GPU-skinned NPCs, active SFS saving `118.5 MiB` VRAM) — verified 19/19 bit-exact PASS (DX12 Debug Layer clean, 0 errors) on an NVIDIA RTX 5080.**
+![v0.10.0 4-Mode AAA Benchmark Showcase (60 / 120 / 240 / Unlimited MAX > 450 FPS on RTX 5080)](media/aaa_benchmark_4modes.gif)
+- **Full HD (`1920×1080`) Captures:** [`60 FPS MP4`](media/aaa_benchmark_60fps.mp4) | [`120 FPS MP4`](media/aaa_benchmark_120fps.mp4) | [`240 FPS MP4`](media/aaa_benchmark_240fps.mp4) | [`Unlimited (MAX) MP4`](media/aaa_benchmark_unlimited.mp4) | [`3-Act 8s Overview GIF`](media/aaa_showcase_v8.gif)
+
+**GPU-accelerated, bit-exact Xbox Series X|S BCPack decompressor, Zero-Copy DirectX 12 C-ABI (`bcpack_gpu.dll`), precompiled Vulkan 1.3 SPIR-V compute kernels (`dxc -spirv`), `1.25M` Virtual `ResourceDescriptorHeap[]` Paging (`0.064 ms`), Hardware VRS Tier 2 + TAAU Upscaling (`551.5 FPS` Low / `394.2 FPS` Medium / `202.5 FPS` Ultra+VRS), & Open AAA 4K PBR Benchmark — reaching 11,327.6 MB/s (11.33 GB/s — 282.1× peak on 64 MiB BC1), 6,024.0 MB/s equiv on 16-lane BC7 rANS (100% Wave32), 432.6 GB/s AMD Gfx10 Swizzle->Linear detile — verified 19/19 bit-exact PASS (DX12 Debug Layer clean, 0 errors) on an NVIDIA RTX 5080.**
 
 > Clean-room implementation (`MIT OR Apache-2.0`) using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. Built on the format specification and CPU oracle from [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) and Microsoft's MIT-licensed [`microsoft/silicon-rans`](https://github.com/microsoft/silicon-rans). AI/LLM full technical spec: [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md) & [`llms.txt`](llms.txt).
+
+---
+
+## What's New in `v0.11.0` — Low-VRAM Scaling, TAAU Upscaler & Hardware VRS Tier 2
+
+Built for 8 GB / budget GPUs (`RTX 3060 / 4060 / RX 6600 / iGPU`) alongside high-refresh 1080p/1440p monitors:
+1. **Auto-VRAM Detection (`IDXGIAdapter3::QueryVideoMemoryInfo`) & 3-Tier Presets (`--preset auto|low|medium|ultra`, `--scale <0.4..1.0>`):**
+   - Automatically selects `--preset low` when dedicated VRAM `<= 8192 MiB` (otherwise `ultra`), scaling internal resolution, DXR/RTGI, VRS Tier 2, and SFS budget together.
+2. **True Temporal Upscaling (TAAU `50% / 67% / 100%`, [`shaders/aaa_taa.hlsl`](shaders/aaa_taa.hlsl)):**
+   - Upgrades TAA into a spatial-temporal upscaler with **16-phase Halton(2,3) jitter**, closest-depth velocity dilation, **5-tap Catmull-Rom bicubic history** sampling, and adaptive YCoCg variance clipping (`50%` `960×540 → 1080p`, `67%` `1280×720 → 1080p`, or `100%` native + CAS).
+3. **Hardware Variable Rate Shading (VRS Tier 2, [`shaders/aaa_vrs.hlsl`](shaders/aaa_vrs.hlsl) + [`aaa_vrs.spv`](shaders/spirv/aaa_vrs.spv)):**
+   - Compute pass generates a `16×16`-tile `R8_UINT` rate image (`D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE`) preserving **`1×1`** around the focal center & high-contrast edges, dropping peripheral/low-contrast or high-motion tiles to **`2×2`** (and flat upper sky to **`4×4`** on `low`). Live **`[K]`** toggle / CLI `--vrs` / `--no-vrs`.
+   - **Verified VRS Tier 2 gain on `ultra` (`1080p` native + Full DXR 1.1 + RTGI):** **`155.66 → 202.55 FPS Avg` (`+30.1%`)** and **`239.98 → 347.75 FPS Peak` (`+44.9%`)**.
+4. **SFS Budget Thrashing Hysteresis (`src/aaa_scene.rs`):**
+   - Guards `SfsResidencyManager` against pointless eviction/re-decode ping-pong when tight budgets (`--vram-budget-mb 64`) leave less than one 4K Mip-0 (`16 MiB`) free above lower-mip residency (`Evictions: 708 → 3`, raising `--preset low` from `160.82` → **`551.51 FPS Avg`**).
+
+| Preset (`1920×1080` Output, RTX 5080 `5.0s`) | Internal → Out (TAAU) | Pipeline Active | Average FPS | Peak (`1% High`) | `1% Low` | SFS VRAM Used / Saved |
+|---|---|---|---:|---:|---:|---:|
+| **`--preset ultra`** | `1920×1080 → 1080p` (`100%`) | DXR 1.1 + RTGI + `128 MiB` SFS (`VRS OFF`) | `155.66 FPS` | `239.98 FPS` | `47.49 FPS` | `86.2 / 204.7 MiB` (`-118.5 MiB`) |
+| **`--preset ultra --vrs`** | `1920×1080 → 1080p` (`100%`) | DXR 1.1 + RTGI + **VRS Tier 2** + `128 MiB` SFS | **`202.55 FPS`** | **`347.75 FPS`** | `57.80 FPS` | `86.2 / 204.7 MiB` (`-118.5 MiB`) |
+| **`--preset medium`** | `1280×720 → 1080p` (`67%`) | DXR 1.1 + **TAAU + VRS Tier 2** + `96 MiB` SFS | **`394.24 FPS`** | **`639.06 FPS`** | **`219.86 FPS`** | `86.2 / 204.7 MiB` (`-118.5 MiB`) |
+| **`--preset low`** | `960×540 → 1080p` (`50%`) | Raster + **TAAU + VRS Tier 2** + `64 MiB` SFS | **`551.51 FPS`** | **`853.53 FPS`** | **`320.31 FPS`** | **`53.7 / 204.7 MiB`** (**`-151.0 MiB`**) |
+
+> All 3 presets (`ultra`, `medium`, `low`) verified under **DX12 Debug Layer (`--debug`) with 0 errors**, plus `bcpack-gpu-demo.exe --verify`: **`19/19 PASS`**.
 
 ---
 
@@ -40,16 +67,14 @@
 | **Mesh Shaders + 6-Mip Hi-Z** | Boxy LOD geometry vs slow 12M-tri vertex shading | `as_6_5`/`ms_6_5` 1-draw dispatch + `R32_TYPELESS` 6-mip MAX depth pyramid | **`12.41M → 0.99M`** avg visible (`0.015 ms` Hi-Z) | [`aaa_meshlet_as.hlsl`](shaders/aaa_meshlet_as.hlsl), [`hiz_build.hlsl`](shaders/hiz_build.hlsl) |
 | **GPU Crowd Skinning (`500` NPCs)** | CPU skeletal animation stalls open-world crowd streaming | 4-bone LBS in Compute (`[numthreads(64,1,1)]`) + per-limb TAA motion vectors | **`0.075 ms`** for `512k` verts (`max_err=7.63e-6`) | [`crowd_skin.hlsl`](shaders/crowd_skin.hlsl), [`aaa_crowd.hlsl`](shaders/aaa_crowd.hlsl) |
 | **Textured DXR 1.1 + TAA/AgX/CAS** | Flat instance reflections, specular aliasing, RTGI noise shimmer | `RtInstMeta` (`t34`) ray-hit UV sampling + 4-pass A-Trous + YCoCg TAA + AgX Filmic | **`150.61 FPS` Avg** (`1080p` HDR, 60s benchmark) | [`aaa_pbr.hlsl`](shaders/aaa_pbr.hlsl), [`aaa_taa.hlsl`](shaders/aaa_taa.hlsl), [`aaa_composite.hlsl`](shaders/aaa_composite.hlsl) |
-| **Zero-Copy C-ABI & Vulkan SPIR-V** | Cross-process copies; Vulkan 1.3/Linux Proton shaders needed (`OpenScarlett`) | `bcpack_gpu_create_from_device`, `BcPackDecodeToTexture2D`, official DXC `-spirv` | **0 CPU readback**, 7 Vulkan 1.3 `.spv` kernels | [`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`compile_spirv.sh`](shaders/compile_spirv.sh) |
+| **Zero-Copy C-ABI & Vulkan SPIR-V** | Cross-process copies; Vulkan 1.3/Linux Proton shaders needed (`OpenScarlett`) | `bcpack_gpu_create_from_device`, `BcPackDecodeToTexture2D`, official DXC `-spirv` | **0 CPU readback**, 8 Vulkan 1.3 `.spv` kernels | [`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`compile_spirv.sh`](shaders/compile_spirv.sh) |
+| **TAAU Upscaler + Hardware VRS Tier 2** | 8 GB / 128-bit GPUs (`RTX 3060/4060`, `RX 6600`) bottlenecked at 1080p DXR + SFS | `--preset auto\|low\|medium\|ultra` (`QueryVideoMemoryInfo`), 5-tap Catmull-Rom TAAU, `16×16` VRS rate CS (`[K]`), SFS hysteresis | **`+30.1%` (`155.7→202.6`)** VRS on Ultra; **`394.2 FPS`** Med; **`551.5 FPS`** (`-151 MiB`) Low | [`aaa_vrs.hlsl`](shaders/aaa_vrs.hlsl), [`aaa_taa.hlsl`](shaders/aaa_taa.hlsl), [`aaa_scene.rs`](src/aaa_scene.rs) |
 
 ---
 
-## Open AAA Benchmark (`v0.10.0` — 4K BC7/BC5 + Active SFS + 12.41M Mesh-Shader City + 500 NPCs + DXR 1.1 + TAA)
+## Open AAA Benchmark (`v0.11.0` — 4K BC7/BC5 + Active SFS + 12.41M Mesh-Shader City + 500 NPCs + DXR 1.1 + TAAU + VRS Tier 2)
 
-![v0.10.0 4-Mode AAA Benchmark Showcase (60 / 120 / 240 / Unlimited MAX > 400 FPS on RTX 5080)](media/aaa_benchmark_4modes.gif)
-- **Full HD (`1920×1080`) Captures:** [`60 FPS MP4`](media/aaa_benchmark_60fps.mp4) | [`120 FPS MP4`](media/aaa_benchmark_120fps.mp4) | [`240 FPS MP4`](media/aaa_benchmark_240fps.mp4) | [`Unlimited (MAX) MP4`](media/aaa_benchmark_unlimited.mp4) | [`3-Act 8s Overview GIF`](media/aaa_showcase_v8.gif)
-
-> **Important Throughput Note:** `60 / 120 / 240 FPS` above are **display/capture cap presets** (`--fps-cap` / HUD slider)—**NOT** the hardware limit. Uncapped on NVIDIA GeForce RTX 5080 (`1920×1080` native HDR), the benchmark runs at **`163.30 FPS Avg` (`250.96 FPS Peak`)** with full **DXR 1.1 + RTGI + 12.41M City + 500 NPCs**, **`231.62 FPS Avg` (`361.79 FPS Peak`)** with the full **12.41M Mesh-Shader City + 500 NPCs** raster pipeline (`--no-rt --no-rtgi`), and **`452.01 FPS Avg` (`708.27 FPS Peak`)** (`> 400 FPS`) in core **4K BC7/BC5 SFS** streaming (`--no-rt --no-rtgi --no-city --no-crowd`).
+> **Important Throughput Note:** `60 / 120 / 240 FPS` in the top-of-page showcase GIF/MP4s are **display/capture cap presets** (`--fps-cap` / HUD slider)—**NOT** the hardware limit. Uncapped on NVIDIA GeForce RTX 5080 (`1920×1080` native HDR), the benchmark runs at **`163.30 FPS Avg` (`250.96 FPS Peak`)** with full **DXR 1.1 + RTGI + 12.41M City + 500 NPCs**, **`202.55 FPS Avg` (`347.75 FPS Peak`)** with **VRS Tier 2** (`--preset ultra --vrs`), **`231.62 FPS Avg` (`361.79 FPS Peak`)** in full **12.41M City** raster (`--no-rt --no-rtgi`), **`394.24 FPS`** on `--preset medium`, **`551.51 FPS`** on `--preset low`, and **`452.01 FPS Avg` (`708.27 FPS Peak`)** (`> 400 FPS`) in core **4K BC7/BC5 SFS** streaming (`--no-rt --no-rtgi --no-city --no-crowd`).
 
 | Benchmark Preset (`1920×1080` Native HDR, RTX 5080) | Pipeline Active | Average FPS | Peak (`1% High`) | `1% Low` | SFS VRAM Used / Saved |
 |---|---|---:|---:|---:|---:|
@@ -69,7 +94,7 @@ A photorealistic GPU-streaming benchmark (**`bcpack-aaa-demo.exe`** / [`src/aaa_
 - **Stage 2 — 4K BC7 / BC5 Streaming & Active GPU SFS:** Khronos [`CarConcept.glb`](https://github.com/KhronosGroup/glTF-Sample-Assets) (`162,766` verts, `213,347` tris, `109` submeshes + `6` parked + `5` traffic cars, `14` BC7/BC5 textures) + **9× Poly Haven CC0 4K (`4096×4096`) PBR maps** (`asphalt_pit_lane`, `brick_pavement`, `concrete_wall_008` in **BC7 Mode 6** / **BC5**, `11` mip levels + Packed Mip Tail, `204.67 MiB` full VRAM pool), decompressed via ping-pong Async Compute [`Bc16GpuStreamer`](src/gpu_decoder.rs) ([`shaders/bc16_pack.hlsl`](shaders/bc16_pack.hlsl)) with live pixel-shader Sampler Feedback (`g_SfsFeedback : u0`) and LRU `ResourceMinLODClamp` budget control (`--vram-budget-mb 128`, `[F]` toggle).
 - **Stage 3 — Modular 12.41M-Tri Mesh-Shader City, Hi-Z & 500 GPU-Skinned NPCs:** Hardware `as_6_5`/`ms_6_5`/`ps_6_6` pipeline ([`shaders/aaa_meshlet_ps.hlsl`](shaders/aaa_meshlet_ps.hlsl)) rendering `851` instances / `219,774` meshlets (**`12.41M` pre-cull tris**) across modular glass-curtain skyscrapers, Art-Deco hotels, palms, streetlamps, seawall balustrade, road lane markings, and far bayfront skyline HLOD with a live 6-mip conservative Hi-Z pyramid (`hiz_build.dxil`), plus **`500` GPU-skinned walking pedestrians** (`154,000` verts/frame via `crowd_skin.dxil` + [`shaders/aaa_crowd.hlsl`](shaders/aaa_crowd.hlsl)).
 - **Interactive Controls, Live HUD Sliders & 60s Benchmark (`START_AAA_BENCHMARK.bat`):**
-  - **VSync ON by default** (`--no-vsync` / `[L]` to uncap), **`[H]` On-Screen HUD Sliders** (mouse-draggable **FPS Cap `15–300 / MAX`** and **Simulation Speed `0.00x–4.00x`**, `[` / `]` FPS step, `-` / `=` / `[0]` sim speed, `[P]` Pause), `[T]` Flush VRAM Wave, `[V]` X-Ray SFS Heatmap, `[F]` SFS Budget ON/OFF, `[SPACE]` GPU Async vs 1T CPU, `[R]` DXR 1.1, `[G]` RTGI, `[C]` Camera (`Showroom` / `Chase` / `FreeCam`), **`START_AAA_BENCHMARK.bat`** (`--benchmark-run` 60s 3-act automated flythrough; optional CLI `--fps-cap <N>`, `--sim-speed <F>`, `--show-hud` / `--no-hud`).
+  - **VSync ON by default** (`--no-vsync` / `[L]` to uncap), **`[K]` VRS Tier 2** (`--vrs` / `--no-vrs`), **`[H]` On-Screen HUD Sliders** (mouse-draggable **FPS Cap `15–300 / MAX`** and **Simulation Speed `0.00x–4.00x`**, `[` / `]` FPS step, `-` / `=` / `[0]` sim speed, `[P]` Pause), `[T]` Flush VRAM Wave, `[V]` X-Ray SFS Heatmap, `[F]` SFS Budget ON/OFF, `[SPACE]` GPU Async vs 1T CPU, `[R]` DXR 1.1, `[G]` RTGI, `[C]` Camera (`Showroom` / `Chase` / `FreeCam`), **`START_AAA_BENCHMARK.bat`** (`--benchmark-run` 60s 3-act automated flythrough; optional CLI `--preset auto|low|medium|ultra`, `--scale <F>`, `--fps-cap <N>`, `--sim-speed <F>`, `--show-hud` / `--no-hud`).
 - **Measured on NVIDIA RTX 5080 (`1920×1080` native HDR):**
   - **60s `--benchmark-run` (`9,026` frames):** **`150.61 FPS` Avg** (`6.64 ms`) | **`87.07 FPS` 1% Low** | **`43.37 FPS` 0.1% Low** | Active SFS **`86.2 / 204.7 MiB`** (**`118.5 MiB` VRAM saved**) | Mesh Shaders + Hi-Z **`12.41M` pre-cull → `0.99M` avg visible** (`0.18M` Hi-Z occluded) | **`500` GPU-Skinned NPCs** | DX12 Debug Layer clean (`0` errors).
   - **`--flush-bench` (`153.50 MiB` Mip0 BC7/BC5, `2,456` 64K-tiles):** GPU Async Compute **`217.011 ms`** vs 1-Core CPU **`5,487.356 ms`** (**`25.3×` kernel speedup**, `0.74 GB/s` full 16-lane BC7/BC5 encode+pack).

@@ -16,6 +16,7 @@ SHADERS=(
   hiz_build
   crowd_skin
   bindless_paging
+  aaa_vrs
 )
 
 for s in "${SHADERS[@]}"; do

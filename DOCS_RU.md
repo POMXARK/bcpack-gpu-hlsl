@@ -1,7 +1,25 @@
-# bcpack-gpu-hlsl v0.10.0 — Zero-Copy C-ABI, Vulkan 1.3 SPIR-V и 4K AAA-бенчмарк (> 400 FPS без лимита, 19/19 PASS)
+# bcpack-gpu-hlsl v0.11.0 — Оптимизация под 8 ГБ GPU (TAAU + VRS Tier 2), Zero-Copy C-ABI и SPIR-V (19/19 PASS)
 
-![Живой 4-режимный прогон v0.10.0 AAA-бенчмарка (60 / 120 / 240 / Unlimited MAX на RTX 5080)](media/aaa_benchmark_4modes.gif)
+![Живой 4-режимный прогон AAA-бенчмарка (60 / 120 / 240 / Unlimited MAX > 450 FPS на RTX 5080)](media/aaa_benchmark_4modes.gif)
 - **Full HD (`1920×1080`) видео:** [`60 FPS MP4`](media/aaa_benchmark_60fps.mp4) | [`120 FPS MP4`](media/aaa_benchmark_120fps.mp4) | [`240 FPS MP4`](media/aaa_benchmark_240fps.mp4) | [`Без лимита (MAX) MP4`](media/aaa_benchmark_unlimited.mp4) | [`Обзор 3 актов`](media/aaa_showcase_v8.gif)
+
+---
+
+## Что нового в v0.11.0 (Оптимизация под слабые / 8 ГБ видеокарты)
+
+1. **Авто-определение VRAM (`IDXGIAdapter3::QueryVideoMemoryInfo`) и 3 профиля `--preset auto|low|medium|ultra` (плюс `--scale`):**
+   - При VRAM `<= 8192 MiB` по умолчанию включается `low`, на старших картах — `ultra`.
+2. **Аппаратный Variable Rate Shading (VRS Tier 2, [`shaders/aaa_vrs.hlsl`](shaders/aaa_vrs.hlsl) + `aaa_vrs.spv`):**
+   - Compute-пасс строит карту тайлов `16×16` (`R8_UINT`, переключение клавишей **`[K]`** / `--vrs` / `--no-vrs`), оставляя **`1×1`** в центре внимания и на контрастных границах и переводя периферию/движение в **`2×2`** (и небо на `low` в `4×4`).
+   - Прирост только от VRS Tier 2 в нативном `1080p` Full DXR 1.1 + RTGI: **`155.66 → 202.55 FPS Avg` (`+30.1%`)**, пик **`239.98 → 347.75 FPS` (`+44.9%`)**.
+3. **Встроенный темпоральный апскейлер TAAU (`50% / 67% / 100%`, [`shaders/aaa_taa.hlsl`](shaders/aaa_taa.hlsl)):**
+   - 16-фазный Halton(2,3) джиттер, выбор скорости по ближней глубине, бикубический Catmull-Rom семплер истории и адаптивное YCoCg-ограничение:
+     - `--preset ultra` (`1080p → 1080p`, DXR + RTGI, `VRS OFF`): `155.66 FPS Avg` | `239.98 FPS Peak` | `86.2/204.7 MiB`
+     - `--preset ultra --vrs` (`1080p → 1080p`, DXR + RTGI + **VRS**): **`202.55 FPS Avg`** | **`347.75 FPS Peak`** | `86.2/204.7 MiB`
+     - `--preset medium` (`720p → 1080p` 67%, DXR + **TAAU + VRS**, SFS 96 MiB): **`394.24 FPS Avg`** | **`639.06 FPS Peak`** | `1% Low: 219.86 FPS`
+     - `--preset low` (`540p → 1080p` 50%, Raster + **TAAU + VRS**, SFS 64 MiB): **`551.51 FPS Avg`** | **`853.53 FPS Peak`** | `1% Low: 320.31 FPS` | **`53.7/204.7 MiB` (экономия `151.0 MiB` VRAM!)**
+4. **Защита от трэшинга SFS на жёстком бюджете (`src/aaa_scene.rs`):**
+   - Пропуск крупных 4K Mip-0 текстур, не влезающих сверх базовых мипов в `64 MiB`, и гистерезис 45 кадров убрали цикличное вытеснение (`Evictions: 708 → 3`, ускорив `--preset low` с `160.82` до **`551.51 FPS`**).
 
 > **Важно про лимит FPS:** режимы `60 / 120 / 240 FPS` в роликах и HUD — это **искусственные ограничители (`--fps-cap`)**, а **не максимум производительности**. Без лимита на NVIDIA GeForce RTX 5080 (`1920×1080` HDR) конвейер выдаёт **`163.30 FPS Avg` (пик `250.96 FPS`)** с полным **DXR 1.1 + RTGI + 12.41M городом + 500 NPC**, **`231.62 FPS Avg` (пик `361.79 FPS`)** в растеризации с полным **12.41M городом + 500 NPC**, и **`452.01 FPS Avg` (пик `708.27 FPS`, т.е. > 400 FPS)** в базовом профиле потокового **4K BC7/BC5 SFS** (`--no-rt --no-rtgi --no-city --no-crowd`).
 
