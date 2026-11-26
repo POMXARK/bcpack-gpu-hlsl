@@ -24,6 +24,7 @@
 | **Hi-Z Depth Culling** | [`src/hiz_culling.rs`](../src/hiz_culling.rs), [`shaders/hiz_build.hlsl`](../shaders/hiz_build.hlsl), [`shaders/hiz_cull.hlsl`](../shaders/hiz_cull.hlsl) | 6-mip conservative MAX depth pyramid + Wave32 sphere projection occlusion test | `AaaHiZPyramid` (`R32_TYPELESS`), `ceil(log2(max(rectW, rectH)))` mip selection |
 | **DXR 1.1 Inline RT / RTGI** | [`src/raytracing.rs`](../src/raytracing.rs), [`src/rtgi.rs`](../src/rtgi.rs) | BLAS/TLAS builder (`PREFER_FAST_BUILD`, `<=1536` inst) + A-Trous bilateral denoiser | `RayQuery<RAY_FLAG_FORCE_OPAQUE>`, `rtgi_denoise.hlsl`, `rtgi_composite.hlsl` |
 | **Open AAA Benchmark (`v0.8.0`)** | [`src/aaa_scene.rs`](../src/aaa_scene.rs), [`src/aaa_world.rs`](../src/aaa_world.rs), [`src/bin/demo_aaa.rs`](../src/bin/demo_aaa.rs) | 4K BC7/BC5 streaming + active GPU SFS + 12.41M Mesh-Shader City + 500 NPCs + TAA + AgX + HUD | `SfsResidencyManager`, `AaaMeshletCity`, `AaaPostPipeline`, `AaaCompCB` (12 DW), `--benchmark-run` |
+| **Bottleneck Suite (`v0.14.1`)** | [`src/bottleneck_suite.rs`](../src/bottleneck_suite.rs), [`START_BOTTLENECK_SUITE.bat`](../START_BOTTLENECK_SUITE.bat) | 6 synthetic open-world DX12 bottleneck benchmarks + JSON report (`--bottleneck-suite`) | `BcPackDecodeBatch` (`58.95×`), COM Reaper (`13,351×`), Copy Coalescing (`42.41×`), DXR BLAS/TLAS (`1.91×`), Pager+Aliasing, `ExecuteIndirect` (`7.46×`) |
 | **Assets & Encoders** | [`src/assets.rs`](../src/assets.rs), [`src/gltf_loader.rs`](../src/gltf_loader.rs) | Pure-Rust BC1, BC7 Mode 6 & BC5 encoders + histogram-accelerated rANS + `BCP4` cache | `TexFormat::{Bc1, Bc5, Bc7}`, `TILE_BC16_BYTES = 65536` (`4,096` 16B blocks/tile) |
 
 ---
@@ -138,10 +139,24 @@ BcPackDecodeAsync(standalone, compressed_ptr, compressed_size, num_blocks,
 
 ## 4. Verification Oracle & Benchmark Numbers (NVIDIA RTX 5080, Driver 621.24)
 
-- **`bcpack-gpu-demo.exe --verify`:** **19/19 bit-exact PASS** (`0` byte/symbol mismatches, DX12 Debug Layer clean):
+- **`bcpack-gpu-demo.exe --verify` (`v0.14.1`):** **21/21 bit-exact PASS** (`0` byte/symbol mismatches, DX12 Debug Layer clean):
   - Tests `1..7`: BC1 synthetic, monolithic `512×512`, `4K`-block tiles, BC7 16-lane rANS (Normal/UI/Albedo), Gfx10 `SW_64KB_D` + `SW_4KB_S` detile, Full 10-level Mipmap + Packed Mip Tail, and C-ABI FFI smoke test.
   - Tests `8..13`: DXR 1.1 analytical BVH rays, `32×32` LRU world streaming, `4.01M` Mesh Shaders + culling, `1,536`-TLAS + RTGI denoiser, 8B quantized meshlet geometry, `CarConcept.glb` + Poly Haven PBR.
-  - Tests `14..19`: **`1.25M` Virtual Descriptor Paging** (`0.064 ms`), **`64×64` Supersonic Jet-Flight Streaming** (`960 MB/s`), **`12.04M` Two-Pass Hi-Z Culling** (`0.015 ms`), **`500`-NPC GPU LBS Skinning** (`0.075 ms`), **`Zero-Copy Buffer C-ABI` (`BcPackDecodeToBuffer`)**, and **`Direct 2D Texture C-ABI` (`BcPackDecodeToTexture2D`: Mip 0 `512×512 SW_64KB_D` + Mip 3 `64×64` auto-padded `256B` RowPitch, `0` mismatches)**.
+  - Tests `14..21`: **`1.25M` Virtual Descriptor Paging** (`0.064 ms`), **`64×64` Supersonic Jet-Flight Streaming** (`960 MB/s`), **`12.04M` Two-Pass Hi-Z Culling** (`0.015 ms`), **`500`-NPC GPU LBS Skinning** (`0.075 ms`), **`Zero-Copy Buffer C-ABI` (`BcPackDecodeToBuffer`)**, **`Direct 2D Texture C-ABI` (`BcPackDecodeToTexture2D`)**, **Full Multi-Mode `BC7` (Modes 0..7 + Rotations)** (`9.155 ms`), and **`BC3`/`BC4`/`BC5`** (`1.421 ms`, `0` byte mismatches).
+- **`bcpack-gpu-demo.exe --bottleneck-suite` (`v0.14.1`, RTX 5080):**
+  - `Bench1` Virtual Tile Pool (`4.0 GiB → 256 MiB`, LRU `14,163` evictions / `5,459` thrash vs Pareto `14,336` / `5,632`) + BCPack `16.0 MiB`: `AsyncLoop=2488.32 ms` vs **`BcPackDecodeBatch=42.21 ms` (`kernel=21.29 ms`, `58.95×`)** vs `ToTexture2D=2495.03 ms` (`6.4 MB/s` due to per-call sync fence waits).
+  - `Bench2` Retired COM Drop Storm (`10,000 × 4 KiB` UPLOAD): `Inline=1503.34 ms` (proj `75k`: `11275.1 ms`) vs `ReaperHandoff=0.1126 ms` (`bg=1407.44 ms`, `13,351×`) vs `PooledRing=0.0202 ms`.
+  - `Bench3` Copy Coalescing (`32 MiB`): `4,096 × 8 KiB + barriers` (`15.34 ms`) vs `32 × 1 MiB` coalesced (`0.36 ms`, `42.41×`).
+  - `Bench4` DXR 1.1 BVH4 (`64 BLAS + 16,384 TLAS`): `0.29 → 0.23 MiB` compacted, `TLAS Rebuild=0.32 ms` vs `Refit=0.17 ms` (`1.91×`).
+  - `Bench5` Descriptor Paging (`10×100k = 1,000,000` accesses, `737,856` evictions): `1.11 ms/frame`; `16` aliased `PlacedResource` textures (`64` barriers): `0.072 ms`.
+  - `Bench6` `2,048` Dispatches: `BarrierStorm=6.50 ms` vs `DirectNoBarrier=0.37 ms` vs `ExecuteIndirect=0.87 ms` (`7.46×` vs storm).
+- **`bcpack-gpu-demo.exe --bottleneck-suite` (`v0.14.1` Open-World DX12 Bottleneck Suite, RTX 5080):**
+  - **Bench 1 (4.0 GiB Virtual Tile Pool + `16.0 MiB` BC1 Decode):** `BcPackDecodeAsync` loop = `2488.32 ms` vs **`BcPackDecodeBatch` = `42.21 ms` (`21.29 ms` kernel, `58.95×`)**; per-call `BcPackDecodeToTexture2D` loop (`128` sequential CPU-synced uploads) = `2495.03 ms` (`6.4 MB/s`), proving batch-pipelined upload dominance.
+  - **Bench 2 (Retired COM Object Drop Storm, `10,000 × 4 KiB` UPLOAD):** Inline `drop` = `1503.34 ms` (proj `75k` = `11,275.1 ms`) vs **Reaper Thread Handoff = `0.1126 ms`** (**`13,351×`** caller relief; `1407.44 ms` background drain) vs **Pooled Ring Reset = `0.0202 ms`**.
+  - **Bench 3 (Host-Copy Coalescing, `32 MiB` = `4,096 × 8 KiB`):** Naive (`4,096` barriers+copies) = `5.30 ms` rec / `15.34 ms` wall vs **Coalesced (`32 × 1 MiB`) = `0.062 ms` rec / `0.36 ms` wall (`42.41×`)**.
+  - **Bench 4 (DXR 1.1 BVH4, `64` BLAS + `16,384` TLAS):** BLAS compaction `0.29 → 0.23 MiB` (shared scratch `< 4 KiB`); `16,384`-instance TLAS full rebuild = `0.324 ms` vs `PERFORM_UPDATE` refit = **`0.170 ms` (`1.91×`)**.
+  - **Bench 5 (`VirtualDescriptorPager` + `PlacedResource` Aliasing):** `10 × 100k` accesses (`1.25M → 262k`, `737,856` evictions) = **`1.11 ms/frame`** avg; `16` aliased `512×512` `BC1` textures (`64` aliasing barriers) = **`0.072 ms`**.
+  - **Bench 6 (`2,048` Compute Dispatches):** Barrier Storm (`uav_barrier` per dispatch) = `6.50 ms` vs **`ExecuteIndirect` = `0.87 ms` (`7.46×`)** vs Direct No-Barrier Loop = `0.37 ms`.
 - **`bcpack-aaa-demo.exe --benchmark-run --benchmark-secs 60` (`1920×1080` HDR):**
   - **`150.61 FPS` Avg** (`6.64 ms`, `9,026` frames) | **`87.07 FPS` 1% Low** | **`43.37 FPS` 0.1% Low**
   - **Active SFS VRAM:** **`86.2 / 204.7 MiB`** (`118.5 MiB` saved)

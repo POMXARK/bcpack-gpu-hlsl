@@ -1,6 +1,7 @@
 pub mod aaa_scene;
 pub mod aaa_world;
 pub mod assets;
+pub mod bottleneck_suite;
 pub mod demo_scene;
 pub mod gltf_loader;
 pub mod hiz_culling;

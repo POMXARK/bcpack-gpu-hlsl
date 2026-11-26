@@ -1,7 +1,7 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
 [![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1%20%2B%20VRS%20Tier2-2f80ed)](sdk/shaders/bcpack_decode.hlsl)
-[![v0.12.0](https://img.shields.io/badge/v0.12.0-BC1%2F3%2F4%2F5%2F7%20(0..7)%20%7C%2021%2F21%20PASS-ff4081)](#verified-bit-exactness-bcpack-gpu-demo---verify--2121-pass)
+[![v0.14.1](https://img.shields.io/badge/v0.14.1-BC1%2F3%2F4%2F5%2F6H%2F7%20%7C%2021%2F21%20PASS-ff4081)](#verified-bit-exactness-bcpack-gpu-demo---verify--2121-pass)
 [![Standalone SDK](https://img.shields.io/badge/Hardware%20SDK-POMXARK%2Fbcpack--gpu--sdk-orange)](https://github.com/POMXARK/bcpack-gpu-sdk)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](sdk/shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](sdk/include/bcpack_gpu.h)
@@ -14,6 +14,23 @@
 
 > Want only the lightweight, zero-bloat C-ABI DLL (`bcpack_gpu.dll`), `bcpack_gpu.h`, HLSL/DXIL compute kernels, and **Vulkan 1.3 SPIR-V (`.spv`)** binaries? Use **[`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk)** directly!
 > Clean-room implementation (`MIT OR Apache-2.0`) using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. AI/LLM spec: [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md) & [`llms.txt`](llms.txt).
+
+---
+
+## What's New in `v0.14.1` — Open-World DX12 Bottleneck Profiling Suite (`--bottleneck-suite`)
+
+Added [`src/bottleneck_suite.rs`](src/bottleneck_suite.rs) and [`START_BOTTLENECK_SUITE.bat`](START_BOTTLENECK_SUITE.bat) (`bcpack-gpu-demo --bottleneck-suite --report-json bottleneck_report.json`) targeting clean-room open-world Xbox translation bottlenecks (`C-ABI` batching, COM retirement, copy/barrier coalescing, DXR 1.1 BVH4 streaming, descriptor churn, and `ExecuteIndirect`):
+
+| Benchmark (`NVIDIA GeForce RTX 5080`, `v0.14.1`) | Baseline / Naive | Optimized Path | Measured Gain |
+|---|---|---|---|
+| **1. BCPack `16.0 MiB` (`128×512×512 BC1`)** | `BcPackDecodeAsync` loop `2488.32 ms` / `ToTexture2D` sync loop `2495.03 ms` | **`BcPackDecodeBatch`** `42.21 ms` (`kernel=21.29 ms`) | **`58.95×`** (also exposes per-call sync wait inside `ToTexture2D` loop) |
+| **2. Retired COM Drop Storm (`10k × 4 KiB` UPLOAD)** | Inline `drop`: `1503.34 ms` (proj `75k`: `11275.1 ms`) | Background reaper handoff: **`0.1126 ms`** (`bg=1407.44 ms`) / Pooled ring: **`0.0202 ms`** | **`13,351×`** caller relief |
+| **3. Small Host-Copy Coalescing (`32 MiB`)** | `4,096 × 8 KiB` + per-copy barriers: rec `5.30 ms`, wall `15.34 ms` | `32 × 1 MiB` coalesced: rec `0.062 ms`, wall **`0.36 ms`** | **`42.41×`** |
+| **4. DXR 1.1 BVH4 (`64 BLAS + 16,384 TLAS`)** | Full TLAS rebuild `0.32 ms`, pre-compact `0.29 MiB` | Compacted `0.23 MiB`, TLAS `PERFORM_UPDATE` refit **`0.17 ms`** | **`1.91×`** TLAS update |
+| **5. Descriptor Paging + `PlacedResource` Aliasing** | `1.25M → 262k` (`1,000,000` accesses, `737,856` evictions) | **`1.11 ms/frame`** avg; `16` aliased textures / `64` `ALIASING` barriers in **`0.072 ms`** | Clean `S_OK` |
+| **6. `2,048` Compute Dispatches (`bc16_pack`)** | Per-dispatch `uav_barrier` storm: `6.50 ms` | **`ExecuteIndirect`** `0.87 ms` / Direct no-barrier `0.37 ms` | **`7.46×`** (`ExecuteIndirect`) |
+
+- Also verified `bcpack-gpu-demo.exe --verify`: **`21/21 PASS`** (`0` mismatches, DX12 Debug Layer clean).
 
 ---
 
@@ -73,6 +90,23 @@ Built for 8 GB / budget GPUs (`RTX 3060 / 4060 / RX 6600 / iGPU`) alongside high
 | **Textured DXR 1.1 + TAA/AgX/CAS** | Flat instance reflections, specular aliasing, RTGI noise shimmer | `RtInstMeta` (`t34`) ray-hit UV sampling + 4-pass A-Trous + YCoCg TAA + AgX Filmic | **`150.61 FPS` Avg** (`1080p` HDR, 60s benchmark) | [`aaa_pbr.hlsl`](shaders/aaa_pbr.hlsl), [`aaa_taa.hlsl`](shaders/aaa_taa.hlsl), [`aaa_composite.hlsl`](shaders/aaa_composite.hlsl) |
 | **Zero-Copy C-ABI & Vulkan SPIR-V** | Cross-process copies; Vulkan 1.3/Linux Proton shaders needed (`OpenScarlett`) | `bcpack_gpu_create_from_device`, `BcPackDecodeToTexture2D`, official DXC `-spirv` | **0 CPU readback**, 9 Vulkan 1.3 `.spv` kernels | [`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`compile_spirv.sh`](shaders/compile_spirv.sh) |
 | **Compute `RayQuery` RTGI + TAAU + VRS Tier 2** | 8 GB / RDNA2 GPUs (`RTX 3060/4060`, `RX 6600`) stalled by PS RTGI quads + 1080p SFS | Cross-vendor `[numthreads(8,8,1)]` `VK_KHR_ray_query` CS, 5-tap TAAU, `16×16` VRS (`[K]`), SFS hysteresis | **`196.8 FPS`** Ultra CS RTGI, **`258.9 FPS`** (`420.6 Peak`) +VRS, **`551.5 FPS`** Low | [`aaa_rtgi_cs.hlsl`](shaders/aaa_rtgi_cs.hlsl), [`aaa_vrs.hlsl`](shaders/aaa_vrs.hlsl), [`aaa_taa.hlsl`](shaders/aaa_taa.hlsl) |
+
+---
+
+## Open-World DX12 Bottleneck Suite (`v0.14.1` — `bcpack-gpu-demo --bottleneck-suite` / `START_BOTTLENECK_SUITE.bat`)
+
+100% synthetic clean-room profiler targeting the primary CPU/GPU bottlenecks in modern Xbox Series X|S → Windows DX12 translation layers & open-world streaming engines (verified on **NVIDIA GeForce RTX 5080**, `--verify`: **`21/21 PASS`**):
+
+| Benchmark | Workload | Baseline (Naive) | Optimized Path | Measured Gain (RTX 5080) |
+|---|---|---:|---:|---|
+| **1. BCPack Batch vs Loop** | `128 × 512×512 BC1` (`16.0 MiB`) | `2488.32 ms` (`BcPackDecodeAsync` loop) | **`42.21 ms`** (`BcPackDecodeBatch`, `21.29 ms` kernel) | **`58.95×`** faster (`BcPackDecodeToTexture2D` 128-call unbatched loop = `2495.03 ms`, proving per-call CPU sync bottleneck) |
+| **2. COM Object Drop Storm** | `10,000 × 4 KiB` UPLOAD `ID3D12Resource` | `1503.34 ms` inline `drop` (`~11.3s` @ 75k) | **`0.1126 ms`** Reaper Handoff / **`0.0202 ms`** Ring Reuse | **`13,351×`** caller thread relief (`1407.44 ms` bg drain) |
+| **3. Host-Copy Coalescing** | `32 MiB` (`4,096 × 8 KiB`) Upload → Default | `5.30 ms` rec / `15.34 ms` wall | **`0.062 ms`** rec / **`0.36 ms`** wall (`32 × 1 MiB`) | **`42.41×`** faster E2E |
+| **4. DXR 1.1 BVH4 Scale** | `64` Compacted BLAS + `16,384`-Inst TLAS | `0.29 MiB` raw, `0.324 ms` full rebuild | **`0.23 MiB`** compacted, **`0.170 ms`** `PERFORM_UPDATE` refit | **`1.91×`** faster TLAS update |
+| **5. Descriptor Paging & Aliasing** | `10 × 100k` (`1.25M → 262k`) + `16` Alias Tex | — | **`1.11 ms/frame`** (`737,856` evict) / **`0.072 ms`** (`64` barriers) | Clean `0`-error aliasing & paging |
+| **6. Compute Barrier Storm vs `ExecuteIndirect`** | `2,048` Compute `Dispatch(4,1,1)` | `6.50 ms` (`uav_barrier` every dispatch) | **`0.87 ms`** (`ExecuteIndirect`) / `0.37 ms` (No-Barrier) | **`7.46×`** vs barrier storm |
+
+Run standalone or save structured metrics via `bcpack-gpu-demo.exe --bottleneck-suite --report-json bottleneck_report.json` (`START_BOTTLENECK_SUITE.bat`).
 
 ---
 
