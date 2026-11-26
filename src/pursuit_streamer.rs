@@ -1,9 +1,13 @@
 //! Bundle 1: Async-Threaded Zero-Copy 6-Format (`BC1`, `BC3`, `BC4`, `BC5`, `BC6H`, `BC7` + `GFX10 SW_64KB_D`)
 //! Pursuit Streaming + Live `VirtualDescriptorPager` (`1.25M -> 262K`) integration for `bcpack-aaa-demo`.
 //!
-//! All `BcPackDecodeBatchToTextures` calls run on a dedicated background thread (`pursuit-zc-streamer`),
-//! so the main render thread never blocks on CPU waits and only issues pure GPU-GPU
-//! `render_queue.Wait(&direct_fence, latest_fence)` synchronization.
+//! Architecture (v0.15.3):
+//! - Console-style `1024`-block (`128x128 px`, `32x32` blocks, 8/16 KiB) tiles so `bcpack` rANS &
+//!   block-rebuild shaders run 4x shorter serial chains per warp and saturate all GPU SMs in one wave.
+//! - Two-generation ping-pong texture ring (`[gen 0, gen 1]`): the dedicated `pursuit-zc-streamer`
+//!   thread decodes wave `N` into `pools[gen]` while the main render thread binds ONLY already-completed
+//!   `pools[ready_gen]` via a non-blocking GPU-GPU `render_queue.Wait(&direct_fence, ready_fence)`
+//!   (`ready_fence <= direct_fence.GetCompletedValue()`), eliminating all render-queue bubbles.
 
 use bcpack::bc7 as bcp_bc7;
 use bcpack::encode::{encode_lanes, Fragment, Rng};
@@ -28,10 +32,14 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-const POOL_PER_FORMAT: usize = 6;
-const POOL_DIM_PX: u32 = 256;
-const POOL_BLOCKS_SIDE: u32 = POOL_DIM_PX / 4; // 64
-const POOL_BLOCKS: u32 = POOL_BLOCKS_SIDE * POOL_BLOCKS_SIDE; // 4096
+/// Console-tiled 1024-block (`128x128 px` = `32x32` BC blocks) chunks:
+/// 8 KiB (BC1/BC4, 256B RowPitch) or 16 KiB (BC3/BC5/BC6H/BC7, 512B RowPitch) -> 0 row-pad copies.
+const POOL_SLOTS_PER_GEN: usize = 32;
+const CRUISE_TILES_PER_FMT: usize = 24; // 24 * 6 = 144 tiles/wave (1.875 MiB)
+const WHIP_TILES_PER_FMT: usize = 32;   // 32 * 6 = 192 tiles/wave (2.500 MiB)
+const POOL_DIM_PX: u32 = 128;
+const POOL_BLOCKS_SIDE: u32 = POOL_DIM_PX / 4; // 32
+const POOL_BLOCKS: u32 = POOL_BLOCKS_SIDE * POOL_BLOCKS_SIDE; // 1024
 
 #[derive(Clone, Copy)]
 struct FormatSpec {
@@ -154,16 +162,19 @@ impl Drop for SendSdkCtx {
     }
 }
 
-/// Exclusive ownership wrapper for a target VRAM texture ring owned by the background streamer thread.
-struct SendTexPool(Vec<[ID3D12Resource; 6]>);
-// SAFETY: `ID3D12Resource` COM objects are free-threaded; accessed only by the streamer thread.
-unsafe impl Send for SendTexPool {}
+/// Exclusive ownership wrapper for the two-generation ping-pong VRAM texture ring.
+struct SendPingPongPools([Vec<[ID3D12Resource; 6]>; 2]);
+// SAFETY: `ID3D12Resource` COM objects are free-threaded; write generation is owned solely by the worker thread
+// while the previously completed generation is read-ready via cross-queue fence visibility.
+unsafe impl Send for SendPingPongPools {}
 
 struct SharedStreamerState {
     enabled: AtomicBool,
     whip_active: AtomicBool,
     quit: AtomicBool,
-    latest_direct_fence: AtomicU64,
+    /// Fence value of the most recently **GPU-completed** ping-pong generation (guaranteed <= GetCompletedValue).
+    ready_direct_fence: AtomicU64,
+    ready_generation: AtomicU64,
     total_batches: AtomicU64,
     total_textures: AtomicU64,
     total_bytes_vram: AtomicU64,
@@ -177,7 +188,8 @@ impl SharedStreamerState {
             enabled: AtomicBool::new(false),
             whip_active: AtomicBool::new(false),
             quit: AtomicBool::new(false),
-            latest_direct_fence: AtomicU64::new(0),
+            ready_direct_fence: AtomicU64::new(0),
+            ready_generation: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
             total_textures: AtomicU64::new(0),
             total_bytes_vram: AtomicU64::new(0),
@@ -210,6 +222,7 @@ pub struct PursuitTelemetry {
     pub whip_pan_pulse: f32,
     pub fps_1pct_low: f32,
     pub last_direct_fence: u64,
+    pub ready_generation: u64,
 }
 
 pub struct PursuitStreamer {
@@ -230,10 +243,11 @@ pub struct PursuitStreamer {
 impl PursuitStreamer {
     pub fn new(ctx: &mut GpuContext) -> Self {
         unsafe {
+            // max_chunks = 128 so all 96 Bcn tiles (32x BC3/BC4/BC5) + 32x BC1/BC6H/BC7 fit in 1 wave.
             let sdk_ctx = bcpack_gpu_create_from_device(
                 ctx.device.as_raw(),
                 std::ptr::null_mut(),
-                64,
+                128,
                 524_288,
                 16 * 1024 * 1024,
             );
@@ -248,7 +262,7 @@ impl PursuitStreamer {
 
             let mut pager = VirtualDescriptorPager::new(ctx);
             // Warm physical descriptor heap to full 262,144 occupancy once at startup so runtime
-            // per-frame updates only touch the visible window while immediately exercising real LRU evictions.
+            // per-frame updates touch only the visible window while exercising real LRU evictions.
             let mut virt_cursor = 0usize;
             for _ in 0..PHYS_HEAP_SLOTS {
                 let vid = (virt_cursor % VIRTUAL_DESC_COUNT) as u32;
@@ -257,91 +271,120 @@ impl PursuitStreamer {
             }
 
             let ctrl7 = valid_bc7_ctrl_codes();
-            let mut tex_pool = Vec::with_capacity(POOL_PER_FORMAT);
-            let mut streams = Vec::with_capacity(POOL_PER_FORMAT);
-
-            for p in 0..POOL_PER_FORMAT {
-                let mut arr_res: [Option<ID3D12Resource>; 6] = [None, None, None, None, None, None];
+            // Create 8 distinct compressed variants per format (small startup encode cost) and
+            // 2 ping-pong generations x 32 destination textures per format (~5.25 MiB total VRAM).
+            const STREAM_VARIANTS: usize = 8;
+            let mut streams = Vec::with_capacity(STREAM_VARIANTS);
+            for v in 0..STREAM_VARIANTS {
                 let mut arr_str: [Vec<u8>; 6] = Default::default();
                 for (fi, spec) in FORMAT_SPECS.iter().enumerate() {
-                    let desc = D3D12_RESOURCE_DESC {
-                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                        Width: POOL_DIM_PX as u64,
-                        Height: POOL_DIM_PX,
-                        DepthOrArraySize: 1,
-                        MipLevels: 1,
-                        Format: spec.dxgi_fmt,
-                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-                        Flags: D3D12_RESOURCE_FLAG_NONE,
-                        ..Default::default()
-                    };
-                    let mut tex: Option<ID3D12Resource> = None;
-                    ctx.device
-                        .CreateCommittedResource(
-                            &heap_props(D3D12_HEAP_TYPE_DEFAULT),
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COMMON,
-                            None,
-                            &mut tex,
-                        )
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "Pursuit tex CreateCommittedResource {} failed: {e:?}",
-                                spec.name
-                            )
-                        });
-                    arr_res[fi] = tex;
-
-                    let seed = 0x51A7_0000u64 + (p as u64) * 17 + (fi as u64);
+                    let seed = 0x51A7_1024u64 + (v as u64) * 31 + (fi as u64);
                     arr_str[fi] =
                         encode_cleanroom_chunk(spec.mode, POOL_BLOCKS as usize, seed, &ctrl7);
                 }
-                tex_pool.push([
-                    arr_res[0].take().unwrap(),
-                    arr_res[1].take().unwrap(),
-                    arr_res[2].take().unwrap(),
-                    arr_res[3].take().unwrap(),
-                    arr_res[4].take().unwrap(),
-                    arr_res[5].take().unwrap(),
-                ]);
                 streams.push(arr_str);
             }
 
+            let mut build_gen_pool = || -> Vec<[ID3D12Resource; 6]> {
+                let mut pool = Vec::with_capacity(POOL_SLOTS_PER_GEN);
+                for _ in 0..POOL_SLOTS_PER_GEN {
+                    let mut arr_res: [Option<ID3D12Resource>; 6] =
+                        [None, None, None, None, None, None];
+                    for (fi, spec) in FORMAT_SPECS.iter().enumerate() {
+                        let desc = D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: POOL_DIM_PX as u64,
+                            Height: POOL_DIM_PX,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: spec.dxgi_fmt,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                            Flags: D3D12_RESOURCE_FLAG_NONE,
+                            ..Default::default()
+                        };
+                        let mut tex: Option<ID3D12Resource> = None;
+                        ctx.device
+                            .CreateCommittedResource(
+                                &heap_props(D3D12_HEAP_TYPE_DEFAULT),
+                                D3D12_HEAP_FLAG_NONE,
+                                &desc,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                None,
+                                &mut tex,
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "Pursuit tex CreateCommittedResource {} failed: {e:?}",
+                                    spec.name
+                                )
+                            });
+                        arr_res[fi] = tex;
+                    }
+                    pool.push([
+                        arr_res[0].take().unwrap(),
+                        arr_res[1].take().unwrap(),
+                        arr_res[2].take().unwrap(),
+                        arr_res[3].take().unwrap(),
+                        arr_res[4].take().unwrap(),
+                        arr_res[5].take().unwrap(),
+                    ]);
+                }
+                pool
+            };
+
+            let pools = [build_gen_pool(), build_gen_pool()];
             let shared = Arc::new(SharedStreamerState::new());
             let worker_shared = Arc::clone(&shared);
             let send_ctx = SendSdkCtx(sdk_ctx);
-            let send_pool = SendTexPool(tex_pool);
+            let send_pools = SendPingPongPools(pools);
 
             let worker = thread::Builder::new()
                 .name("pursuit-zc-streamer".to_string())
                 .spawn(move || {
+                    struct PendingWave {
+                        gen_idx: u64,
+                        fence_val: u64,
+                        ok_count: u64,
+                        batch_bytes: u64,
+                        batch_detiled: u64,
+                        tiles_per_fmt: u64,
+                    }
+
                     let mut batch_seq = 0usize;
+                    let mut in_flight: Option<PendingWave> = None;
                     let mut items: Vec<BcPackTextureBatchItem> =
-                        Vec::with_capacity(POOL_PER_FORMAT * 6);
+                        Vec::with_capacity(WHIP_TILES_PER_FMT * 6);
+
                     while !worker_shared.quit.load(Ordering::Acquire) {
                         if !worker_shared.enabled.load(Ordering::Acquire) {
                             thread::sleep(Duration::from_millis(2));
                             continue;
                         }
                         let whip = worker_shared.whip_active.load(Ordering::Relaxed);
-                        let copies_per_fmt = if whip { POOL_PER_FORMAT } else { 2 };
+                        let tiles_per_fmt = if whip {
+                            WHIP_TILES_PER_FMT
+                        } else {
+                            CRUISE_TILES_PER_FMT
+                        };
+                        let gen_idx = batch_seq & 1;
+                        let dst_gen = &send_pools.0[gen_idx];
+
                         items.clear();
                         let mut batch_bytes = 0u64;
                         let mut batch_detiled = 0u64;
 
-                        for p in 0..copies_per_fmt {
-                            let pool_slot = (batch_seq + p) % POOL_PER_FORMAT;
+                        for t in 0..tiles_per_fmt {
+                            let variant_idx = (batch_seq + t) % STREAM_VARIANTS;
                             for (fi, spec) in FORMAT_SPECS.iter().enumerate() {
-                                let swizzle = if ((p + fi + batch_seq) & 1) == 0 {
+                                let swizzle = if ((t + fi + batch_seq) & 1) == 0 {
                                     batch_detiled += 1;
                                     BCPACK_SWIZZLE_GFX10_64KB_D
                                 } else {
                                     BCPACK_SWIZZLE_LINEAR
                                 };
-                                let stream = &streams[pool_slot][fi];
-                                let dst = &send_pool.0[pool_slot][fi];
+                                let stream = &streams[variant_idx][fi];
+                                let dst = &dst_gen[t][fi];
                                 items.push(BcPackTextureBatchItem {
                                     compressed_data: stream.as_ptr(),
                                     compressed_size: stream.len() as u32,
@@ -360,6 +403,9 @@ impl PursuitStreamer {
                             }
                         }
 
+                        // BcPackDecodeBatchToTextures drains the prior wave before dispatching `gen_idx`,
+                        // so once it returns, `in_flight` (the opposite ping-pong generation) is 100%
+                        // GPU-completed and safe to bind on `render_queue` with ZERO GPU wait!
                         let mut fence_val = 0u64;
                         let ok_count = BcPackDecodeBatchToTextures(
                             send_ctx.0,
@@ -367,32 +413,44 @@ impl PursuitStreamer {
                             items.len() as u32,
                             &mut fence_val,
                         );
-                        if ok_count > 0 {
+
+                        if let Some(done_wave) = in_flight.take() {
                             worker_shared.total_batches.fetch_add(1, Ordering::Relaxed);
                             worker_shared
                                 .total_textures
-                                .fetch_add(ok_count as u64, Ordering::Relaxed);
+                                .fetch_add(done_wave.ok_count, Ordering::Relaxed);
                             worker_shared
                                 .total_bytes_vram
-                                .fetch_add(batch_bytes, Ordering::Relaxed);
+                                .fetch_add(done_wave.batch_bytes, Ordering::Relaxed);
                             worker_shared
                                 .gfx10_detiled_count
-                                .fetch_add(batch_detiled, Ordering::Relaxed);
+                                .fetch_add(done_wave.batch_detiled, Ordering::Relaxed);
                             for fi in 0..6 {
                                 worker_shared.format_counts[fi]
-                                    .fetch_add(copies_per_fmt as u64, Ordering::Relaxed);
+                                    .fetch_add(done_wave.tiles_per_fmt, Ordering::Relaxed);
                             }
-                            if fence_val > 0 {
-                                worker_shared
-                                    .latest_direct_fence
-                                    .store(fence_val, Ordering::Release);
-                            }
+                            worker_shared
+                                .ready_generation
+                                .store(done_wave.gen_idx, Ordering::Relaxed);
+                            worker_shared
+                                .ready_direct_fence
+                                .store(done_wave.fence_val, Ordering::Release);
+                        }
+
+                        if ok_count > 0 && fence_val > 0 {
+                            in_flight = Some(PendingWave {
+                                gen_idx: gen_idx as u64,
+                                fence_val,
+                                ok_count: ok_count as u64,
+                                batch_bytes,
+                                batch_detiled,
+                                tiles_per_fmt: tiles_per_fmt as u64,
+                            });
                         }
                         batch_seq = batch_seq.wrapping_add(1);
                     }
-                    // `send_ctx` drops cleanly here (waiting for in-flight SDK work before destroying)
                     drop(send_ctx);
-                    drop(send_pool);
+                    drop(send_pools);
                 })
                 .ok();
 
@@ -455,19 +513,26 @@ impl PursuitStreamer {
         }
         self.prev_whip_active = whip_pan_active;
 
-        // Pure GPU-GPU fence wait on the latest async Zero-Copy batch (0 CPU stall!)
-        let latest_fence = self.shared.latest_direct_fence.load(Ordering::Acquire);
-        if latest_fence > self.waited_fence {
-            unsafe {
-                render_queue
-                    .Wait(&self.direct_fence, latest_fence)
-                    .expect("render_queue.Wait(BcPackGetDirectFence) failed");
+        // Non-blocking ping-pong GPU-GPU fence visibility barrier:
+        // Bind ONLY the already-completed ping-pong generation (`ready_fence <= GetCompletedValue()`),
+        // so `render_queue` NEVER stalls waiting on the in-flight async compute decode wave!
+        let ready_fence = self.shared.ready_direct_fence.load(Ordering::Acquire);
+        if ready_fence > self.waited_fence {
+            let gpu_done = unsafe { self.direct_fence.GetCompletedValue() };
+            if gpu_done >= ready_fence {
+                unsafe {
+                    render_queue
+                        .Wait(&self.direct_fence, ready_fence)
+                        .expect("render_queue.Wait(BcPackGetDirectFence) failed");
+                }
+                self.waited_fence = ready_fence;
+                self.telemetry.last_direct_fence = ready_fence;
+                self.telemetry.ready_generation =
+                    self.shared.ready_generation.load(Ordering::Relaxed);
             }
-            self.waited_fence = latest_fence;
-            self.telemetry.last_direct_fence = latest_fence;
         }
 
-        // Visible-window VirtualDescriptorPager update (low per-frame CPU budget, real LRU evictions)
+        // Visible-window VirtualDescriptorPager update (low CPU budget, real LRU evictions)
         let page_ops = if whip_pan_active { 512 } else { 128 };
         let ev_before = self.pager.evictions;
         for _ in 0..page_ops {
@@ -520,7 +585,7 @@ impl PursuitStreamer {
     pub fn log_summary(&self) {
         let pt = &self.telemetry;
         println!(
-            "[pursuit-zero-copy] BcPackDecodeBatchToTextures (async): {:.1} MB/s (peak {:.1} MB/s) | {} batches, {} tex ({:.1} MiB direct VRAM, {} GFX10 SW_64KB_D) | fmt[BC1/3/4/5/6H/7]={:?} | Pager={}K/262K evict={} ({:.1}K/s) | WhipPans={} | 1%Low={:.1} FPS",
+            "[pursuit-zero-copy] BcPackDecodeBatchToTextures (1024-blk ping-pong): {:.1} MB/s (peak {:.1} MB/s) | {} batches, {} tiles ({:.1} MiB direct VRAM, {} GFX10 SW_64KB_D) | fmt[BC1/3/4/5/6H/7]={:?} | Pager={}K/262K evict={} ({:.1}K/s) | WhipPans={} | 1%Low={:.1} FPS",
             pt.throughput_mbs,
             pt.peak_throughput_mbs,
             pt.total_batches,

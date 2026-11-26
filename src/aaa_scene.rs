@@ -4106,7 +4106,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     String::new()
                 };
                 let title = format!(
-                    "BCPack AAA v0.15.2 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x){} | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
+                    "BCPack AAA v0.15.3 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x){} | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
                     mode_str,
                     fps_val,
                     cap_str,
