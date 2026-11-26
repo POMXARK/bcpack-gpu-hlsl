@@ -8,7 +8,7 @@ use crate::gltf_loader::{
 };
 use crate::gpu_decoder::{
     cmd_barriers, create_committed_buffer, dump_d3d12_info_queue, heap_props, pack_batch,
-    transition_barrier, uav_barrier, uav_barrier_all, upload_slice, Bc16GpuStreamer, GpuContext,
+    transition_barrier, uav_barrier, upload_slice, Bc16GpuStreamer, GpuContext,
 };
 use crate::raytracing::{supports_dxr_1_1, MAX_RT_INSTANCES};
 use crate::rtgi::RTGI_DENOISE_CS_DXIL;
@@ -662,7 +662,7 @@ struct SfsTexState {
     mip0_bytes: usize,
     queued: bool,
     clamped_lod: f32, // 0.0 = Mip-0 resident, 1.0 = SFS clamped to Mip 1+
-    srv_dirty: bool,
+    srv_dirty_mask: u8,
     desired_mip: f32,
     pixel_hits: u32,
     last_hot_frame: u64,
@@ -695,7 +695,7 @@ impl SfsResidencyManager {
                 mip0_bytes,
                 queued: false,
                 clamped_lod: 1.0,
-                srv_dirty: false,
+                srv_dirty_mask: 0,
                 desired_mip: 4.0,
                 pixel_hits: 0,
                 last_hot_frame: 0,
@@ -720,7 +720,7 @@ impl SfsResidencyManager {
             s.queued = false;
             if s.clamped_lod < 0.5 {
                 s.clamped_lod = 1.0;
-                s.srv_dirty = true;
+                s.srv_dirty_mask = 3;
             }
             s.fresh_timer = 0.0;
             s.clay_timer = 0.75;
@@ -767,7 +767,7 @@ impl SfsResidencyManager {
         s.queued = false;
         if s.clamped_lod < 0.5 {
             s.clamped_lod = 1.0;
-            s.srv_dirty = true;
+            s.srv_dirty_mask = 3;
         }
         s.fresh_timer = 0.0;
         self.pending.retain(|r| r.tex_idx != idx);
@@ -896,7 +896,7 @@ impl SfsResidencyManager {
             s.fresh_timer = 1.0;
             if s.mip0_resident_strips >= s.num_strips && s.clamped_lod > 0.5 {
                 s.clamped_lod = 0.0;
-                s.srv_dirty = true;
+                s.srv_dirty_mask = 3;
             }
         }
     }
@@ -951,8 +951,6 @@ struct AaaDxrScene {
     tlas_result: [ID3D12Resource; 2],
     instances_upload: [ID3D12Resource; 2],
     inst_meta_upload: [ID3D12Resource; 2],
-    tlas_alloc: ID3D12CommandAllocator,
-    tlas_cmd: ID3D12GraphicsCommandList,
 }
 
 impl AaaDxrScene {
@@ -1126,10 +1124,6 @@ impl AaaDxrScene {
         let blas_box = blas_res.pop().unwrap();
         let blas_car = blas_res.pop().unwrap();
 
-        let tlas_alloc: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-        let tlas_cmd: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &tlas_alloc, None).unwrap();
-        tlas_cmd.Close().unwrap();
-
         Some(Self {
             blas_car,
             blas_box,
@@ -1139,14 +1133,12 @@ impl AaaDxrScene {
             tlas_result,
             instances_upload,
             inst_meta_upload,
-            tlas_alloc,
-            tlas_cmd,
         })
     }
 
     unsafe fn build_tlas(
         &self,
-        ctx: &mut GpuContext,
+        cmd: &ID3D12GraphicsCommandList,
         slot: usize,
         instances: &[(usize, [f32; 12], RtInstMeta)],
     ) {
@@ -1171,9 +1163,7 @@ impl AaaDxrScene {
         upload_slice(&self.instances_upload[s], &descs);
         upload_slice(&self.inst_meta_upload[s], &metas);
 
-        self.tlas_alloc.Reset().unwrap();
-        self.tlas_cmd.Reset(&self.tlas_alloc, None).unwrap();
-        let cmd4: ID3D12GraphicsCommandList4 = self.tlas_cmd.cast().unwrap();
+        let cmd4: ID3D12GraphicsCommandList4 = cmd.cast().unwrap();
         let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
             Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
@@ -1190,11 +1180,7 @@ impl AaaDxrScene {
             ScratchAccelerationStructureData: self.tlas_scratch[s].GetGPUVirtualAddress(),
         };
         cmd4.BuildRaytracingAccelerationStructure(&build_desc, None);
-        cmd_barriers(&self.tlas_cmd, vec![uav_barrier_all()]);
-        self.tlas_cmd.Close().unwrap();
-        let exec = [Some(self.tlas_cmd.cast::<ID3D12CommandList>().unwrap())];
-        ctx.queue.ExecuteCommandLists(&exec);
-        ctx.signal_and_wait();
+        cmd_barriers(cmd, vec![uav_barrier(&self.tlas_result[s]), uav_barrier(&self.tlas_scratch[s])]);
     }
 }
 
@@ -3117,6 +3103,9 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         println!("  Controls: [B] Pursuit Zero-Copy | [H] HUD Sliders | [K] VRS Tier2 | [/] FPS | -/= Sim | [P] Pause | [T] Flush | [V] X-Ray | [F] SFS | [L] VSync | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Cam | [ESC] Quit");
 
         let mut frame_fences = [0u64; 2];
+        let mut slot_had_gpu_tiles = [false; 2];
+        let mut slot_tile_bytes = [0usize; 2];
+        let mut slot_has_readback = [false; 2];
         let mut frame_count: u32 = 0;
         let mut free_pos = [-4.2f32, 1.75, -5.0];
         let mut free_yaw = 0.62f32;
@@ -3190,6 +3179,30 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             let slot = (frame_count as usize) & 1;
             ctx.wait_direct_cpu(frame_fences[slot]);
+            if slot_has_readback[slot] {
+                if slot_had_gpu_tiles[slot] {
+                    last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
+                    if last_decode_ms > 1e-4 {
+                        let gbps = (slot_tile_bytes[slot] as f64 / 1e9) / (last_decode_ms / 1000.0);
+                        bench_peak_gbps = bench_peak_gbps.max(gbps);
+                    }
+                    slot_had_gpu_tiles[slot] = false;
+                }
+                if let Some(ref city) = meshlet_city {
+                    last_cull_stats = city.read_cull_stats(slot);
+                    bench_sum_vis_tris += last_cull_stats.vis_tris as u64;
+                    bench_sum_hiz_tris += last_cull_stats.hiz_occluded_tris as u64;
+                }
+                {
+                    let mut fb_ptr: *mut c_void = std::ptr::null_mut();
+                    let fb_rng = D3D12_RANGE { Begin: 0, End: sfs_buf_bytes as usize };
+                    sfs_feedback_readback[slot].Map(0, Some(&fb_rng), Some(&mut fb_ptr)).unwrap();
+                    let fb_bytes = std::slice::from_raw_parts(fb_ptr as *const u8, sfs_buf_bytes as usize);
+                    residency.apply_sfs_feedback_and_schedule(fb_bytes, frame_count as u64, wstate.sfs_enabled);
+                    sfs_feedback_readback[slot].Unmap(0, None);
+                }
+                slot_has_readback[slot] = false;
+            }
 
             // Stream pending 64 KiB (4K BC7/BC5) BCPack tiles via Async Compute (or CPU 1-thread when toggled)
             let batch_tiles_n = cfg.tiles_per_frame.clamp(16, MAX_BATCH_TILES);
@@ -3462,9 +3475,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 residency.mark_resident(&taken);
             }
 
-            // Apply any pending SFS ResourceMinLODClamp SRV updates while GPU is idle (wait_direct_cpu already completed)
+            // Apply pending SFS ResourceMinLODClamp SRV updates for THIS slot only (slot's fence already completed)
+            let slot_bit = 1u8 << slot;
             for (ti, s) in residency.tex.iter_mut().enumerate() {
-                if s.srv_dirty {
+                if (s.srv_dirty_mask & slot_bit) != 0 {
                     let mut sd = D3D12_SHADER_RESOURCE_VIEW_DESC {
                         Format: dxgi_format_for(pack.textures[ti].format),
                         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -3476,9 +3490,12 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                         ResourceMinLODClamp: s.clamped_lod,
                         ..Default::default()
                     };
-                    ctx.device.CreateShaderResourceView(&pbr_textures[ti], Some(&sd), cpu_at(ti));
-                    ctx.device.CreateShaderResourceView(&pbr_textures[ti], Some(&sd), cpu_at(SRV_TABLE_STRIDE + ti));
-                    s.srv_dirty = false;
+                    ctx.device.CreateShaderResourceView(
+                        &pbr_textures[ti],
+                        Some(&sd),
+                        cpu_at(slot * SRV_TABLE_STRIDE + ti),
+                    );
+                    s.srv_dirty_mask &= !slot_bit;
                 }
             }
 
@@ -3570,7 +3587,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                         },
                     ));
                 }
-                rt.build_tlas(&mut ctx, slot, &rt_insts);
+                rt.build_tlas(cmd, slot, &rt_insts);
             }
 
             // Skin 500 promenade pedestrians on GPU Compute before G-Buffer pass
@@ -3917,8 +3934,15 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 break;
             }
 
-            ctx.signal_and_wait();
-            frame_fences[slot] = 0;
+            let fence_val = ctx.signal_direct_async();
+            frame_fences[slot] = fence_val;
+            slot_had_gpu_tiles[slot] = wstate.use_gpu && !taken.is_empty();
+            slot_tile_bytes[slot] = taken.len() * TILE_BC16_BYTES;
+            slot_has_readback[slot] = true;
+            if take_shot || (!wstate.use_gpu && !taken.is_empty()) {
+                ctx.wait_direct_cpu(fence_val);
+                frame_fences[slot] = 0;
+            }
             if cfg.record_dir.is_some() {
                 let render_secs = render_start.elapsed().as_secs_f32().max(1e-4);
                 let inst_fps = (1.0 / render_secs).min(999.0);
@@ -3933,31 +3957,9 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     ema_render_fps
                 };
             }
-            if wstate.use_gpu && !taken.is_empty() {
-                last_decode_ms = gpu_dec.read_slot_kernel_ms(&ctx, slot);
-                if last_decode_ms > 1e-4 {
-                    let gbps = ((taken.len() * TILE_BC16_BYTES) as f64 / 1e9) / (last_decode_ms / 1000.0);
-                    bench_peak_gbps = bench_peak_gbps.max(gbps);
-                }
-            }
-            if let Some(ref city) = meshlet_city {
-                last_cull_stats = city.read_cull_stats(slot);
-                bench_sum_vis_tris += last_cull_stats.vis_tris as u64;
-                bench_sum_hiz_tris += last_cull_stats.hiz_occluded_tris as u64;
-            }
 
             frame_count += 1;
             fps_accum += 1;
-
-            // Readback GPU Sampler Feedback & update active SFS LRU residency/clamping for next frame
-            {
-                let mut fb_ptr: *mut c_void = std::ptr::null_mut();
-                let fb_rng = D3D12_RANGE { Begin: 0, End: sfs_buf_bytes as usize };
-                sfs_feedback_readback[slot].Map(0, Some(&fb_rng), Some(&mut fb_ptr)).unwrap();
-                let fb_bytes = std::slice::from_raw_parts(fb_ptr as *const u8, sfs_buf_bytes as usize);
-                residency.apply_sfs_feedback_and_schedule(fb_bytes, frame_count as u64, wstate.sfs_enabled);
-                sfs_feedback_readback[slot].Unmap(0, None);
-            }
 
             if take_shot {
                 if let Some(ri) = rec_frame_idx {
@@ -4088,18 +4090,23 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                     String::new()
                 };
                 let pursuit_str = if wstate.pursuit_enabled {
+                    let ev_str = if pursuit.telemetry.pager_evictions_per_sec >= 1000.0 {
+                        format!("{:.1}K/s", pursuit.telemetry.pager_evictions_per_sec / 1000.0)
+                    } else {
+                        format!("{:.0}/s", pursuit.telemetry.pager_evictions_per_sec)
+                    };
                     format!(
-                        " | PURSUIT ZC:{:.0}MB/s Pager:{}K/262K Ev:{:.0}/s 1%Low:{:.1}",
+                        " | PURSUIT ZC:{:.0}MB/s Pager:{}K/262K Ev:{} 1%Low:{:.1}",
                         pursuit.telemetry.throughput_mbs,
                         pursuit.telemetry.pager_active_slots / 1000,
-                        pursuit.telemetry.pager_evictions_per_sec,
+                        ev_str,
                         pursuit.telemetry.fps_1pct_low,
                     )
                 } else {
                     String::new()
                 };
                 let title = format!(
-                    "BCPack AAA v0.15.1 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x){} | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
+                    "BCPack AAA v0.15.2 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x){} | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
                     mode_str,
                     fps_val,
                     cap_str,

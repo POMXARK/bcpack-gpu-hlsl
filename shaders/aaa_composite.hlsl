@@ -398,7 +398,25 @@ float3 composite_pursuit_hud(float3 bg, float2 uv) {
     t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 17.5, 0.0), 25u)); // E
     t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 18.5, 0.0), 20u)); // V
     t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 19.5, 0.0), 11u)); // :
-    t_pg = max(t_pg, draw_uint4(uv, r3 + float2(ADV * 21.0, 0.0), ADV, (uint)round(max(g_PagerEvictPerSec, 0.0))));
+    float ev_s = max(g_PagerEvictPerSec, 0.0);
+    if (ev_s >= 1000.0) {
+        uint ev_tenths_k = min((uint)round(ev_s / 100.0), 9999u);
+        uint ev_whole = ev_tenths_k / 10u;
+        uint ev_frac = ev_tenths_k % 10u;
+        float ev_x = 20.8;
+        if (ev_whole >= 100u) {
+            t_pg = max(t_pg, draw_uint3(uv, r3 + float2(ADV * ev_x, 0.0), ADV, ev_whole));
+            t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * (ev_x + 3.2), 0.0), 31u)); // K
+        } else {
+            uint d_off = (ev_whole >= 10u) ? 2u : 1u;
+            t_pg = max(t_pg, draw_uint3(uv, r3 + float2(ADV * ev_x, 0.0), ADV, ev_whole));
+            t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * (ev_x + (float)d_off), 0.0), 12u)); // '.'
+            t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * (ev_x + (float)d_off + 0.85), 0.0), ev_frac));
+            t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * (ev_x + (float)d_off + 1.95), 0.0), 31u)); // K
+        }
+    } else {
+        t_pg = max(t_pg, draw_uint3(uv, r3 + float2(ADV * 21.0, 0.0), ADV, (uint)round(ev_s)));
+    }
 
     float tr2_y = 0.148;
     float fill_pg = lerp(X0, X1, saturate(g_PagerActiveK / 262.0));

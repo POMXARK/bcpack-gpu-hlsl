@@ -3,7 +3,7 @@ members = [".", "sdk"]
 
 [package]
 name = "bcpack-gpu-hlsl"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Clean-room Xbox Series BCPack (MDU rANS) GPU Compute Shader decoder & 4K AAA streaming benchmark in DirectX 12 HLSL SM 6.6 (Wave32)"

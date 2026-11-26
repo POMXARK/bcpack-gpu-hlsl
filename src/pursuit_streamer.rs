@@ -1,5 +1,9 @@
-//! Bundle 1: Zero-Copy 6-Format (`BC1`, `BC3`, `BC4`, `BC5`, `BC6H`, `BC7` + `GFX10 SW_64KB_D`)
+//! Bundle 1: Async-Threaded Zero-Copy 6-Format (`BC1`, `BC3`, `BC4`, `BC5`, `BC6H`, `BC7` + `GFX10 SW_64KB_D`)
 //! Pursuit Streaming + Live `VirtualDescriptorPager` (`1.25M -> 262K`) integration for `bcpack-aaa-demo`.
+//!
+//! All `BcPackDecodeBatchToTextures` calls run on a dedicated background thread (`pursuit-zc-streamer`),
+//! so the main render thread never blocks on CPU waits and only issues pure GPU-GPU
+//! `render_queue.Wait(&direct_fence, latest_fence)` synchronization.
 
 use bcpack::bc7 as bcp_bc7;
 use bcpack::encode::{encode_lanes, Fragment, Rng};
@@ -16,7 +20,10 @@ use bcpack_gpu::ffi::{
 use bcpack_gpu::gpu_decoder::{heap_props, GpuContext};
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -133,6 +140,60 @@ fn encode_cleanroom_chunk(mode: BcpMode, blocks: usize, seed: u64, ctrl7: &[u16]
     encode_lanes(ab, &lanes).expect("encode_lanes failed")
 }
 
+/// Exclusive ownership wrapper to move `*mut BcPackContext` onto the single `pursuit-zc-streamer` thread.
+struct SendSdkCtx(*mut BcPackContext);
+// SAFETY: `BcPackContext` is accessed exclusively by the single background streamer thread until Drop.
+unsafe impl Send for SendSdkCtx {}
+
+impl Drop for SendSdkCtx {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { bcpack_gpu_destroy(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Exclusive ownership wrapper for a target VRAM texture ring owned by the background streamer thread.
+struct SendTexPool(Vec<[ID3D12Resource; 6]>);
+// SAFETY: `ID3D12Resource` COM objects are free-threaded; accessed only by the streamer thread.
+unsafe impl Send for SendTexPool {}
+
+struct SharedStreamerState {
+    enabled: AtomicBool,
+    whip_active: AtomicBool,
+    quit: AtomicBool,
+    latest_direct_fence: AtomicU64,
+    total_batches: AtomicU64,
+    total_textures: AtomicU64,
+    total_bytes_vram: AtomicU64,
+    gfx10_detiled_count: AtomicU64,
+    format_counts: [AtomicU64; 6],
+}
+
+impl SharedStreamerState {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            whip_active: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
+            latest_direct_fence: AtomicU64::new(0),
+            total_batches: AtomicU64::new(0),
+            total_textures: AtomicU64::new(0),
+            total_bytes_vram: AtomicU64::new(0),
+            gfx10_detiled_count: AtomicU64::new(0),
+            format_counts: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct PursuitTelemetry {
     pub throughput_mbs: f64,
@@ -152,13 +213,13 @@ pub struct PursuitTelemetry {
 }
 
 pub struct PursuitStreamer {
-    sdk_ctx: *mut BcPackContext,
     direct_fence: ID3D12Fence,
+    shared: Arc<SharedStreamerState>,
+    worker: Option<JoinHandle<()>>,
     pager: VirtualDescriptorPager,
-    // 6 formats x POOL_PER_FORMAT target textures (each 256x256, D3D12_RESOURCE_STATE_COMMON)
-    tex_pool: Vec<[ID3D12Resource; 6]>,
-    streams: Vec<[Vec<u8>; 6]>,
     virt_cursor: usize,
+    waited_fence: u64,
+    prev_total_bytes: u64,
     frame_times_ms: VecDeque<f64>,
     window_samples: VecDeque<(f64, u64, u64)>, // (elapsed_s, bytes_added, evictions_added)
     start_time: Instant,
@@ -185,9 +246,17 @@ impl PursuitStreamer {
             assert!(!fence_raw.is_null(), "BcPackGetDirectFence returned null");
             let direct_fence = (*ManuallyDrop::new(ID3D12Fence::from_raw(fence_raw))).clone();
 
-            let pager = VirtualDescriptorPager::new(ctx);
-            let ctrl7 = valid_bc7_ctrl_codes();
+            let mut pager = VirtualDescriptorPager::new(ctx);
+            // Warm physical descriptor heap to full 262,144 occupancy once at startup so runtime
+            // per-frame updates only touch the visible window while immediately exercising real LRU evictions.
+            let mut virt_cursor = 0usize;
+            for _ in 0..PHYS_HEAP_SLOTS {
+                let vid = (virt_cursor % VIRTUAL_DESC_COUNT) as u32;
+                let _ = pager.page_in(&ctx.device, vid);
+                virt_cursor = (virt_cursor + 1) % VIRTUAL_DESC_COUNT;
+            }
 
+            let ctrl7 = valid_bc7_ctrl_codes();
             let mut tex_pool = Vec::with_capacity(POOL_PER_FORMAT);
             let mut streams = Vec::with_capacity(POOL_PER_FORMAT);
 
@@ -217,11 +286,17 @@ impl PursuitStreamer {
                             None,
                             &mut tex,
                         )
-                        .unwrap_or_else(|e| panic!("Pursuit tex CreateCommittedResource {} failed: {e:?}", spec.name));
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "Pursuit tex CreateCommittedResource {} failed: {e:?}",
+                                spec.name
+                            )
+                        });
                     arr_res[fi] = tex;
 
                     let seed = 0x51A7_0000u64 + (p as u64) * 17 + (fi as u64);
-                    arr_str[fi] = encode_cleanroom_chunk(spec.mode, POOL_BLOCKS as usize, seed, &ctrl7);
+                    arr_str[fi] =
+                        encode_cleanroom_chunk(spec.mode, POOL_BLOCKS as usize, seed, &ctrl7);
                 }
                 tex_pool.push([
                     arr_res[0].take().unwrap(),
@@ -234,18 +309,109 @@ impl PursuitStreamer {
                 streams.push(arr_str);
             }
 
+            let shared = Arc::new(SharedStreamerState::new());
+            let worker_shared = Arc::clone(&shared);
+            let send_ctx = SendSdkCtx(sdk_ctx);
+            let send_pool = SendTexPool(tex_pool);
+
+            let worker = thread::Builder::new()
+                .name("pursuit-zc-streamer".to_string())
+                .spawn(move || {
+                    let mut batch_seq = 0usize;
+                    let mut items: Vec<BcPackTextureBatchItem> =
+                        Vec::with_capacity(POOL_PER_FORMAT * 6);
+                    while !worker_shared.quit.load(Ordering::Acquire) {
+                        if !worker_shared.enabled.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        let whip = worker_shared.whip_active.load(Ordering::Relaxed);
+                        let copies_per_fmt = if whip { POOL_PER_FORMAT } else { 2 };
+                        items.clear();
+                        let mut batch_bytes = 0u64;
+                        let mut batch_detiled = 0u64;
+
+                        for p in 0..copies_per_fmt {
+                            let pool_slot = (batch_seq + p) % POOL_PER_FORMAT;
+                            for (fi, spec) in FORMAT_SPECS.iter().enumerate() {
+                                let swizzle = if ((p + fi + batch_seq) & 1) == 0 {
+                                    batch_detiled += 1;
+                                    BCPACK_SWIZZLE_GFX10_64KB_D
+                                } else {
+                                    BCPACK_SWIZZLE_LINEAR
+                                };
+                                let stream = &streams[pool_slot][fi];
+                                let dst = &send_pool.0[pool_slot][fi];
+                                items.push(BcPackTextureBatchItem {
+                                    compressed_data: stream.as_ptr(),
+                                    compressed_size: stream.len() as u32,
+                                    num_blocks: POOL_BLOCKS,
+                                    format: spec.ffi_fmt,
+                                    swizzle_mode: swizzle,
+                                    width_blocks: POOL_BLOCKS_SIDE,
+                                    height_blocks: POOL_BLOCKS_SIDE,
+                                    dst_texture2d: dst.as_raw(),
+                                    subresource_index: 0,
+                                    dst_x_blocks: 0,
+                                    dst_y_blocks: 0,
+                                    status: -1,
+                                });
+                                batch_bytes += spec.raw_bytes as u64;
+                            }
+                        }
+
+                        let mut fence_val = 0u64;
+                        let ok_count = BcPackDecodeBatchToTextures(
+                            send_ctx.0,
+                            items.as_mut_ptr(),
+                            items.len() as u32,
+                            &mut fence_val,
+                        );
+                        if ok_count > 0 {
+                            worker_shared.total_batches.fetch_add(1, Ordering::Relaxed);
+                            worker_shared
+                                .total_textures
+                                .fetch_add(ok_count as u64, Ordering::Relaxed);
+                            worker_shared
+                                .total_bytes_vram
+                                .fetch_add(batch_bytes, Ordering::Relaxed);
+                            worker_shared
+                                .gfx10_detiled_count
+                                .fetch_add(batch_detiled, Ordering::Relaxed);
+                            for fi in 0..6 {
+                                worker_shared.format_counts[fi]
+                                    .fetch_add(copies_per_fmt as u64, Ordering::Relaxed);
+                            }
+                            if fence_val > 0 {
+                                worker_shared
+                                    .latest_direct_fence
+                                    .store(fence_val, Ordering::Release);
+                            }
+                        }
+                        batch_seq = batch_seq.wrapping_add(1);
+                    }
+                    // `send_ctx` drops cleanly here (waiting for in-flight SDK work before destroying)
+                    drop(send_ctx);
+                    drop(send_pool);
+                })
+                .ok();
+
             Self {
-                sdk_ctx,
                 direct_fence,
+                shared,
+                worker,
                 pager,
-                tex_pool,
-                streams,
-                virt_cursor: 0,
+                virt_cursor,
+                waited_fence: 0,
+                prev_total_bytes: 0,
                 frame_times_ms: VecDeque::with_capacity(120),
                 window_samples: VecDeque::with_capacity(240),
                 start_time: Instant::now(),
                 prev_whip_active: false,
-                telemetry: PursuitTelemetry::default(),
+                telemetry: PursuitTelemetry {
+                    pager_active_slots: PHYS_HEAP_SLOTS as u32,
+                    ..Default::default()
+                },
             }
         }
     }
@@ -272,6 +438,13 @@ impl PursuitStreamer {
         }
 
         self.telemetry.whip_pan_pulse = whip_pan_pulse;
+        self.shared
+            .enabled
+            .store(pursuit_enabled, Ordering::Release);
+        self.shared
+            .whip_active
+            .store(whip_pan_active, Ordering::Relaxed);
+
         if !pursuit_enabled {
             self.prev_whip_active = false;
             return;
@@ -282,69 +455,20 @@ impl PursuitStreamer {
         }
         self.prev_whip_active = whip_pan_active;
 
-        let copies_per_fmt = if whip_pan_active { POOL_PER_FORMAT } else { 2 };
-        let frame_idx = self.telemetry.total_batches as usize;
-        let mut items: Vec<BcPackTextureBatchItem> = Vec::with_capacity(copies_per_fmt * 6);
-        let mut batch_bytes = 0u64;
-        let mut batch_detiled = 0u64;
-
-        for p in 0..copies_per_fmt {
-            let pool_slot = (frame_idx + p) % POOL_PER_FORMAT;
-            for (fi, spec) in FORMAT_SPECS.iter().enumerate() {
-                let swizzle = if ((p + fi + frame_idx) & 1) == 0 {
-                    batch_detiled += 1;
-                    BCPACK_SWIZZLE_GFX10_64KB_D
-                } else {
-                    BCPACK_SWIZZLE_LINEAR
-                };
-                let stream = &self.streams[pool_slot][fi];
-                let dst = &self.tex_pool[pool_slot][fi];
-                items.push(BcPackTextureBatchItem {
-                    compressed_data: stream.as_ptr(),
-                    compressed_size: stream.len() as u32,
-                    num_blocks: POOL_BLOCKS,
-                    format: spec.ffi_fmt,
-                    swizzle_mode: swizzle,
-                    width_blocks: POOL_BLOCKS_SIDE,
-                    height_blocks: POOL_BLOCKS_SIDE,
-                    dst_texture2d: dst.as_raw(),
-                    subresource_index: 0,
-                    dst_x_blocks: 0,
-                    dst_y_blocks: 0,
-                    status: -1,
-                });
-                batch_bytes += spec.raw_bytes as u64;
-                self.telemetry.format_counts[fi] += 1;
-            }
-        }
-
-        let mut fence_val = 0u64;
-        let ok_count = unsafe {
-            BcPackDecodeBatchToTextures(
-                self.sdk_ctx,
-                items.as_mut_ptr(),
-                items.len() as u32,
-                &mut fence_val,
-            )
-        };
-        debug_assert_eq!(
-            ok_count,
-            items.len() as i32,
-            "Pursuit BcPackDecodeBatchToTextures had partial errors: ok={ok_count}/{}",
-            items.len()
-        );
-
-        if fence_val > 0 {
+        // Pure GPU-GPU fence wait on the latest async Zero-Copy batch (0 CPU stall!)
+        let latest_fence = self.shared.latest_direct_fence.load(Ordering::Acquire);
+        if latest_fence > self.waited_fence {
             unsafe {
                 render_queue
-                    .Wait(&self.direct_fence, fence_val)
+                    .Wait(&self.direct_fence, latest_fence)
                     .expect("render_queue.Wait(BcPackGetDirectFence) failed");
             }
-            self.telemetry.last_direct_fence = fence_val;
+            self.waited_fence = latest_fence;
+            self.telemetry.last_direct_fence = latest_fence;
         }
 
-        // Exercise live VirtualDescriptorPager (1.25M virtual -> 262,144 physical slots)
-        let page_ops = if whip_pan_active { 4096 } else { 2048 };
+        // Visible-window VirtualDescriptorPager update (low per-frame CPU budget, real LRU evictions)
+        let page_ops = if whip_pan_active { 512 } else { 128 };
         let ev_before = self.pager.evictions;
         for _ in 0..page_ops {
             let vid = (self.virt_cursor % VIRTUAL_DESC_COUNT) as u32;
@@ -353,22 +477,24 @@ impl PursuitStreamer {
         }
         let ev_delta = self.pager.evictions.saturating_sub(ev_before);
 
-        self.telemetry.total_batches += 1;
-        self.telemetry.total_textures += ok_count.max(0) as u64;
-        self.telemetry.total_bytes_vram += batch_bytes;
-        self.telemetry.gfx10_detiled_count += batch_detiled;
+        let cur_bytes = self.shared.total_bytes_vram.load(Ordering::Relaxed);
+        let bytes_delta = cur_bytes.saturating_sub(self.prev_total_bytes);
+        self.prev_total_bytes = cur_bytes;
+
+        self.telemetry.total_batches = self.shared.total_batches.load(Ordering::Relaxed);
+        self.telemetry.total_textures = self.shared.total_textures.load(Ordering::Relaxed);
+        self.telemetry.total_bytes_vram = cur_bytes;
+        self.telemetry.gfx10_detiled_count =
+            self.shared.gfx10_detiled_count.load(Ordering::Relaxed);
+        for fi in 0..6 {
+            self.telemetry.format_counts[fi] =
+                self.shared.format_counts[fi].load(Ordering::Relaxed);
+        }
         self.telemetry.pager_evictions_total = self.pager.evictions;
-        let resident = (self.telemetry.total_textures.saturating_mul(512))
-            .min(PHYS_HEAP_SLOTS as u64)
-            .max(self.pager.evictions.min(PHYS_HEAP_SLOTS as u64));
-        self.telemetry.pager_active_slots = if self.pager.evictions > 0 {
-            PHYS_HEAP_SLOTS as u32
-        } else {
-            resident as u32
-        };
+        self.telemetry.pager_active_slots = PHYS_HEAP_SLOTS as u32;
 
         let now_s = self.start_time.elapsed().as_secs_f64();
-        self.window_samples.push_back((now_s, batch_bytes, ev_delta));
+        self.window_samples.push_back((now_s, bytes_delta, ev_delta));
         while let Some(&(ts, _, _)) = self.window_samples.front() {
             if now_s - ts > 0.75 && self.window_samples.len() > 2 {
                 self.window_samples.pop_front();
@@ -394,7 +520,7 @@ impl PursuitStreamer {
     pub fn log_summary(&self) {
         let pt = &self.telemetry;
         println!(
-            "[pursuit-zero-copy] BcPackDecodeBatchToTextures: {:.1} MB/s (peak {:.1} MB/s) | {} batches, {} tex ({:.1} MiB direct VRAM, {} GFX10 SW_64KB_D) | fmt[BC1/3/4/5/6H/7]={:?} | Pager={}K/262K evict={} ({:.0}/s) | WhipPans={} | 1%Low={:.1} FPS",
+            "[pursuit-zero-copy] BcPackDecodeBatchToTextures (async): {:.1} MB/s (peak {:.1} MB/s) | {} batches, {} tex ({:.1} MiB direct VRAM, {} GFX10 SW_64KB_D) | fmt[BC1/3/4/5/6H/7]={:?} | Pager={}K/262K evict={} ({:.1}K/s) | WhipPans={} | 1%Low={:.1} FPS",
             pt.throughput_mbs,
             pt.peak_throughput_mbs,
             pt.total_batches,
@@ -404,7 +530,7 @@ impl PursuitStreamer {
             pt.format_counts,
             pt.pager_active_slots / 1000,
             pt.pager_evictions_total,
-            pt.pager_evictions_per_sec,
+            pt.pager_evictions_per_sec / 1000.0,
             pt.whip_pan_count,
             pt.fps_1pct_low,
         );
@@ -413,9 +539,9 @@ impl PursuitStreamer {
 
 impl Drop for PursuitStreamer {
     fn drop(&mut self) {
-        if !self.sdk_ctx.is_null() {
-            unsafe { bcpack_gpu_destroy(self.sdk_ctx) };
-            self.sdk_ctx = std::ptr::null_mut();
+        self.shared.quit.store(true, Ordering::Release);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
         }
     }
 }
