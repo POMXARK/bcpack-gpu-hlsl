@@ -139,24 +139,17 @@ BcPackDecodeAsync(standalone, compressed_ptr, compressed_size, num_blocks,
 
 ## 4. Verification Oracle & Benchmark Numbers (NVIDIA RTX 5080, Driver 621.24)
 
-- **`bcpack-gpu-demo.exe --verify` (`v0.14.1`):** **21/21 bit-exact PASS** (`0` byte/symbol mismatches, DX12 Debug Layer clean):
+- **`bcpack-gpu-demo.exe --verify` (`v0.15.0`):** **21/21 bit-exact PASS** (`0` byte/symbol mismatches, DX12 Debug Layer clean):
   - Tests `1..7`: BC1 synthetic, monolithic `512×512`, `4K`-block tiles, BC7 16-lane rANS (Normal/UI/Albedo), Gfx10 `SW_64KB_D` + `SW_4KB_S` detile, Full 10-level Mipmap + Packed Mip Tail, and C-ABI FFI smoke test.
   - Tests `8..13`: DXR 1.1 analytical BVH rays, `32×32` LRU world streaming, `4.01M` Mesh Shaders + culling, `1,536`-TLAS + RTGI denoiser, 8B quantized meshlet geometry, `CarConcept.glb` + Poly Haven PBR.
-  - Tests `14..21`: **`1.25M` Virtual Descriptor Paging** (`0.064 ms`), **`64×64` Supersonic Jet-Flight Streaming** (`960 MB/s`), **`12.04M` Two-Pass Hi-Z Culling** (`0.015 ms`), **`500`-NPC GPU LBS Skinning** (`0.075 ms`), **`Zero-Copy Buffer C-ABI` (`BcPackDecodeToBuffer`)**, **`Direct 2D Texture C-ABI` (`BcPackDecodeToTexture2D`)**, **Full Multi-Mode `BC7` (Modes 0..7 + Rotations)** (`9.155 ms`), and **`BC3`/`BC4`/`BC5`** (`1.421 ms`, `0` byte mismatches).
-- **`bcpack-gpu-demo.exe --bottleneck-suite` (`v0.14.1`, RTX 5080):**
-  - `Bench1` Virtual Tile Pool (`4.0 GiB → 256 MiB`, LRU `14,163` evictions / `5,459` thrash vs Pareto `14,336` / `5,632`) + BCPack `16.0 MiB`: `AsyncLoop=2488.32 ms` vs **`BcPackDecodeBatch=42.21 ms` (`kernel=21.29 ms`, `58.95×`)** vs `ToTexture2D=2495.03 ms` (`6.4 MB/s` due to per-call sync fence waits).
-  - `Bench2` Retired COM Drop Storm (`10,000 × 4 KiB` UPLOAD): `Inline=1503.34 ms` (proj `75k`: `11275.1 ms`) vs `ReaperHandoff=0.1126 ms` (`bg=1407.44 ms`, `13,351×`) vs `PooledRing=0.0202 ms`.
-  - `Bench3` Copy Coalescing (`32 MiB`): `4,096 × 8 KiB + barriers` (`15.34 ms`) vs `32 × 1 MiB` coalesced (`0.36 ms`, `42.41×`).
-  - `Bench4` DXR 1.1 BVH4 (`64 BLAS + 16,384 TLAS`): `0.29 → 0.23 MiB` compacted, `TLAS Rebuild=0.32 ms` vs `Refit=0.17 ms` (`1.91×`).
-  - `Bench5` Descriptor Paging (`10×100k = 1,000,000` accesses, `737,856` evictions): `1.11 ms/frame`; `16` aliased `PlacedResource` textures (`64` barriers): `0.072 ms`.
-  - `Bench6` `2,048` Dispatches: `BarrierStorm=6.50 ms` vs `DirectNoBarrier=0.37 ms` vs `ExecuteIndirect=0.87 ms` (`7.46×` vs storm).
-- **`bcpack-gpu-demo.exe --bottleneck-suite` (`v0.14.1` Open-World DX12 Bottleneck Suite, RTX 5080):**
-  - **Bench 1 (4.0 GiB Virtual Tile Pool + `16.0 MiB` BC1 Decode):** `BcPackDecodeAsync` loop = `2488.32 ms` vs **`BcPackDecodeBatch` = `42.21 ms` (`21.29 ms` kernel, `58.95×`)**; per-call `BcPackDecodeToTexture2D` loop (`128` sequential CPU-synced uploads) = `2495.03 ms` (`6.4 MB/s`), proving batch-pipelined upload dominance.
-  - **Bench 2 (Retired COM Object Drop Storm, `10,000 × 4 KiB` UPLOAD):** Inline `drop` = `1503.34 ms` (proj `75k` = `11,275.1 ms`) vs **Reaper Thread Handoff = `0.1126 ms`** (**`13,351×`** caller relief; `1407.44 ms` background drain) vs **Pooled Ring Reset = `0.0202 ms`**.
-  - **Bench 3 (Host-Copy Coalescing, `32 MiB` = `4,096 × 8 KiB`):** Naive (`4,096` barriers+copies) = `5.30 ms` rec / `15.34 ms` wall vs **Coalesced (`32 × 1 MiB`) = `0.062 ms` rec / `0.36 ms` wall (`42.41×`)**.
-  - **Bench 4 (DXR 1.1 BVH4, `64` BLAS + `16,384` TLAS):** BLAS compaction `0.29 → 0.23 MiB` (shared scratch `< 4 KiB`); `16,384`-instance TLAS full rebuild = `0.324 ms` vs `PERFORM_UPDATE` refit = **`0.170 ms` (`1.91×`)**.
-  - **Bench 5 (`VirtualDescriptorPager` + `PlacedResource` Aliasing):** `10 × 100k` accesses (`1.25M → 262k`, `737,856` evictions) = **`1.11 ms/frame`** avg; `16` aliased `512×512` `BC1` textures (`64` aliasing barriers) = **`0.072 ms`**.
-  - **Bench 6 (`2,048` Compute Dispatches):** Barrier Storm (`uav_barrier` per dispatch) = `6.50 ms` vs **`ExecuteIndirect` = `0.87 ms` (`7.46×`)** vs Direct No-Barrier Loop = `0.37 ms`.
+  - Tests `14..21`: **`1.25M` Virtual Descriptor Paging** (`0.063 ms`), **`64×64` Supersonic Jet-Flight Streaming** (`960 MB/s`), **`12.04M` Two-Pass Hi-Z Culling** (`0.016 ms`), **`500`-NPC GPU LBS Skinning** (`0.076 ms`), **`Zero-Copy Buffer C-ABI` (`BcPackDecodeToBuffer`)**, **`Direct 2D Texture C-ABI` (`BcPackDecodeToTexture2D`)**, **Full Multi-Mode `BC7` (Modes 0..7 + Rotations)** (`9.140 ms`), and **`BC3`/`BC4`/`BC5`** (`1.286 ms`, `0` byte mismatches).
+- **`bcpack-gpu-demo.exe --bottleneck-suite` (`v0.15.0` Open-World DX12 Bottleneck Suite, RTX 5080):**
+  - **Bench 1 (4.0 GiB Virtual Tile Pool + `16.0 MiB` `128×512×512 BC1`):** `AsyncLoop=2433.03 ms` | **`BcPackDecodeBatch=39.00 ms` (`kernel=21.28 ms`, `62.39×`)** | `ToTexture2D` single-call loop=`2505.58 ms` (`6.4 MB/s`) | **`BcPackDecodeBatchToTextures=31.18 ms` (`513.2 MB/s`, `80.37×` vs loop, zero CPU readback)**.
+  - **Bench 2 (Retired COM Drop Storm, `10,000 × 4 KiB` UPLOAD):** Inline `drop`=`1307.54 ms` (proj `75k`=`9806.6 ms`) vs **Reaper Handoff=`0.1346 ms`** (`bg=1290.43 ms`, **`9,714×`** caller relief) vs **Pooled Ring=`0.0201 ms`**.
+  - **Bench 3 (Host-Copy Coalescing, `32 MiB` = `4,096 × 8 KiB`):** Naive=`6.22 ms` rec / `17.04 ms` wall vs **Coalesced (`32 × 1 MiB`)=`0.064 ms` rec / `0.47 ms` wall (`36.04×`)**.
+  - **Bench 4 (DXR 1.1 BVH4, `64` BLAS + `16,384` TLAS):** BLAS compaction `0.29 → 0.23 MiB`; `16,384`-TLAS rebuild=`0.26 ms` vs `PERFORM_UPDATE` refit=`0.12 ms` (**`2.18×`**).
+  - **Bench 5 (`VirtualDescriptorPager` + `PlacedResource` Aliasing):** `10 × 100k` accesses (`1.25M → 262k`, `737,856` evictions)=**`0.65 ms/frame`** avg; `16` aliased `512×512` `BC1` textures (`64` aliasing barriers)=**`0.042 ms`**.
+  - **Bench 6 (`2,048` Compute Dispatches):** BarrierStorm=`4.87 ms` vs **`ExecuteIndirect`=`1.05 ms` (`4.63×`)** vs DirectNoBarrier=`0.38 ms`.
 - **`bcpack-aaa-demo.exe --benchmark-run --benchmark-secs 60` (`1920×1080` HDR):**
   - **`150.61 FPS` Avg** (`6.64 ms`, `9,026` frames) | **`87.07 FPS` 1% Low** | **`43.37 FPS` 0.1% Low**
   - **Active SFS VRAM:** **`86.2 / 204.7 MiB`** (`118.5 MiB` saved)

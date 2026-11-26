@@ -1,7 +1,7 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
 [![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1%20%2B%20VRS%20Tier2-2f80ed)](sdk/shaders/bcpack_decode.hlsl)
-[![v0.14.1](https://img.shields.io/badge/v0.14.1-BC1%2F3%2F4%2F5%2F6H%2F7%20%7C%2021%2F21%20PASS-ff4081)](#verified-bit-exactness-bcpack-gpu-demo---verify--2121-pass)
+[![v0.15.0](https://img.shields.io/badge/v0.15.0-BatchToTextures%2080x%20%7C%2021%2F21%20PASS-ff4081)](#verified-bit-exactness-bcpack-gpu-demo---verify--2121-pass)
 [![Standalone SDK](https://img.shields.io/badge/Hardware%20SDK-POMXARK%2Fbcpack--gpu--sdk-orange)](https://github.com/POMXARK/bcpack-gpu-sdk)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](sdk/shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](sdk/include/bcpack_gpu.h)
@@ -17,18 +17,18 @@
 
 ---
 
-## What's New in `v0.14.1` — Open-World DX12 Bottleneck Profiling Suite (`--bottleneck-suite`)
+## What's New in `v0.15.0` — Batched Zero-Copy `BcPackDecodeBatchToTextures` & Open-World DX12 Bottleneck Suite
 
-Added [`src/bottleneck_suite.rs`](src/bottleneck_suite.rs) and [`START_BOTTLENECK_SUITE.bat`](START_BOTTLENECK_SUITE.bat) (`bcpack-gpu-demo --bottleneck-suite --report-json bottleneck_report.json`) targeting clean-room open-world Xbox translation bottlenecks (`C-ABI` batching, COM retirement, copy/barrier coalescing, DXR 1.1 BVH4 streaming, descriptor churn, and `ExecuteIndirect`):
+Updated `sdk/` to **`bcpack-gpu-sdk v0.15.0`** and verified all 6 clean-room open-world bottlenecks (`src/bottleneck_suite.rs`, `START_BOTTLENECK_SUITE.bat`) on **Windows 11 + NVIDIA GeForce RTX 5080**:
 
-| Benchmark (`NVIDIA GeForce RTX 5080`, `v0.14.1`) | Baseline / Naive | Optimized Path | Measured Gain |
+| Benchmark (`NVIDIA GeForce RTX 5080`, `v0.15.0`) | Baseline / Naive | Optimized Path | Measured Gain |
 |---|---|---|---|
-| **1. BCPack `16.0 MiB` (`128×512×512 BC1`)** | `BcPackDecodeAsync` loop `2488.32 ms` / `ToTexture2D` sync loop `2495.03 ms` | **`BcPackDecodeBatch`** `42.21 ms` (`kernel=21.29 ms`) | **`58.95×`** (also exposes per-call sync wait inside `ToTexture2D` loop) |
-| **2. Retired COM Drop Storm (`10k × 4 KiB` UPLOAD)** | Inline `drop`: `1503.34 ms` (proj `75k`: `11275.1 ms`) | Background reaper handoff: **`0.1126 ms`** (`bg=1407.44 ms`) / Pooled ring: **`0.0202 ms`** | **`13,351×`** caller relief |
-| **3. Small Host-Copy Coalescing (`32 MiB`)** | `4,096 × 8 KiB` + per-copy barriers: rec `5.30 ms`, wall `15.34 ms` | `32 × 1 MiB` coalesced: rec `0.062 ms`, wall **`0.36 ms`** | **`42.41×`** |
-| **4. DXR 1.1 BVH4 (`64 BLAS + 16,384 TLAS`)** | Full TLAS rebuild `0.32 ms`, pre-compact `0.29 MiB` | Compacted `0.23 MiB`, TLAS `PERFORM_UPDATE` refit **`0.17 ms`** | **`1.91×`** TLAS update |
-| **5. Descriptor Paging + `PlacedResource` Aliasing** | `1.25M → 262k` (`1,000,000` accesses, `737,856` evictions) | **`1.11 ms/frame`** avg; `16` aliased textures / `64` `ALIASING` barriers in **`0.072 ms`** | Clean `S_OK` |
-| **6. `2,048` Compute Dispatches (`bc16_pack`)** | Per-dispatch `uav_barrier` storm: `6.50 ms` | **`ExecuteIndirect`** `0.87 ms` / Direct no-barrier `0.37 ms` | **`7.46×`** (`ExecuteIndirect`) |
+| **1. BCPack `16.0 MiB` (`128×512×512 BC1` -> VRAM Tex2D)** | `BcPackDecodeAsync` loop `2433.03 ms` / `ToTexture2D` sync loop `2505.58 ms` (`6.4 MB/s`) | **`BcPackDecodeBatchToTextures`** **`31.18 ms`** (`513.2 MB/s`, `BcPackDecodeBatch` `39.00 ms`) | **`80.37×`** vs `ToTexture2D` loop |
+| **2. Retired COM Drop Storm (`10k × 4 KiB` UPLOAD)** | Inline `drop`: `1307.54 ms` (proj `75k`: `9806.6 ms`) | Background reaper handoff: **`0.1346 ms`** (`bg=1290.43 ms`) / Pooled ring: **`0.0201 ms`** | **`9,714×`** caller relief |
+| **3. Small Host-Copy Coalescing (`32 MiB`)** | `4,096 × 8 KiB` + per-copy barriers: rec `6.22 ms`, wall `17.04 ms` | `32 × 1 MiB` coalesced: rec `0.064 ms`, wall **`0.47 ms`** | **`36.04×`** |
+| **4. DXR 1.1 BVH4 (`64 BLAS + 16,384 TLAS`)** | Full TLAS rebuild `0.26 ms`, pre-compact `0.29 MiB` | Compacted `0.23 MiB`, TLAS `PERFORM_UPDATE` refit **`0.12 ms`** | **`2.18×`** TLAS update |
+| **5. Descriptor Paging + `PlacedResource` Aliasing** | `1.25M → 262k` (`1,000,000` accesses, `737,856` evictions) | **`0.65 ms/frame`** avg; `16` aliased textures / `64` `ALIASING` barriers in **`0.042 ms`** | Clean `S_OK` |
+| **6. `2,048` Compute Dispatches (`bc16_pack`)** | Per-dispatch `uav_barrier` storm: `4.87 ms` | **`ExecuteIndirect`** `1.05 ms` / Direct no-barrier `0.38 ms` | **`4.63×`** (`ExecuteIndirect`) |
 
 - Also verified `bcpack-gpu-demo.exe --verify`: **`21/21 PASS`** (`0` mismatches, DX12 Debug Layer clean).
 

@@ -1,7 +1,8 @@
 use crate::ffi::{
     bcpack_gpu_create_from_device, bcpack_gpu_destroy, BcPackBatchItem, BcPackDecodeAsync,
-    BcPackDecodeBatch, BcPackDecodeToTexture2D, BcPackGetLastTimingMs, BcPackWaitDirectFence,
-    BCPACK_FORMAT_BC1, BCPACK_SWIZZLE_LINEAR,
+    BcPackDecodeBatch, BcPackDecodeBatchToTextures, BcPackDecodeToTexture2D,
+    BcPackGetLastTimingMs, BcPackTextureBatchItem, BcPackWaitDirectFence, BCPACK_FORMAT_BC1,
+    BCPACK_SWIZZLE_LINEAR,
 };
 use crate::gpu_decoder::{
     buffer_desc, cmd_barriers, create_committed_buffer, heap_props, transition_barrier,
@@ -86,8 +87,11 @@ struct Bench1Report {
     batch_kernel_ms: f64,
     zerocopy_tex2d_wall_ms: f64,
     zerocopy_tex2d_mbs: f64,
+    zerocopy_batch_tex2d_wall_ms: f64,
+    zerocopy_batch_tex2d_mbs: f64,
     batch_speedup: f64,
     zerocopy_speedup: f64,
+    zerocopy_batch_speedup: f64,
 }
 
 fn run_bench1_residency_and_bcpack(ctx: &mut GpuContext) -> Bench1Report {
@@ -307,6 +311,41 @@ fn run_bench1_residency_and_bcpack(ctx: &mut GpuContext) -> Bench1Report {
     assert_eq!(wrc, 0, "BcPackWaitDirectFence failed: {wrc}");
     let zerocopy_tex2d_wall_ms = t_zc.elapsed().as_secs_f64() * 1000.0;
 
+    // Phase 4 (v0.15.0): Batched Zero-Copy BcPackDecodeBatchToTextures (1 compute batch + 1 DIRECT command list + 1 fence)
+    let mut tex_batch_items: Vec<BcPackTextureBatchItem> = (0..CHUNKS)
+        .map(|i| {
+            let s = &encoded_pool[i % encoded_pool.len()];
+            BcPackTextureBatchItem {
+                compressed_data: s.as_ptr(),
+                compressed_size: s.len() as u32,
+                num_blocks: BLOCKS_PER_CHUNK as u32,
+                format: BCPACK_FORMAT_BC1,
+                swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+                width_blocks: 128,
+                height_blocks: 128,
+                dst_texture2d: tex_pool[i % tex_pool.len()].as_raw(),
+                subresource_index: 0,
+                dst_x_blocks: 0,
+                dst_y_blocks: 0,
+                status: 0,
+            }
+        })
+        .collect();
+    let mut batch_tex_fence = 0u64;
+    let t_btex = Instant::now();
+    let btex_ok = unsafe {
+        BcPackDecodeBatchToTextures(
+            ffi_ctx,
+            tex_batch_items.as_mut_ptr(),
+            tex_batch_items.len() as u32,
+            &mut batch_tex_fence,
+        )
+    };
+    assert_eq!(btex_ok, CHUNKS as i32, "BcPackDecodeBatchToTextures failed: {btex_ok}");
+    let bwrc = unsafe { BcPackWaitDirectFence(ffi_ctx, batch_tex_fence, u32::MAX) };
+    assert_eq!(bwrc, 0, "BcPackWaitDirectFence (batch) failed: {bwrc}");
+    let zerocopy_batch_tex2d_wall_ms = t_btex.elapsed().as_secs_f64() * 1000.0;
+
     unsafe {
         bcpack_gpu_destroy(ffi_ctx);
     }
@@ -314,14 +353,16 @@ fn run_bench1_residency_and_bcpack(ctx: &mut GpuContext) -> Bench1Report {
 
     let total_mb = (CHUNKS * CHUNK_OUT_BYTES) as f64 / (1024.0 * 1024.0);
     let zerocopy_tex2d_mbs = total_mb / (zerocopy_tex2d_wall_ms / 1000.0);
+    let zerocopy_batch_tex2d_mbs = total_mb / (zerocopy_batch_tex2d_wall_ms / 1000.0);
     let batch_speedup = async_loop_wall_ms / batch_wall_ms.max(0.001);
     let zerocopy_speedup = async_loop_wall_ms / zerocopy_tex2d_wall_ms.max(0.001);
+    let zerocopy_batch_speedup = zerocopy_tex2d_wall_ms / zerocopy_batch_tex2d_wall_ms.max(0.001);
 
     println!(
         "[bench1] Virtual Pool 4.0 GiB -> 256 MiB: LRU evictions={lru_evictions} (thrash={lru_thrash_reloads}) vs Pareto evictions={pareto_evictions} (thrash={pareto_thrash_reloads})"
     );
     println!(
-        "[bench1] BCPack 16.0 MiB (128x512x512 BC1): AsyncLoop={async_loop_wall_ms:.2}ms | Batch={batch_wall_ms:.2}ms (kernel={batch_kernel_ms:.2}ms, {batch_speedup:.2}x) | ZeroCopyTex2D={zerocopy_tex2d_wall_ms:.2}ms ({zerocopy_tex2d_mbs:.1} MB/s, {zerocopy_speedup:.2}x)"
+        "[bench1] BCPack 16.0 MiB (128x512x512 BC1): AsyncLoop={async_loop_wall_ms:.2}ms | Batch={batch_wall_ms:.2}ms (kernel={batch_kernel_ms:.2}ms, {batch_speedup:.2}x) | ToTex2DLoop={zerocopy_tex2d_wall_ms:.2}ms ({zerocopy_tex2d_mbs:.1} MB/s) | BatchToTex2D={zerocopy_batch_tex2d_wall_ms:.2}ms ({zerocopy_batch_tex2d_mbs:.1} MB/s, {zerocopy_batch_speedup:.2}x vs loop)"
     );
 
     Bench1Report {
@@ -336,8 +377,11 @@ fn run_bench1_residency_and_bcpack(ctx: &mut GpuContext) -> Bench1Report {
         batch_kernel_ms,
         zerocopy_tex2d_wall_ms,
         zerocopy_tex2d_mbs,
+        zerocopy_batch_tex2d_wall_ms,
+        zerocopy_batch_tex2d_mbs,
         batch_speedup,
         zerocopy_speedup,
+        zerocopy_batch_speedup,
     }
 }
 
@@ -1299,7 +1343,7 @@ fn run_bench6_dispatch_vs_indirect(ctx: &mut GpuContext) -> Bench6Report {
 pub fn run_bottleneck_suite(_assets_dir: &Path, report_json: Option<&Path>) {
     let mut ctx = GpuContext::new(false);
     println!(
-        "=== BCPack GPU v0.14.1 Open-World DX12 Bottleneck Suite ===\n[suite] Adapter: {} (VRAM: {} MiB dedicated, {} MiB OS budget)",
+        "=== BCPack GPU v0.15.0 Open-World DX12 Bottleneck Suite ===\n[suite] Adapter: {} (VRAM: {} MiB dedicated, {} MiB OS budget)",
         ctx.adapter_name, ctx.dedicated_vram_mb, ctx.os_vram_budget_mb
     );
 
@@ -1311,7 +1355,7 @@ pub fn run_bottleneck_suite(_assets_dir: &Path, report_json: Option<&Path>) {
     let b6 = run_bench6_dispatch_vs_indirect(&mut ctx);
 
     let json = format!(
-        "{{\n  \"adapter\": \"{}\",\n  \"dedicated_vram_mb\": {},\n  \"os_vram_budget_mb\": {},\n  \"bench1_virtual_pool_bcpack\": {{\n    \"virtual_catalog_gib\": {:.1},\n    \"budget_mib\": {},\n    \"lru_evictions\": {},\n    \"lru_thrash_reloads\": {},\n    \"pareto_evictions\": {},\n    \"pareto_thrash_reloads\": {},\n    \"async_loop_wall_ms\": {:.3},\n    \"batch_wall_ms\": {:.3},\n    \"batch_kernel_ms\": {:.3},\n    \"zerocopy_tex2d_wall_ms\": {:.3},\n    \"zerocopy_tex2d_mbs\": {:.1},\n    \"batch_speedup\": {:.2},\n    \"zerocopy_speedup\": {:.2}\n  }},\n  \"bench2_com_drop_storm\": {{\n    \"objects_count\": {},\n    \"inline_drop_ms\": {:.3},\n    \"reaper_handoff_ms\": {:.4},\n    \"reaper_bg_drain_ms\": {:.3},\n    \"pooled_ring_reset_ms\": {:.4},\n    \"projected_75k_inline_ms\": {:.2},\n    \"handoff_speedup\": {:.1}\n  }},\n  \"bench3_copy_coalescing\": {{\n    \"total_mib\": {},\n    \"naive_copies\": {},\n    \"coalesced_copies\": {},\n    \"naive_cpu_record_ms\": {:.3},\n    \"naive_wall_ms\": {:.3},\n    \"coalesced_cpu_record_ms\": {:.3},\n    \"coalesced_wall_ms\": {:.3},\n    \"speedup\": {:.2}\n  }},\n  \"bench4_dxr_bvh_streaming\": {{\n    \"dxr_supported\": {},\n    \"blas_count\": {},\n    \"instances_count\": {},\n    \"blas_precompact_mib\": {:.3},\n    \"blas_compacted_mib\": {:.3},\n    \"shared_scratch_mib\": {:.3},\n    \"tlas_rebuild_avg_ms\": {:.3},\n    \"tlas_refit_avg_ms\": {:.3},\n    \"refit_speedup\": {:.2}\n  }},\n  \"bench5_descriptor_aliasing\": {{\n    \"virtual_descs\": {},\n    \"physical_slots\": {},\n    \"total_accesses\": {},\n    \"paging_evictions\": {},\n    \"avg_frame_paging_ms\": {:.3},\n    \"aliasing_switches\": {},\n    \"aliasing_wall_ms\": {:.3}\n  }},\n  \"bench6_dispatch_indirect\": {{\n    \"dispatch_count\": {},\n    \"barrier_storm_wall_ms\": {:.3},\n    \"direct_nobarrier_wall_ms\": {:.3},\n    \"execute_indirect_wall_ms\": {:.3},\n    \"indirect_vs_storm_speedup\": {:.2}\n  }}\n}}\n",
+        "{{\n  \"adapter\": \"{}\",\n  \"dedicated_vram_mb\": {},\n  \"os_vram_budget_mb\": {},\n  \"bench1_virtual_pool_bcpack\": {{\n    \"virtual_catalog_gib\": {:.1},\n    \"budget_mib\": {},\n    \"lru_evictions\": {},\n    \"lru_thrash_reloads\": {},\n    \"pareto_evictions\": {},\n    \"pareto_thrash_reloads\": {},\n    \"async_loop_wall_ms\": {:.3},\n    \"batch_wall_ms\": {:.3},\n    \"batch_kernel_ms\": {:.3},\n    \"zerocopy_tex2d_wall_ms\": {:.3},\n    \"zerocopy_tex2d_mbs\": {:.1},\n    \"zerocopy_batch_tex2d_wall_ms\": {:.3},\n    \"zerocopy_batch_tex2d_mbs\": {:.1},\n    \"batch_speedup\": {:.2},\n    \"zerocopy_speedup\": {:.2},\n    \"zerocopy_batch_speedup\": {:.2}\n  }},\n  \"bench2_com_drop_storm\": {{\n    \"objects_count\": {},\n    \"inline_drop_ms\": {:.3},\n    \"reaper_handoff_ms\": {:.4},\n    \"reaper_bg_drain_ms\": {:.3},\n    \"pooled_ring_reset_ms\": {:.4},\n    \"projected_75k_inline_ms\": {:.2},\n    \"handoff_speedup\": {:.1}\n  }},\n  \"bench3_copy_coalescing\": {{\n    \"total_mib\": {},\n    \"naive_copies\": {},\n    \"coalesced_copies\": {},\n    \"naive_cpu_record_ms\": {:.3},\n    \"naive_wall_ms\": {:.3},\n    \"coalesced_cpu_record_ms\": {:.3},\n    \"coalesced_wall_ms\": {:.3},\n    \"speedup\": {:.2}\n  }},\n  \"bench4_dxr_bvh_streaming\": {{\n    \"dxr_supported\": {},\n    \"blas_count\": {},\n    \"instances_count\": {},\n    \"blas_precompact_mib\": {:.3},\n    \"blas_compacted_mib\": {:.3},\n    \"shared_scratch_mib\": {:.3},\n    \"tlas_rebuild_avg_ms\": {:.3},\n    \"tlas_refit_avg_ms\": {:.3},\n    \"refit_speedup\": {:.2}\n  }},\n  \"bench5_descriptor_aliasing\": {{\n    \"virtual_descs\": {},\n    \"physical_slots\": {},\n    \"total_accesses\": {},\n    \"paging_evictions\": {},\n    \"avg_frame_paging_ms\": {:.3},\n    \"aliasing_switches\": {},\n    \"aliasing_wall_ms\": {:.3}\n  }},\n  \"bench6_dispatch_indirect\": {{\n    \"dispatch_count\": {},\n    \"barrier_storm_wall_ms\": {:.3},\n    \"direct_nobarrier_wall_ms\": {:.3},\n    \"execute_indirect_wall_ms\": {:.3},\n    \"indirect_vs_storm_speedup\": {:.2}\n  }}\n}}\n",
         ctx.adapter_name.replace('"', "\\\""),
         ctx.dedicated_vram_mb,
         ctx.os_vram_budget_mb,
@@ -1326,8 +1370,11 @@ pub fn run_bottleneck_suite(_assets_dir: &Path, report_json: Option<&Path>) {
         b1.batch_kernel_ms,
         b1.zerocopy_tex2d_wall_ms,
         b1.zerocopy_tex2d_mbs,
+        b1.zerocopy_batch_tex2d_wall_ms,
+        b1.zerocopy_batch_tex2d_mbs,
         b1.batch_speedup,
         b1.zerocopy_speedup,
+        b1.zerocopy_batch_speedup,
         b2.objects_count,
         b2.inline_drop_ms,
         b2.reaper_handoff_ms,
