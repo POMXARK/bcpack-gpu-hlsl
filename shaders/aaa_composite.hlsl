@@ -12,6 +12,15 @@ cbuffer AaaCompCB : register(b0) {
     float g_SimSpeed;      // 0.00..4.00
     float g_ActiveDrag;    // 0 = none, 1 = FPS, 2 = SIM
     float g_VsyncOn;       // > 0.5 when VSync active
+    // Bundle 1: Pursuit Zero-Copy (BcPackDecodeBatchToTextures) & VirtualDescriptorPager HUD
+    float g_PursuitOn;       // > 0.5 draws top-right Pursuit HUD panel
+    float g_ZcThroughputMbs; // Zero-Copy VRAM streaming MB/s
+    float g_PursuitBatches;  // Total DecodeBatchToTextures batches
+    float g_PagerActiveK;    // Active physical slots in thousands (0..262)
+    float g_PagerEvictPerSec;// Evictions/sec in VirtualDescriptorPager
+    float g_Fps1PctLow;      // Rolling 1% Low FPS
+    float g_WhipPanPulse;    // 0..1 peak during 180-deg whip-pan bursts
+    float g_FormatCount;     // Active BCPack format count (6)
 };
 
 Texture2D<float4>       g_TaaHDR      : register(t0);
@@ -91,6 +100,17 @@ uint hud_glyph_mask(uint ch) {
     if (ch == 26u) return GLYPH5(6u, 5u, 5u, 5u, 6u); // 'D'
     if (ch == 27u) return GLYPH5(5u, 5u, 5u, 5u, 7u); // 'U'
     if (ch == 28u) return GLYPH5(5u, 5u, 7u, 5u, 5u); // 'H'
+    if (ch == 29u) return GLYPH5(6u, 5u, 6u, 5u, 6u); // 'B'
+    if (ch == 30u) return GLYPH5(7u, 4u, 5u, 5u, 7u); // 'G'
+    if (ch == 31u) return GLYPH5(5u, 5u, 6u, 5u, 5u); // 'K'
+    if (ch == 32u) return GLYPH5(7u, 5u, 5u, 5u, 7u); // 'O'
+    if (ch == 33u) return GLYPH5(6u, 5u, 6u, 5u, 5u); // 'R'
+    if (ch == 34u) return GLYPH5(7u, 2u, 2u, 2u, 2u); // 'T'
+    if (ch == 35u) return GLYPH5(5u, 5u, 5u, 7u, 5u); // 'W'
+    if (ch == 36u) return GLYPH5(7u, 1u, 2u, 4u, 7u); // 'Z'
+    if (ch == 37u) return GLYPH5(1u, 1u, 2u, 4u, 4u); // '/'
+    if (ch == 38u) return GLYPH5(5u, 1u, 2u, 4u, 5u); // '%'
+    if (ch == 39u) return GLYPH5(0u, 0u, 7u, 0u, 0u); // '-'
     return 0u;
 }
 
@@ -115,6 +135,21 @@ float draw_uint3(float2 uv, float2 org, float adv, uint val) {
     uint idx = 0u;
     if (h > 0u) { m = max(m, sample_hud_char(uv, org + float2(adv * idx, 0.0), h)); idx++; }
     if (h > 0u || t > 0u) { m = max(m, sample_hud_char(uv, org + float2(adv * idx, 0.0), t)); idx++; }
+    m = max(m, sample_hud_char(uv, org + float2(adv * idx, 0.0), o));
+    return m;
+}
+
+float draw_uint4(float2 uv, float2 org, float adv, uint val) {
+    uint v = min(val, 9999u);
+    uint k = v / 1000u;
+    uint h = (v / 100u) % 10u;
+    uint t = (v / 10u) % 10u;
+    uint o = v % 10u;
+    float m = 0.0;
+    uint idx = 0u;
+    if (k > 0u) { m = max(m, sample_hud_char(uv, org + float2(adv * idx, 0.0), k)); idx++; }
+    if (k > 0u || h > 0u) { m = max(m, sample_hud_char(uv, org + float2(adv * idx, 0.0), h)); idx++; }
+    if (k > 0u || h > 0u || t > 0u) { m = max(m, sample_hud_char(uv, org + float2(adv * idx, 0.0), t)); idx++; }
     m = max(m, sample_hud_char(uv, org + float2(adv * idx, 0.0), o));
     return m;
 }
@@ -270,6 +305,135 @@ float3 composite_hud(float3 bg, float2 uv) {
     return col;
 }
 
+float3 composite_pursuit_hud(float3 bg, float2 uv) {
+    // Top-right frosted HUD panel: x in [0.642, 0.982], y in [0.025, 0.215]
+    static const float2 P_CENTER = float2(0.812, 0.120);
+    static const float2 P_HALF   = float2(0.170, 0.095);
+    float2 aspect = float2(1.7777778, 1.0);
+    float sd_panel = sd_round_box((uv - P_CENTER) * aspect, P_HALF * aspect, 0.014);
+    if (sd_panel > 0.004) {
+        return bg;
+    }
+
+    float panel_alpha = smoothstep(0.002, -0.002, sd_panel);
+    float border_mask = smoothstep(0.004, 0.001, abs(sd_panel));
+    float pulse = saturate(g_WhipPanPulse);
+    float3 col = lerp(bg, bg * 0.22 + float3(0.032, 0.048, 0.075), 0.84 * panel_alpha);
+    float3 bcol = lerp(float3(0.24, 0.62, 0.84), float3(1.0, 0.68, 0.18), pulse);
+    col = lerp(col, bcol, (0.50 + 0.35 * pulse) * border_mask);
+
+    static const float ADV = 0.0068;
+    static const float X0  = 0.658;
+    static const float X1  = 0.966;
+
+    // Row 1: "PURSUIT: 6-FMT GFX10" (or "180 TURN!" accent on right)
+    float t_hdr = 0.0;
+    float2 r1 = float2(X0, 0.042);
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 0.0, 0.0), 14u)); // P
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 1.0, 0.0), 27u)); // U
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 2.0, 0.0), 33u)); // R
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 3.0, 0.0), 15u)); // S
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 4.0, 0.0), 27u)); // U
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 5.0, 0.0), 24u)); // I
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 6.0, 0.0), 34u)); // T
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 7.0, 0.0), 11u)); // :
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 9.0, 0.0), (uint)round(clamp(g_FormatCount, 1.0, 9.0))));
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 10.0, 0.0), 39u)); // -
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 11.0, 0.0), 13u)); // F
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 12.0, 0.0), 18u)); // M
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 13.0, 0.0), 34u)); // T
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 15.0, 0.0), 30u)); // G
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 16.0, 0.0), 13u)); // F
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 17.0, 0.0), 19u)); // X
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 18.0, 0.0), 1u));  // 1
+    t_hdr = max(t_hdr, sample_hud_char(uv, r1 + float2(ADV * 19.0, 0.0), 0u));  // 0
+
+    float t_b = 0.0;
+    float2 bpos = float2(0.922, 0.042);
+    t_b = max(t_b, sample_hud_char(uv, bpos + float2(ADV * 0.0, 0.0), 29u)); // B
+    t_b = max(t_b, sample_hud_char(uv, bpos + float2(ADV * 1.0, 0.0), 11u)); // :
+    t_b = max(t_b, sample_hud_char(uv, bpos + float2(ADV * 2.0, 0.0), 32u)); // O
+    t_b = max(t_b, sample_hud_char(uv, bpos + float2(ADV * 3.0, 0.0), 22u)); // N
+
+    // Row 2: "ZC VRAM: <NNNN> MBS" + cyan throughput bar
+    float t_zc = 0.0;
+    float2 r2 = float2(X0, 0.078);
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 0.0, 0.0), 36u)); // Z
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 1.0, 0.0), 16u)); // C
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 3.0, 0.0), 20u)); // V
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 4.0, 0.0), 33u)); // R
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 5.0, 0.0), 17u)); // A
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 6.0, 0.0), 18u)); // M
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 7.0, 0.0), 11u)); // :
+    t_zc = max(t_zc, draw_uint4(uv, r2 + float2(ADV * 9.0, 0.0), ADV, (uint)round(max(g_ZcThroughputMbs, 0.0))));
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 14.0, 0.0), 18u)); // M
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 15.0, 0.0), 29u)); // B
+    t_zc = max(t_zc, sample_hud_char(uv, r2 + float2(ADV * 16.0, 0.0), 15u)); // S
+
+    float tr1_y = 0.104;
+    float fill_zc = lerp(X0, X1, saturate(g_ZcThroughputMbs / 1500.0));
+    float sd_tr1 = sd_round_box((uv - float2(0.5 * (X0 + X1), tr1_y)) * aspect, float2(0.5 * (X1 - X0), 0.004) * aspect, 0.003);
+    if (sd_tr1 < 0.002) {
+        float m = smoothstep(0.002, -0.001, sd_tr1);
+        float3 tcol = (uv.x <= fill_zc) ? lerp(float3(0.18, 0.82, 0.96), float3(1.0, 0.72, 0.22), pulse) : float3(0.15, 0.20, 0.27);
+        col = lerp(col, tcol, m * 0.92);
+    }
+
+    // Row 3: "PAGER:<NNN>K/262K EV:<NNNN>" + residency gauge bar
+    float t_pg = 0.0;
+    float2 r3 = float2(X0, 0.122);
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 0.0, 0.0), 14u)); // P
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 1.0, 0.0), 17u)); // A
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 2.0, 0.0), 30u)); // G
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 3.0, 0.0), 25u)); // E
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 4.0, 0.0), 33u)); // R
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 5.0, 0.0), 11u)); // :
+    t_pg = max(t_pg, draw_uint3(uv, r3 + float2(ADV * 6.5, 0.0), ADV, (uint)round(clamp(g_PagerActiveK, 0.0, 262.0))));
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 10.0, 0.0), 31u)); // K
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 11.0, 0.0), 37u)); // /
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 12.0, 0.0), 2u));  // 2
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 13.0, 0.0), 6u));  // 6
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 14.0, 0.0), 2u));  // 2
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 15.0, 0.0), 31u)); // K
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 17.5, 0.0), 25u)); // E
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 18.5, 0.0), 20u)); // V
+    t_pg = max(t_pg, sample_hud_char(uv, r3 + float2(ADV * 19.5, 0.0), 11u)); // :
+    t_pg = max(t_pg, draw_uint4(uv, r3 + float2(ADV * 21.0, 0.0), ADV, (uint)round(max(g_PagerEvictPerSec, 0.0))));
+
+    float tr2_y = 0.148;
+    float fill_pg = lerp(X0, X1, saturate(g_PagerActiveK / 262.0));
+    float sd_tr2 = sd_round_box((uv - float2(0.5 * (X0 + X1), tr2_y)) * aspect, float2(0.5 * (X1 - X0), 0.004) * aspect, 0.003);
+    if (sd_tr2 < 0.002) {
+        float m = smoothstep(0.002, -0.001, sd_tr2);
+        float3 tcol = (uv.x <= fill_pg) ? lerp(float3(0.32, 0.92, 0.58), float3(0.96, 0.64, 0.18), pulse) : float3(0.15, 0.20, 0.27);
+        col = lerp(col, tcol, m * 0.92);
+    }
+
+    // Row 4: "FPS:<NNN>  1%LOW:<NNN>"
+    float t_fps = 0.0;
+    float2 r4 = float2(X0, 0.172);
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 0.0, 0.0), 13u)); // F
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 1.0, 0.0), 14u)); // P
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 2.0, 0.0), 15u)); // S
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 3.0, 0.0), 11u)); // :
+    t_fps = max(t_fps, draw_uint3(uv, r4 + float2(ADV * 4.5, 0.0), ADV, (uint)round(max(g_FpsLive, 0.0))));
+
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 10.5, 0.0), 1u));  // 1
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 11.5, 0.0), 38u)); // %
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 12.5, 0.0), 23u)); // L
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 13.5, 0.0), 32u)); // O
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 14.5, 0.0), 35u)); // W
+    t_fps = max(t_fps, sample_hud_char(uv, r4 + float2(ADV * 15.5, 0.0), 11u)); // :
+    t_fps = max(t_fps, draw_uint3(uv, r4 + float2(ADV * 17.0, 0.0), ADV, (uint)round(max(g_Fps1PctLow, 0.0))));
+
+    col = lerp(col, lerp(float3(0.86, 0.96, 1.0), float3(1.0, 0.85, 0.35), pulse), t_hdr);
+    col = lerp(col, float3(0.58, 0.68, 0.78), t_b);
+    col = lerp(col, float3(0.35, 0.92, 1.0), t_zc);
+    col = lerp(col, float3(0.55, 0.96, 0.74), t_pg);
+    col = lerp(col, float3(1.0, 0.92, 0.72), t_fps);
+    return col;
+}
+
 float3 eval_tonemapped(float2 uv, float autoExp) {
     float3 taa = g_TaaHDR.SampleLevel(g_LinClamp, uv, 0.0).rgb;
     float3 bloom = g_BloomTex.SampleLevel(g_LinClamp, uv, 0.0).rgb * g_BloomStrength;
@@ -307,6 +471,9 @@ float4 PSMain(CompPSIn input) : SV_Target {
 
     if (g_HudEnable > 0.5) {
         sharpened = composite_hud(sharpened, input.uv);
+        if (g_PursuitOn > 0.5) {
+            sharpened = composite_pursuit_hud(sharpened, input.uv);
+        }
     }
 
     return float4(sharpened, 1.0);

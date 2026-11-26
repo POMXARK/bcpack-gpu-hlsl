@@ -106,6 +106,7 @@ pub struct AaaDemoConfig {
     pub no_rt_explicit: bool,
     pub no_rtgi_explicit: bool,
     pub vram_budget_explicit: bool,
+    pub pursuit_stress: bool,
 }
 
 impl Default for AaaDemoConfig {
@@ -143,6 +144,7 @@ impl Default for AaaDemoConfig {
             no_rt_explicit: false,
             no_rtgi_explicit: false,
             vram_budget_explicit: false,
+            pursuit_stress: false,
         }
     }
 }
@@ -197,6 +199,7 @@ struct WindowState {
     sfs_enabled: bool,
     vrs_enabled: bool,
     vrs_supported: bool,
+    pursuit_enabled: bool,
     cam_mode: u32, // 0=Showroom 3/4 Orbit, 1=Chase Drive, 2=Free Cam
     fps_cap: u32,  // 0 = MAX/VSync, 15..=300 = capped FPS
     sim_speed: f32,
@@ -480,6 +483,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             x if x == b'F' as u32 => st.sfs_enabled = !st.sfs_enabled,
             x if x == b'R' as u32 => st.rt_enabled = !st.rt_enabled,
             x if x == b'G' as u32 => st.rtgi_enabled = !st.rtgi_enabled,
+            x if x == b'B' as u32 => st.pursuit_enabled = !st.pursuit_enabled,
             x if x == b'K' as u32 && st.vrs_supported => st.vrs_enabled = !st.vrs_enabled,
             x if x == b'C' as u32 => st.cam_mode = (st.cam_mode + 1) % 3,
             x if x == b'H' as u32 => st.hud_visible = !st.hud_visible,
@@ -1742,7 +1746,7 @@ impl AaaPostPipeline {
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 12 },
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 20 },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
@@ -1878,7 +1882,7 @@ impl AaaPostPipeline {
         sun_screen_dir: [f32; 2],
         jitter_ndc: [f32; 2],
         time: f32,
-        hud: [f32; 8],
+        hud: [f32; 16],
     ) {
         let srv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let gpu_base = main_srv_heap.GetGPUDescriptorHandleForHeapStart();
@@ -2161,8 +2165,10 @@ impl AaaPostPipeline {
             0.12f32, 0.35f32, 1.0f32, time,
             hud[0], hud[1], hud[2], hud[3],
             hud[4], hud[5], hud[6], hud[7],
+            hud[8], hud[9], hud[10], hud[11],
+            hud[12], hud[13], hud[14], hud[15],
         ];
-        cmd.SetGraphicsRoot32BitConstants(0, 12, comp_cb.as_ptr() as *const c_void, 0);
+        cmd.SetGraphicsRoot32BitConstants(0, 20, comp_cb.as_ptr() as *const c_void, 0);
         cmd.SetGraphicsRootDescriptorTable(1, gpu_at(101 + cur * 3));
         cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmd.DrawInstanced(3, 1, 0, 0);
@@ -2349,6 +2355,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             sfs_enabled: eff_budget_mb > 0,
             vrs_enabled: eff_vrs,
             vrs_supported: ctx.vrs_tier2,
+            pursuit_enabled: cfg.pursuit_stress,
             cam_mode: 0,
             fps_cap: cfg.fps_cap,
             sim_speed: cfg.sim_speed.clamp(0.0, 4.0),
@@ -3006,6 +3013,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
         let budget_bytes = eff_budget_mb * 1024 * 1024;
         let mut residency = SfsResidencyManager::new(&pack.textures, budget_bytes);
+        let mut pursuit = crate::pursuit_streamer::PursuitStreamer::new(&mut ctx);
         // Kickstart initial Mip-0 stream with hero car paint & 4K road asphalt before first frame SFS feedback arrives
         for seed_idx in [
             pack.asphalt_tex[0] as usize,
@@ -3106,7 +3114,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             pack.total_bcpack_bytes as f64 / (1024.0 * 1024.0),
             eff_budget_mb
         );
-        println!("  Controls: [H] HUD Sliders | [K] VRS Tier2 | [/] FPS | -/= Sim | [P] Pause | [T] Flush | [V] X-Ray | [F] SFS | [L] VSync | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Cam | [ESC] Quit");
+        println!("  Controls: [B] Pursuit Zero-Copy | [H] HUD Sliders | [K] VRS Tier2 | [/] FPS | -/= Sim | [P] Pause | [T] Flush | [V] X-Ray | [F] SFS | [L] VSync | [SPACE] GPU/CPU | [R] DXR | [G] RTGI | [C] Cam | [ESC] Quit");
 
         let mut frame_fences = [0u64; 2];
         let mut frame_count: u32 = 0;
@@ -3128,6 +3136,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let mut bench_sum_vis_tris = 0u64;
         let mut bench_sum_hiz_tris = 0u64;
         let mut bench_flushed = false;
+        let mut prev_pursuit_whip = false;
 
         if let Some(ref dir) = cfg.record_dir {
             let _ = std::fs::create_dir_all(dir);
@@ -3209,7 +3218,34 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 }
             }
 
-            // Camera positioning
+            // Camera positioning & Bundle 1 Pursuit trajectory (70 m/s corridor + 180-deg whip-pans every 2.75s)
+            let cycle_pos = (t_sec % 2.75) / 2.75;
+            let cycle_idx = (t_sec / 2.75).floor() as u32;
+            let whip_u = if cycle_pos >= 0.84 {
+                ((cycle_pos - 0.84) / 0.16).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let whip_pan_active = wstate.pursuit_enabled && whip_u > 0.0;
+            let whip_pan_pulse = if whip_pan_active {
+                (whip_u * std::f32::consts::PI).sin()
+            } else {
+                0.0
+            };
+            if whip_pan_active && !prev_pursuit_whip && wstate.sfs_enabled {
+                residency.flush_to_clay();
+            }
+            prev_pursuit_whip = whip_pan_active;
+
+            pursuit.tick_frame(
+                &ctx.device,
+                &ctx.queue,
+                raw_dt_ms,
+                whip_pan_active,
+                whip_pan_pulse,
+                wstate.pursuit_enabled,
+            );
+
             let speed = if (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 { 24.0 } else { 8.0 };
             if wstate.cam_mode == 2 {
                 let fwd = [free_yaw.sin(), 0.0, free_yaw.cos()];
@@ -3245,7 +3281,16 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             }
 
             let hero_model = Mat4::translation(0.0, 0.0, 0.0).mul(&Mat4::rotate_y(2.42));
-            let (cam_pos, cam_target) = if cfg.benchmark_run {
+            let (cam_pos, cam_target) = if wstate.pursuit_enabled && !cfg.benchmark_run && wstate.cam_mode != 2 {
+                let s_smooth = whip_u * whip_u * (3.0 - 2.0 * whip_u);
+                let base_yaw = if (cycle_idx & 1) == 0 { 0.0 } else { std::f32::consts::PI };
+                let yaw = base_yaw + s_smooth * std::f32::consts::PI;
+                let z = -35.0 + (t_sec * 70.0).rem_euclid(145.0);
+                let x = -2.0 + (t_sec * 1.45).sin() * 3.8;
+                let y = 2.4 + (t_sec * 2.1).cos() * 0.45;
+                let fwd = [yaw.sin(), -0.05, yaw.cos()];
+                ([x, y, z], [x + fwd[0] * 26.0, y + fwd[1] * 26.0, z + fwd[2] * 26.0])
+            } else if cfg.benchmark_run {
                 let p = (t_sec / cfg.benchmark_secs.max(2.0)).clamp(0.0, 1.0);
                 if p < 0.33 {
                     let s = p / 0.33;
@@ -3787,6 +3832,7 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             };
             cmd_barriers(cmd, vec![transition_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
 
+            let pt = &pursuit.telemetry;
             let hud_cb = [
                 if wstate.hud_visible { 1.0f32 } else { 0.0f32 },
                 fps_to_norm(wstate.fps_cap),
@@ -3796,6 +3842,14 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 wstate.sim_speed,
                 wstate.drag_slider as f32,
                 if wstate.vsync_enabled { 1.0f32 } else { 0.0f32 },
+                if wstate.pursuit_enabled { 1.0f32 } else { 0.0f32 },
+                pt.throughput_mbs as f32,
+                pt.total_batches as f32,
+                (pt.pager_active_slots as f32) / 1000.0,
+                pt.pager_evictions_per_sec as f32,
+                pt.fps_1pct_low,
+                pt.whip_pan_pulse,
+                6.0f32,
             ];
             post.run_post_and_composite(
                 cmd,
@@ -4033,12 +4087,24 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 } else {
                     String::new()
                 };
+                let pursuit_str = if wstate.pursuit_enabled {
+                    format!(
+                        " | PURSUIT ZC:{:.0}MB/s Pager:{}K/262K Ev:{:.0}/s 1%Low:{:.1}",
+                        pursuit.telemetry.throughput_mbs,
+                        pursuit.telemetry.pager_active_slots / 1000,
+                        pursuit.telemetry.pager_evictions_per_sec,
+                        pursuit.telemetry.fps_1pct_low,
+                    )
+                } else {
+                    String::new()
+                };
                 let title = format!(
-                    "BCPack AAA v0.11.0 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x) | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
+                    "BCPack AAA v0.15.1 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x){} | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
                     mode_str,
                     fps_val,
                     cap_str,
                     wstate.sim_speed,
+                    pursuit_str,
                     render_w,
                     render_h,
                     out_w,
@@ -4120,6 +4186,9 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                         residency.total_mip0_tiles(),
                         last_decode_ms
                     );
+                    if wstate.pursuit_enabled {
+                        pursuit.log_summary();
+                    }
                     break;
                 }
             }

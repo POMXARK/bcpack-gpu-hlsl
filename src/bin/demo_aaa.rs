@@ -94,6 +94,7 @@ fn main() {
             }
             "--show-hud" => cfg.show_hud = Some(true),
             "--no-hud" => cfg.show_hud = Some(false),
+            "--pursuit-stress" => cfg.pursuit_stress = true,
             other => {
                 eprintln!("Unknown flag '{other}'");
                 std::process::exit(2);
