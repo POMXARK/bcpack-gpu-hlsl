@@ -1,9 +1,35 @@
-# bcpack-gpu-hlsl v0.12.0 — Full BC7 (Modes 0–7) + BC3/4/5, TAAU + VRS Tier 2 и субмодуль `sdk/` (21/21 PASS)
+# bcpack-gpu-hlsl v0.15.4 — Стенды эмуляции UMA (`82.1×`), живой режим `2 → 65 FPS`, `--pursuit-stress` и `sdk/` (21/21 PASS)
+
+[![Mentioned in Awesome GTA6 Reverse Engineering](https://awesome.re/mentioned-badge.svg)](https://github.com/Ahmet-Dedeler/awesome-gta6-reverse-engineering)
 
 > **Отдельный аппаратный SDK без демо-сцен:** [`bcpack_gpu.dll`](https://github.com/POMXARK/bcpack-gpu-sdk), [`bcpack_gpu.h`](sdk/include/bcpack_gpu.h), базовые Compute HLSL/DXIL-ядра и прекомпилированный **Vulkan 1.3 SPIR-V** вынесены в чистый репозиторий **[`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk)** и подключены сюда через Git-субмодуль [`sdk/`](sdk) (`git clone --recursive`).
 
 ![Живой 4-режимный прогон AAA-бенчмарка (60 / 120 / 240 / Unlimited MAX > 450 FPS на RTX 5080)](media/aaa_benchmark_4modes.gif)
 - **Full HD (`1920×1080`) видео:** [`60 FPS MP4`](media/aaa_benchmark_60fps.mp4) | [`120 FPS MP4`](media/aaa_benchmark_120fps.mp4) | [`240 FPS MP4`](media/aaa_benchmark_240fps.mp4) | [`Без лимита (MAX) MP4`](media/aaa_benchmark_unlimited.mp4) | [`Обзор 3 актов`](media/aaa_showcase_v8.gif)
+
+---
+
+## Что нового в v0.15.4 — Стенды эмуляции UMA (`82.1×`), живой `--uma-stress` (`2 → 65 FPS`) и `--pursuit-stress`
+
+Добавлен чистый open-source стенд ([`src/uma_stress.rs`](src/uma_stress.rs)), воспроизводящий на синтетических ресурсах 4 ключевых узких места трансляции общей памяти (UMA) консолей Xbox Series X|S → PC DX12 (проверено на **Windows 11 + NVIDIA GeForce RTX 5080**, **DX12 Debug Layer: 0 ошибок**):
+
+- **Headless-бенчмарк (`bcpack-gpu-demo.exe --uma-emulation-bench --report-json uma_emulation_report.json` / `START_UMA_EMULATION_BENCH.bat`):** **`510.727 мс → 6.219 мс`** (**ускорение `82.13×`** по сумме всех 4 подсистем с побайтной проверкой).
+- **Живой 3D-режим в городе (`bcpack-aaa-demo.exe --uma-stress --no-vsync --show-hud` / `START_UMA_STRESS.bat`, клавиши `[U]` и `[1]..[4]`):** искусственно воспроизводит просадку до **`2 FPS` (`507.1 мс/кадр`)** в реальном AAA-городе и возвращает **`65 FPS` (`8.7 мс/кадр`)** при включении оптимизаций `[1]..[4]`.
+
+| Подсистема (`--uma-emulation-bench`, RTX 5080) | Наивный путь (тормоз эмуляции) | Оптимизированный путь (`[1]..[4]`) | Headless До → После | Ускорение | Живой `--uma-stress` |
+|---|---|---|---:|---:|---:|
+| **[1] Watch + Static Skip + GPU Gfx10 Detile** | `MEM_WRITE_WATCH` + CPU-детйлинг `2 000 × 256×256` текстур (`1 900` статичных + `100` динамических) | Пропуск статичных + GPU `DEFAULT`-кэш + [`uma_gfx10_detile.hlsl`](shaders/uma_gfx10_detile.hlsl) | `489.676 → 3.226 мс` | **`151.79×`** (`byte_exact=true`) | `475.0 → 6.7 мс` |
+| **[2] 1M Descriptor Heap + Compute Scatter** | CPU-скан `1 000 000` слотов (`64 MiB`) + `4 487` разрозненных копирований | Компактный список патчей + Compute [`uma_scatter_patch.hlsl`](shaders/uma_scatter_patch.hlsl) (`1 499` патчей) | `19.013 → 2.009 мс` | **`9.46×`** (`byte_exact=true`) | `9.0 → 1.0 мс` |
+| **[3] 8-поточная запись + Hazard Journals** | Однопоточная запись и жёсткие барьеры (`64` скиннинг CS + `3 500` draws) | Параллельная запись на `8` воркерах + по-ресурсные hazard-журналы ([`uma_skin_cs.hlsl`](shaders/uma_skin_cs.hlsl)) | `1.747 → 0.786 мс` | **`2.22×`** (`64/64` × 30 к.) | `1.6 → 0.7 мс` |
+| **[4] 128 MiB Working Set: PCIe vs GDDR7** | Чтение `128 MiB` геометрии с шины PCIe из `UPLOAD`-хипа | Перенос рабочего набора в локальную GDDR7 `DEFAULT` ([`uma_workingset.hlsl`](shaders/uma_workingset.hlsl)) | `1.216 → 0.311 мс` wall (`0.292 → 0.198 мс` GPU) | **`1.48×`** GPU | **`21.5 → 0.3 мс`** (`71.7×`) |
+| **Итого по 4 подсистемам** | Все 4 тормоза включены | Все 4 модуля `[1]+[2]+[3]+[4]` | **`510.727 → 6.219 мс`** | **`82.13×`** | **`2 FPS (507.1 мс) → 65 FPS (8.7 мс)`** |
+
+![Живой стенд --uma-stress без оптимизаций: 2 FPS (507.1 ms/frame) на RTX 5080](media/uma_city_naive.png)
+
+![Живой стенд --uma-stress с модулями [1]..[4]: 65 FPS (8.7 ms/frame) на RTX 5080](media/uma_city_opt.png)
+
+### Режим `--pursuit-stress` (`v0.15.2–v0.15.3` — клавиша `[B]` / `START_PURSUIT_STRESS.bat`)
+- **Асинхронный zero-copy стриминг 6 форматов ([`src/pursuit_streamer.rs`](src/pursuit_streamer.rs)):** потоковая декомпрессия **всех 6 GPU-форматов (`BC1`, `BC3`, `BC4`, `BC5`, `BC6H`, `BC7`) + `GFX10 SW_64KB_D`** тайлами по `1 024` блока (`128×128 px`, `144` cruise / `192` whip тайла за волну) через `BcPackDecodeBatchToTextures`, двубуферное кольцо поколений на меж-очередных `ID3D12Fence` без пузырей, inline-обновление TLAS и живой HUD счётчиков `VirtualDescriptorPager` (`1.25M → 262K`).
 
 ---
 

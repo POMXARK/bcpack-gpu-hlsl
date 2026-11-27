@@ -1,7 +1,8 @@
 # bcpack-gpu-hlsl — Clean-Room Xbox Series BCPack (MDU rANS) Decoder in DirectX 12 HLSL SM 6.6
 
 [![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20MeshShaders%20%2B%20DXR%201.1%20%2B%20VRS%20Tier2-2f80ed)](sdk/shaders/bcpack_decode.hlsl)
-[![v0.15.0](https://img.shields.io/badge/v0.15.0-BatchToTextures%2080x%20%7C%2021%2F21%20PASS-ff4081)](#verified-bit-exactness-bcpack-gpu-demo---verify--2121-pass)
+[![v0.15.4](https://img.shields.io/badge/v0.15.4-UMA%2082.1x%20%7C%20BatchToTextures%2080x%20%7C%2021%2F21%20PASS-ff4081)](#whats-new-in-v0154--clean-room-uma-emulation-suite-821-live-2--65-fps--pursuit-stress)
+[![Mentioned in Awesome GTA6 Reverse Engineering](https://awesome.re/mentioned-badge.svg)](https://github.com/Ahmet-Dedeler/awesome-gta6-reverse-engineering)
 [![Standalone SDK](https://img.shields.io/badge/Hardware%20SDK-POMXARK%2Fbcpack--gpu--sdk-orange)](https://github.com/POMXARK/bcpack-gpu-sdk)
 [![BC7 16-Lane](https://img.shields.io/badge/BC7%20rANS-6.02%20GB%2Fs%20(32%2F32)-9b59b6)](sdk/shaders/bcpack_bc7_rans.hlsl)
 [![C-ABI DLL](https://img.shields.io/badge/FFI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](sdk/include/bcpack_gpu.h)
@@ -14,6 +15,30 @@
 
 > Want only the lightweight, zero-bloat C-ABI DLL (`bcpack_gpu.dll`), `bcpack_gpu.h`, HLSL/DXIL compute kernels, and **Vulkan 1.3 SPIR-V (`.spv`)** binaries? Use **[`POMXARK/bcpack-gpu-sdk`](https://github.com/POMXARK/bcpack-gpu-sdk)** directly!
 > Clean-room implementation (`MIT OR Apache-2.0`) using **100% open synthetic and procedurally generated `.bcpack` assets** — zero copyrighted or proprietary game data. AI/LLM spec: [`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md) & [`llms.txt`](llms.txt).
+
+---
+
+## What's New in `v0.15.4` — Clean-Room UMA Emulation Suite (`82.1×`, Live `2 → 65 FPS`) & Pursuit Stress
+
+Added an open, 100% synthetic reproduction and optimization testbed ([`src/uma_stress.rs`](src/uma_stress.rs)) for the four primary Unified Memory Architecture (UMA) emulation bottlenecks in Xbox Series X|S → PC DX12 translation layers, verified on **Windows 11 + NVIDIA GeForce RTX 5080** (`DX12 Debug Layer: 0 errors`):
+
+- **Headless Benchmark (`bcpack-gpu-demo.exe --uma-emulation-bench --report-json uma_emulation_report.json` / `START_UMA_EMULATION_BENCH.bat`):** **`510.727 ms → 6.219 ms`** (**`82.13×` speedup** across all 4 subsystems, bit/byte-exact verification).
+- **Interactive Live 3D City Mode (`bcpack-aaa-demo.exe --uma-stress --no-vsync --show-hud` / `START_UMA_STRESS.bat`, toggle `[U]` + `[1]..[4]`):** Reproduces a realistic `507.1 ms/frame` (**`2 FPS`**) stall inside the live AAA 3D city and recovers to **`8.7 ms/frame` (`65 FPS`)** when all four optimizations are toggled on.
+
+| Subsystem (`--uma-emulation-bench`, RTX 5080) | Naive Path (Emulation Bottleneck) | Optimized Path (`[1]..[4]`) | Headless Naive → Opt | Headless Gain | Live `--uma-stress` |
+|---|---|---|---:|---:|---:|
+| **[1] Watch + Static Skip + GPU Gfx10 Detile** | `MEM_WRITE_WATCH` + CPU detile across `2,000 × 256×256` textures (`1,900` static + `100` dynamic) | Static skip + persistent GPU `DEFAULT` residency + inline [`uma_gfx10_detile.hlsl`](shaders/uma_gfx10_detile.hlsl) | `489.676 ms → 3.226 ms` | **`151.79×`** (`byte_exact=true`) | `475.0 ms → 6.7 ms` |
+| **[2] 1M Descriptor Heap + Compute Scatter** | CPU scan over `1,000,000` (`64 MiB`) descriptor slots + `4,487` scattered copies | Compact dirty list + 1× GPU Compute [`uma_scatter_patch.hlsl`](shaders/uma_scatter_patch.hlsl) (`1,499` patches) | `19.013 ms → 2.009 ms` | **`9.46×`** (`byte_exact=true`) | `9.0 ms → 1.0 ms` |
+| **[3] 8-Thread Recording + Hazard Journals** | Single-thread recording + conservative barriers across `64` skin CS + `3,500` draws | 8-worker parallel command recording + per-resource hazard journals ([`uma_skin_cs.hlsl`](shaders/uma_skin_cs.hlsl)) | `1.747 ms → 0.786 ms` | **`2.22×`** (`64/64` × 30f) | `1.6 ms → 0.7 ms` |
+| **[4] 128 MiB Working Set Placement** | Streaming `128 MiB` vertex/index working set from PCIe `UPLOAD` heap | Promoted into resident GDDR7 `DEFAULT` heap ([`uma_workingset.hlsl`](shaders/uma_workingset.hlsl)) | `1.216 ms → 0.311 ms` wall (`0.292 → 0.198 ms` GPU) | **`1.48×`** GPU | **`21.5 ms → 0.3 ms`** (`71.7×`) |
+| **Combined UMA Suite Total** | All 4 bottlenecks active | All 4 optimizations `[1]+[2]+[3]+[4]` active | **`510.727 ms → 6.219 ms`** | **`82.13×`** | **`2 FPS (507.1 ms) → 65 FPS (8.7 ms)`** |
+
+![Clean-Room --uma-stress Naive Baseline: 2 FPS (507.1 ms/frame) on RTX 5080](media/uma_city_naive.png)
+
+![Clean-Room --uma-stress Optimized [1]..[4]: 65 FPS (8.7 ms/frame) on RTX 5080](media/uma_city_opt.png)
+
+### Open-World Pursuit Stress (`v0.15.2–v0.15.3` — `--pursuit-stress` / `[B]` / `START_PURSUIT_STRESS.bat`)
+- **Async 6-Format Zero-Copy Pipeline ([`src/pursuit_streamer.rs`](src/pursuit_streamer.rs)):** Streams console-style `1,024`-block (`128×128 px`) tiles across **all 6 GPU block formats (`BC1`, `BC3`, `BC4`, `BC5`, `BC6H`, `BC7`) + `GFX10 SW_64KB_D`** (`144` cruise / `192` whip tiles per wave) using dedicated thread `BcPackDecodeBatchToTextures` decompression, double-buffered two-generation GPU-GPU fence ping-pong (`render_queue.Wait(&direct_fence, ready_fence)`), inline TLAS refit, and live `VirtualDescriptorPager` (`1.25M → 262K`) HUD counters.
 
 ---
 
@@ -90,6 +115,7 @@ Built for 8 GB / budget GPUs (`RTX 3060 / 4060 / RX 6600 / iGPU`) alongside high
 | **Textured DXR 1.1 + TAA/AgX/CAS** | Flat instance reflections, specular aliasing, RTGI noise shimmer | `RtInstMeta` (`t34`) ray-hit UV sampling + 4-pass A-Trous + YCoCg TAA + AgX Filmic | **`150.61 FPS` Avg** (`1080p` HDR, 60s benchmark) | [`aaa_pbr.hlsl`](shaders/aaa_pbr.hlsl), [`aaa_taa.hlsl`](shaders/aaa_taa.hlsl), [`aaa_composite.hlsl`](shaders/aaa_composite.hlsl) |
 | **Zero-Copy C-ABI & Vulkan SPIR-V** | Cross-process copies; Vulkan 1.3/Linux Proton shaders needed (`OpenScarlett`) | `bcpack_gpu_create_from_device`, `BcPackDecodeToTexture2D`, official DXC `-spirv` | **0 CPU readback**, 9 Vulkan 1.3 `.spv` kernels | [`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`compile_spirv.sh`](shaders/compile_spirv.sh) |
 | **Compute `RayQuery` RTGI + TAAU + VRS Tier 2** | 8 GB / RDNA2 GPUs (`RTX 3060/4060`, `RX 6600`) stalled by PS RTGI quads + 1080p SFS | Cross-vendor `[numthreads(8,8,1)]` `VK_KHR_ray_query` CS, 5-tap TAAU, `16×16` VRS (`[K]`), SFS hysteresis | **`196.8 FPS`** Ultra CS RTGI, **`258.9 FPS`** (`420.6 Peak`) +VRS, **`551.5 FPS`** Low | [`aaa_rtgi_cs.hlsl`](shaders/aaa_rtgi_cs.hlsl), [`aaa_vrs.hlsl`](shaders/aaa_vrs.hlsl), [`aaa_taa.hlsl`](shaders/aaa_taa.hlsl) |
+| **4-Subsystem UMA Emulation Suite (`v0.15.4`)** | `MEM_WRITE_WATCH` + CPU detile, `1M` slot scans, single-thread draw hazards, PCIe working-set spillover | Static skip + GPU Gfx10 detile, Compute scatter patch, 8-worker recording + hazard journals, GDDR7 placement | **`82.13×`** headless (`510.73 → 6.219 ms`), live **`2 → 65 FPS`** (`151.8×` detile) | [`uma_stress.rs`](src/uma_stress.rs), [`uma_gfx10_detile.hlsl`](shaders/uma_gfx10_detile.hlsl), [`uma_scatter_patch.hlsl`](shaders/uma_scatter_patch.hlsl) |
 
 ---
 
