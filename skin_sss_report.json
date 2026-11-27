@@ -1,0 +1,39 @@
+{
+  "adapter": "NVIDIA GeForce RTX 5080",
+  "resolution": [1280, 720],
+  "t1_wave32_nan_inf": {
+    "total_pixels": 921600,
+    "nan_pixels_naive": 96025,
+    "inf_pixels_naive": 2881,
+    "nan_pixels_opt": 0,
+    "inf_pixels_opt": 0,
+    "gpu_pass_ms_naive": 31.598,
+    "gpu_pass_ms_opt": 1.527,
+    "naive_png": "media\\skin_sss_naive.png",
+    "opt_png": "media\\skin_sss_opt.png"
+  },
+  "t2_pso_skin_priority": {
+    "total_draws": 120,
+    "dropped_draws_naive": 48,
+    "dropped_skin_draws_naive": 48,
+    "dropped_pct_naive": 40.00,
+    "dropped_draws_opt": 0,
+    "dropped_skin_draws_opt": 0,
+    "dropped_pct_opt": 0.00,
+    "fallback_skin_ubershader_used": 0
+  },
+  "t3_keepshown_dirty_scatter": {
+    "mip_frames": 64,
+    "zero_read_frames_naive": 24,
+    "zero_read_frames_opt": 0,
+    "heap_slots": 1000000,
+    "dirty_slots": 1024,
+    "naive_linear_scan_ms": 9.8034,
+    "opt_bitmap_avx2_ms": 0.5854,
+    "opt_gpu_scatter_ms": 0.3610,
+    "scan_speedup": 16.75,
+    "gpu_readback_verified_slots": 1024
+  },
+  "dx12_debug_errors": 0,
+  "dx12_debug_messages": []
+}

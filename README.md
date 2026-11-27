@@ -18,6 +18,22 @@
 
 ---
 
+## What's New — Clean-Room `--skin-sss-stress` Wave32 & Subsurface Scattering Bench + SDK Primitives
+
+Added a clean-room dual-bust DX12 benchmark suite ([`src/skin_sss_stress.rs`](src/skin_sss_stress.rs), `START_SKIN_SSS_STRESS.bat`) plus portable primitives in `bcpack-gpu-sdk` ([`sdk/src/primitives.rs`](sdk/src/primitives.rs), [`sdk/shaders/scatter_patch.hlsl`](sdk/shaders/scatter_patch.hlsl), [`sdk/shaders/wave32_nan_guard.hlsli`](sdk/shaders/wave32_nan_guard.hlsli)), verified on **Windows 11 + NVIDIA GeForce RTX 5080** (`DX12 Debug Layer: 0 errors`):
+
+- **`[T1]` Wave32 `NaN`/`Inf` Guard & Cross-Lane Read (`1280×720` `R16G16B16A16_FLOAT` HDR → Bloom → ACES ToneMap):**
+  - Naive Wave64→Wave32 shader causes thin-rim `+Inf` HDR bloom blowout (`2,881` `Inf` pixels) on the left bust and unguarded `WaveActiveBallot.y` / `WaveReadLaneAt(lane+32)` `qNaN` black crush (`96,025` `NaN` pixels) on the right bust's skin & hair while crisp opaque eyes, jewelry, and straps keep drawing (`31.598 ms`).
+  - With `Wave32NanGuard` (`Wave32SafeReadLane64` + `Wave32SanitizeFloat4`), both busts render clean subsurface skin and hair in **`1.527 ms`** with **`0` `NaN`** and **`0` `Inf`** pixels verified by GPU readback ([`skin_sss_report.json`](skin_sss_report.json)).
+- **`[T2]` Heavy SSS PSO Queue Scheduling (`120` cold draws: `60` env + `60` skin/hair):** Naive FIFO exhausts the non-blocking compile budget on env PSOs and drops **`48/120` (`40.00%`, all `48` skin draws)**; **`SkinPriority`** + pre-compiled `HybridFallbackSkin` drops **`0/120` (`0.00%`)**.
+- **`[T3]` Mip-Slot Streaming `KeepShown` + 1M-Slot Dirty-Bitmap AVX2 + `GpuScatterPatcher`:** Retaining the coarse mip eliminates unready mip zero-reads (**`24/64 → 0/64` frames**), while `HierarchicalDirtyBitmap` + `diff_dirty_pages_64b` (`9.8034 ms → 0.5854 ms`, **`16.75×`**) + `GpuScatterPatcher` (**`0.3610 ms`** GPU) patch `1,024/1,024` scattered `64B` slots in a `1,000,000`-slot (`64 MiB`) `DEFAULT` heap with bit-exact GPU readback.
+
+![Clean-Room --skin-sss-stress Naive Wave32 Baseline: +Inf Blowout & qNaN Black Skin Crush](media/skin_sss_naive.png)
+
+![Clean-Room --skin-sss-stress Optimized Wave32NanGuard: Clean SSS Skin & Hair (0 NaN, 0 Inf)](media/skin_sss_opt.png)
+
+---
+
 ## What's New in `v0.15.4` — Clean-Room UMA Emulation Suite (`82.1×`, Live `2 → 65 FPS`) & Pursuit Stress
 
 Added an open, 100% synthetic reproduction and optimization testbed ([`src/uma_stress.rs`](src/uma_stress.rs)) for the four primary Unified Memory Architecture (UMA) emulation bottlenecks in Xbox Series X|S → PC DX12 translation layers, verified on **Windows 11 + NVIDIA GeForce RTX 5080** (`DX12 Debug Layer: 0 errors`):

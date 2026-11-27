@@ -1351,6 +1351,7 @@ fn main() {
     let do_bottleneck_suite = args.iter().any(|a| a == "--bottleneck-suite");
     let do_uma_bench = args.iter().any(|a| a == "--uma-emulation-bench");
     let do_pso_bench = args.iter().any(|a| a == "--pso-compile-bench");
+    let do_skin_sss = args.iter().any(|a| a == "--skin-sss-stress");
     let do_demo = args.iter().any(|a| a == "--demo");
     let do_jet_flight = args.iter().any(|a| a == "--jet-flight" || a == "--rage-stress");
     let regen_assets = args.iter().any(|a| a == "--regen-assets");
@@ -1370,6 +1371,7 @@ fn main() {
     let mut chunks = 256usize;
     let mut measure_frames: Option<u32> = None;
     let mut report_json: Option<PathBuf> = None;
+    let mut screenshot_dir: Option<PathBuf> = None;
     let mut assets_dir = PathBuf::from("assets");
     let mut i = 1;
     while i < args.len() {
@@ -1400,13 +1402,16 @@ fn main() {
         } else if args[i] == "--report-json" && i + 1 < args.len() {
             report_json = Some(PathBuf::from(&args[i + 1]));
             i += 2;
+        } else if args[i] == "--screenshot-dir" && i + 1 < args.len() {
+            screenshot_dir = Some(PathBuf::from(&args[i + 1]));
+            i += 2;
         } else {
             i += 1;
         }
     }
 
-    if !do_verify && !do_bench && !do_bottleneck_suite && !do_uma_bench && !do_pso_bench && !do_demo && !do_jet_flight {
-        println!("Usage: bcpack-gpu-demo [--verify] [--bench] [--bottleneck-suite] [--uma-emulation-bench] [--pso-compile-bench] [--debug] [--report-json <out.json>] [--jet-flight] [--demo] [--chunks N] [--world-stream] [--vram-cap-mb N] [--measure-frames N] [--assets-dir <dir>] [--screenshot <out.png> --frames <N>] [--record-dir <dir> --record-frames <N>] [--regen-assets]");
+    if !do_verify && !do_bench && !do_bottleneck_suite && !do_uma_bench && !do_pso_bench && !do_skin_sss && !do_demo && !do_jet_flight {
+        println!("Usage: bcpack-gpu-demo [--verify] [--bench] [--bottleneck-suite] [--uma-emulation-bench] [--pso-compile-bench] [--skin-sss-stress] [--debug] [--report-json <out.json>] [--screenshot-dir <dir>] [--jet-flight] [--demo] [--chunks N] [--world-stream] [--vram-cap-mb N] [--measure-frames N] [--assets-dir <dir>] [--screenshot <out.png> --frames <N>] [--record-dir <dir> --record-frames <N>] [--regen-assets]");
         return;
     }
 
@@ -1432,6 +1437,15 @@ fn main() {
         bcpack_demo::pso_stress::run_pso_compile_bench(
             enable_debug,
             Some(report_json.as_deref().unwrap_or(default_json.as_path())),
+        );
+    }
+    if do_skin_sss {
+        let default_json = PathBuf::from("skin_sss_report.json");
+        let default_media = PathBuf::from("media");
+        bcpack_demo::skin_sss_stress::run_skin_sss_stress(
+            enable_debug,
+            Some(report_json.as_deref().unwrap_or(default_json.as_path())),
+            screenshot_dir.as_deref().unwrap_or(default_media.as_path()),
         );
     }
     if do_jet_flight {

@@ -11,7 +11,8 @@ pub mod pso_stress;
 pub mod pursuit_streamer;
 pub mod raytracing;
 pub mod rtgi;
+pub mod skin_sss_stress;
 pub mod uma_stress;
 pub mod world_streaming;
 
-pub use bcpack_gpu::{crowd_skinning, descriptor_paging, ffi, gpu_decoder};
+pub use bcpack_gpu::{crowd_skinning, descriptor_paging, ffi, gpu_decoder, primitives};

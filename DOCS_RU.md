@@ -9,6 +9,22 @@
 
 ---
 
+## Новый чистый стенд `--skin-sss-stress` (Wave32 SSS + `sdk::primitives`)
+
+Добавлен процедурный DX12-стенд ([`src/skin_sss_stress.rs`](src/skin_sss_stress.rs), `START_SKIN_SSS_STRESS.bat`) и переносимые примитивы в `bcpack-gpu-sdk` ([`sdk/src/primitives.rs`](sdk/src/primitives.rs), [`sdk/shaders/scatter_patch.hlsl`](sdk/shaders/scatter_patch.hlsl), [`sdk/shaders/wave32_nan_guard.hlsli`](sdk/shaders/wave32_nan_guard.hlsli)), проверено на **Windows 11 + NVIDIA GeForce RTX 5080** (**DX12 Debug Layer: `0` ошибок**):
+
+- **`[T1]` Wave32 `NaN`/`Inf` Guard (`1280×720` HDR `R16G16B16A16_FLOAT` → Bloom → ACES ToneMap):**
+  - Без защиты (`skin_sss_naive.png`): тонкая толщина края даёт `+Inf` засвет HDR Bloom на левом бюсте (`2 881` `Inf`-пикселей), а неверный cross-lane `WaveActiveBallot.y` / `WaveReadLaneAt(lane+32)` на Wave32 даёт `qNaN` и «чёрную кожу/волосы» на правом (`96 025` `NaN`-пикселей) при чётко видимых глазах, украшениях и лямках (`31.598 мс`).
+  - С `Wave32NanGuard` (`Wave32SafeReadLane64` + `Wave32SanitizeFloat4`, `skin_sss_opt.png`): оба бюста с чистым подповерхностным рассеиванием кожи за **`1.527 мс`**, **`0` `NaN`** и **`0` `Inf`** по побитовому GPU readback ([`skin_sss_report.json`](skin_sss_report.json)).
+- **`[T2]` Приоритет PSO кожи (`120` отрисовок: `60` окружение + `60` кожа/волосы):** наивная FIFO-очередь теряет **`48/120` (`40.00%`, все `48` кожи)**; **`SkinPriority`** + предкомпилированный `HybridFallbackSkin` снижают потери до **`0/120` (`0.00%`)**.
+- **`[T3]` Стриминг мипов `KeepShown` + `HierarchicalDirtyBitmap` AVX2 + `GpuScatterPatcher`:** удержание базового мипа убирает пропуски чтения (**`24/64 → 0/64` кадров**), а 3-уровневый битовый индекс + AVX2 (`9.8034 → 0.5854 мс`, **`16.75×`**) и `GpuScatterPatcher` (**`0.3610 мс`** на GPU) точно обновляют `1 024/1 024` слотов по `64B` в куче `1 000 000` слотов (`64 MiB`).
+
+![Стенд --skin-sss-stress до: +Inf засвет и qNaN чёрная кожа](media/skin_sss_naive.png)
+
+![Стенд --skin-sss-stress после: Wave32NanGuard, чистая кожа SSS (0 NaN, 0 Inf)](media/skin_sss_opt.png)
+
+---
+
 ## Что нового в v0.15.4 — Стенды эмуляции UMA (`82.1×`), живой `--uma-stress` (`2 → 65 FPS`) и `--pursuit-stress`
 
 Добавлен чистый open-source стенд ([`src/uma_stress.rs`](src/uma_stress.rs)), воспроизводящий на синтетических ресурсах 4 ключевых узких места трансляции общей памяти (UMA) консолей Xbox Series X|S → PC DX12 (проверено на **Windows 11 + NVIDIA GeForce RTX 5080**, **DX12 Debug Layer: 0 ошибок**):
