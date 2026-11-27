@@ -7,6 +7,7 @@ pub mod gltf_loader;
 pub mod hiz_culling;
 pub mod meshlets;
 pub mod meshes;
+pub mod pso_stress;
 pub mod pursuit_streamer;
 pub mod raytracing;
 pub mod rtgi;

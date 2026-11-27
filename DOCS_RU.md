@@ -31,6 +31,19 @@
 ### Режим `--pursuit-stress` (`v0.15.2–v0.15.3` — клавиша `[B]` / `START_PURSUIT_STRESS.bat`)
 - **Асинхронный zero-copy стриминг 6 форматов ([`src/pursuit_streamer.rs`](src/pursuit_streamer.rs)):** потоковая декомпрессия **всех 6 GPU-форматов (`BC1`, `BC3`, `BC4`, `BC5`, `BC6H`, `BC7`) + `GFX10 SW_64KB_D`** тайлами по `1 024` блока (`128×128 px`, `144` cruise / `192` whip тайла за волну) через `BcPackDecodeBatchToTextures`, двубуферное кольцо поколений на меж-очередных `ID3D12Fence` без пузырей, inline-обновление TLAS и живой HUD счётчиков `VirtualDescriptorPager` (`1.25M → 262K`).
 
+### Чистый стенд компиляции PSO (`--pso-compile-bench` и `--pso-stress`)
+Добавлен 100% синтетический бенчмарк и живой 3D-режим ([`src/pso_stress.rs`](src/pso_stress.rs)) на реальных **`dxcompiler.dll` (`IDxcCompiler3`)**, **`CreateGraphicsPipelineState` / `CreateComputePipelineState`** и **`ID3D12PipelineLibrary`** (проверено на **Windows 11 + NVIDIA GeForce RTX 5080**, **DX12 Debug Layer: 0 ошибок**):
+
+- **Headless-бенчмарк (`bcpack-gpu-demo.exe --pso-compile-bench --report-json pso_compile_report.json` / `START_PSO_COMPILE_BENCH.bat`):**
+  - **`[W1]` `2 500` графических PSO (`250` PBR+branch PS × `10` вариантов состояния):** Наивный `-O3` 1T без дедупликации **`11 650.71 мс`** (`11.65 с`) → `[1]` Канонический кэш DXIL (`250` вызовов DXC) **`1 725.68 мс`** (`6.75×`) → `[1]+[2]` `-O1` + Single-Latch CFG (1T) **`1 421.79 мс`** (`8.19×`) → `[1]+[2]+[3]` 8-поточный пул (холодная сборка) **`221.65 мс`** (**`52.56×`**) → Тёплая загрузка **`ID3D12PipelineLibrary`** (`0.71 MiB`) **`79.68 мс`** (**`146.22×`**).
+  - **`[W2]` `32` тяжёлых Compute-шейдера с ветвлениями + GPU Readback:** Наивный (`-O3` раздутый CFG, 1T) **`905.33 мс`** → Опт (`-O1` чистый CFG, 8T) **`30.66 мс`** (**`29.53×`** ускорение компиляции); GPU-время `0.171 → 0.148 мс`, `max_err = 3.58e-7` (**`32/32` проверено**).
+  - **`[W3]` Волна первого появления за 60 кадров (`2 520` отрисовок, бюджет фризов `0 мс`):** Без фоллбэка **`28.1%` пропущено** (`708` draw) → С предкомпилированным Hybrid Fallback Ubershader (`0.62 мс` на старте) **`0.0%` пропущено** (`0.00 мс` статтера).
+- **Живой 3D-город (`bcpack-aaa-demo.exe --pso-stress --no-vsync --show-hud` / `START_PSO_STRESS.bat`, клавиши `[O]` и `[1]..[4]`):** переключает дедупликацию DXIL (`[1]`), `-O1` Single-Latch (`[2]`), 8T `PipelineLibrary` (`[3]`) и Hybrid Ubershader (`[4]`) в реальном времени (**`10 FPS` / `100.0 мс`**, `36%` пропусков → **`120 FPS` / `0.0 мс`**, `0%` пропусков).
+
+![Живой стенд --pso-stress без оптимизаций: 10 FPS (100.0 мс, 36% пропущено) на RTX 5080](media/pso_city_naive.png)
+
+![Живой стенд --pso-stress с [1]..[4]: 120 FPS (0.0 мс, 0% пропущено) на RTX 5080](media/pso_city_opt.png)
+
 ---
 
 ## Что нового в v0.11.0 (Оптимизация под слабые / 8 ГБ видеокарты)

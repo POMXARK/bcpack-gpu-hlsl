@@ -532,34 +532,45 @@ float3 composite_uma_hud(float3 bg, float2 uv) {
 
     static const float ADV = 0.0068;
     static const float X0  = 0.032;
+    bool is_pso = (g_UmaOn > 1.5);
 
-    // Header: "UMA STRESS   U:ON"
+    // Header: "UMA STRESS   U:ON" or "PSO STRESS   O:ON"
     float t_hdr = 0.0;
     float2 rh = float2(X0, 0.042);
-    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 0.0, 0.0), 27u)); // U
-    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 1.0, 0.0), 18u)); // M
-    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 2.0, 0.0), 17u)); // A
+    if (is_pso) {
+        t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 0.0, 0.0), 14u)); // P
+        t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 1.0, 0.0), 15u)); // S
+        t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 2.0, 0.0), 32u)); // O
+    } else {
+        t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 0.0, 0.0), 27u)); // U
+        t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 1.0, 0.0), 18u)); // M
+        t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 2.0, 0.0), 17u)); // A
+    }
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 4.0, 0.0), 15u)); // S
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 5.0, 0.0), 34u)); // T
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 6.0, 0.0), 33u)); // R
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 7.0, 0.0), 25u)); // E
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 8.0, 0.0), 15u)); // S
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 9.0, 0.0), 15u)); // S
-    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 16.0, 0.0), 27u)); // U
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 16.0, 0.0), is_pso ? 32u : 27u)); // O or U
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 17.0, 0.0), 11u)); // :
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 18.0, 0.0), 32u)); // O
     t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 19.0, 0.0), 22u)); // N
 
-    // Row 1: "1:DETILE OPT/NAIV NNN.N MS"
-    float t1 = draw_uma_row(uv, float2(X0, 0.076), ADV, 1u, 26u, 25u, 34u, 24u, 23u, 25u, opt1, g_UmaSub1Ms);
-    // Row 2: "2:PATCH  OPT/NAIV NNN.N MS"
-    float t2 = draw_uma_row(uv, float2(X0, 0.106), ADV, 2u, 14u, 17u, 34u, 16u, 28u, 10u, opt2, g_UmaSub2Ms);
-    // Row 3: "3:CMDHZD OPT/NAIV NNN.N MS"
-    float t3 = draw_uma_row(uv, float2(X0, 0.136), ADV, 3u, 16u, 18u, 26u, 28u, 36u, 26u, opt3, g_UmaSub3Ms);
-    // Row 4: "4:VRAMWS OPT/NAIV NNN.N MS"
-    float t4 = draw_uma_row(uv, float2(X0, 0.166), ADV, 4u, 20u, 33u, 17u, 18u, 35u, 15u, opt4, g_UmaSub4Ms);
+    float t1 = is_pso
+        ? draw_uma_row(uv, float2(X0, 0.076), ADV, 1u, 26u, 25u, 26u, 27u, 14u, 10u, opt1, g_UmaSub1Ms) // 1:DEDUP
+        : draw_uma_row(uv, float2(X0, 0.076), ADV, 1u, 26u, 25u, 34u, 24u, 23u, 25u, opt1, g_UmaSub1Ms); // 1:DETILE
+    float t2 = is_pso
+        ? draw_uma_row(uv, float2(X0, 0.106), ADV, 2u, 32u, 14u, 34u, 39u, 32u, 1u,  opt2, g_UmaSub2Ms) // 2:OPT-O1
+        : draw_uma_row(uv, float2(X0, 0.106), ADV, 2u, 14u, 17u, 34u, 16u, 28u, 10u, opt2, g_UmaSub2Ms); // 2:PATCH
+    float t3 = is_pso
+        ? draw_uma_row(uv, float2(X0, 0.136), ADV, 3u, 23u, 24u, 29u, 39u, 8u,  34u, opt3, g_UmaSub3Ms) // 3:LIB-8T
+        : draw_uma_row(uv, float2(X0, 0.136), ADV, 3u, 16u, 18u, 26u, 28u, 36u, 26u, opt3, g_UmaSub3Ms); // 3:CMDHZD
+    float t4 = is_pso
+        ? draw_uma_row(uv, float2(X0, 0.166), ADV, 4u, 27u, 29u, 25u, 33u, 10u, 10u, opt4, g_UmaSub4Ms) // 4:UBER
+        : draw_uma_row(uv, float2(X0, 0.166), ADV, 4u, 20u, 33u, 17u, 18u, 35u, 15u, opt4, g_UmaSub4Ms); // 4:VRAMWS
 
-    // Summary Row: "TOT: NNN.N MS   OK:64/64"
+    // Summary Row: "TOT: NNN.N MS   OK:64/64" or "TOT: NNN.N MS  DRP:NN%"
     float t_sum = 0.0;
     float2 rs = float2(X0, 0.206);
     t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 0.0, 0.0), 34u)); // T
@@ -567,13 +578,22 @@ float3 composite_uma_hud(float3 bg, float2 uv) {
     t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 2.0, 0.0), 34u)); // T
     t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 3.0, 0.0), 11u)); // :
     t_sum = max(t_sum, draw_fixed3_1dp(uv, rs + float2(ADV * 4.5, 0.0), ADV, g_UmaTotalMs));
-    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 13.0, 0.0), 32u)); // O
-    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 14.0, 0.0), 31u)); // K
-    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 15.0, 0.0), 11u)); // :
-    t_sum = max(t_sum, draw_uint3(uv, rs + float2(ADV * 16.0, 0.0), ADV, (uint)round(clamp(g_UmaOkMeshes, 0.0, 99.0))));
-    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 18.2, 0.0), 37u)); // /
-    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 19.2, 0.0), 6u));  // 6
-    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 20.2, 0.0), 4u));  // 4
+    if (is_pso) {
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 12.8, 0.0), 26u)); // D
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 13.8, 0.0), 33u)); // R
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 14.8, 0.0), 14u)); // P
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 15.8, 0.0), 11u)); // :
+        t_sum = max(t_sum, draw_uint3(uv, rs + float2(ADV * 16.8, 0.0), ADV, (uint)round(clamp(g_UmaOkMeshes, 0.0, 100.0))));
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 19.6, 0.0), 38u)); // %
+    } else {
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 13.0, 0.0), 32u)); // O
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 14.0, 0.0), 31u)); // K
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 15.0, 0.0), 11u)); // :
+        t_sum = max(t_sum, draw_uint3(uv, rs + float2(ADV * 16.0, 0.0), ADV, (uint)round(clamp(g_UmaOkMeshes, 0.0, 99.0))));
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 18.2, 0.0), 37u)); // /
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 19.2, 0.0), 6u));  // 6
+        t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 20.2, 0.0), 4u));  // 4
+    }
 
     float3 opt_c = float3(0.32, 0.96, 0.68);
     float3 naiv_c = float3(1.0, 0.56, 0.28);

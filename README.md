@@ -42,6 +42,21 @@ Added an open, 100% synthetic reproduction and optimization testbed ([`src/uma_s
 
 ---
 
+### Clean-Room Real-Time PSO Compilation Suite (`--pso-compile-bench` & `--pso-stress`)
+Added a 100% synthetic DXIL/PSO compilation benchmark and live 3D AAA City mode ([`src/pso_stress.rs`](src/pso_stress.rs)) using real **`dxcompiler.dll` (`IDxcCompiler3`)**, **`CreateGraphicsPipelineState` / `CreateComputePipelineState`**, and **`ID3D12PipelineLibrary`** on **Windows 11 + NVIDIA GeForce RTX 5080** (`DX12 Debug Layer: 0 errors`):
+
+- **Headless Benchmark (`bcpack-gpu-demo.exe --pso-compile-bench --report-json pso_compile_report.json` / `START_PSO_COMPILE_BENCH.bat`):**
+  - **`[W1]` `2,500` Graphics PSOs (`250` PBR+branch PS × `10` render-state variants):** Naive `-O3` 1T no-dedup **`11,650.71 ms`** (`11.65 s`) → `[1]` Canonical DXIL Dedup (`250` DXC calls) **`1,725.68 ms`** (`6.75×`) → `[1]+[2]` `-O1` + Single-Latch CFG (1T) **`1,421.79 ms`** (`8.19×`) → `[1]+[2]+[3]` 8-Thread Pool Cold Build **`221.65 ms`** (**`52.56×`**) → Warm **`ID3D12PipelineLibrary`** (`749,308 B` / `0.71 MiB`) **`79.68 ms`** (**`146.22×`**).
+  - **`[W2]` `32` Heavy Nested-Branch Compute Shaders + GPU Readback Parity:** Naive (`-O3` bloated CFG, 1T) **`905.33 ms`** → Opt (`-O1` clean single-latch CFG, 8T) **`30.66 ms`** (**`29.53×`** compile speedup); GPU execution `0.171 ms → 0.148 ms`, `max_err = 3.58e-7` (**`32/32` verified**).
+  - **`[W3]` 60-Frame First-Bind Wave (`2,520` draws, `0 ms` stall budget):** Without fallback **`28.1%` dropped** (`708` draws missing) → With pre-compiled Hybrid Fallback Ubershader (`0.62 ms` startup) **`0.0%` dropped** (`0.00 ms` stall).
+- **Interactive Live 3D City Mode (`bcpack-aaa-demo.exe --pso-stress --no-vsync --show-hud` / `START_PSO_STRESS.bat`, keys `[O]` + `[1]..[4]`):** Toggles Canonical DXIL Dedup (`[1]`), `-O1` Single-Latch CFG (`[2]`), 8-Thread `ID3D12PipelineLibrary` (`[3]`), and Hybrid Ubershader Fallback (`[4]`) in real time (`100.0 ms/f` / **`10 FPS`**, `36%` dropped draws → **`0.0 ms`** compile overhead / **`120 FPS`**, `0%` dropped).
+
+![Clean-Room --pso-stress Naive Baseline: 10 FPS (100.0 ms/f, 36% dropped) on RTX 5080](media/pso_city_naive.png)
+
+![Clean-Room --pso-stress Optimized [1]..[4]: 120 FPS (0.0 ms, 0% dropped) on RTX 5080](media/pso_city_opt.png)
+
+---
+
 ## What's New in `v0.15.0` — Batched Zero-Copy `BcPackDecodeBatchToTextures` & Open-World DX12 Bottleneck Suite
 
 Updated `sdk/` to **`bcpack-gpu-sdk v0.15.0`** and verified all 6 clean-room open-world bottlenecks (`src/bottleneck_suite.rs`, `START_BOTTLENECK_SUITE.bat`) on **Windows 11 + NVIDIA GeForce RTX 5080**:
@@ -116,6 +131,7 @@ Built for 8 GB / budget GPUs (`RTX 3060 / 4060 / RX 6600 / iGPU`) alongside high
 | **Zero-Copy C-ABI & Vulkan SPIR-V** | Cross-process copies; Vulkan 1.3/Linux Proton shaders needed (`OpenScarlett`) | `bcpack_gpu_create_from_device`, `BcPackDecodeToTexture2D`, official DXC `-spirv` | **0 CPU readback**, 9 Vulkan 1.3 `.spv` kernels | [`include/bcpack_gpu.h`](include/bcpack_gpu.h), [`compile_spirv.sh`](shaders/compile_spirv.sh) |
 | **Compute `RayQuery` RTGI + TAAU + VRS Tier 2** | 8 GB / RDNA2 GPUs (`RTX 3060/4060`, `RX 6600`) stalled by PS RTGI quads + 1080p SFS | Cross-vendor `[numthreads(8,8,1)]` `VK_KHR_ray_query` CS, 5-tap TAAU, `16×16` VRS (`[K]`), SFS hysteresis | **`196.8 FPS`** Ultra CS RTGI, **`258.9 FPS`** (`420.6 Peak`) +VRS, **`551.5 FPS`** Low | [`aaa_rtgi_cs.hlsl`](shaders/aaa_rtgi_cs.hlsl), [`aaa_vrs.hlsl`](shaders/aaa_vrs.hlsl), [`aaa_taa.hlsl`](shaders/aaa_taa.hlsl) |
 | **4-Subsystem UMA Emulation Suite (`v0.15.4`)** | `MEM_WRITE_WATCH` + CPU detile, `1M` slot scans, single-thread draw hazards, PCIe working-set spillover | Static skip + GPU Gfx10 detile, Compute scatter patch, 8-worker recording + hazard journals, GDDR7 placement | **`82.13×`** headless (`510.73 → 6.219 ms`), live **`2 → 65 FPS`** (`151.8×` detile) | [`uma_stress.rs`](src/uma_stress.rs), [`uma_gfx10_detile.hlsl`](shaders/uma_gfx10_detile.hlsl), [`uma_scatter_patch.hlsl`](shaders/uma_scatter_patch.hlsl) |
+| **Real-Time PSO Compile Suite (`v0.15.4`)** | `2,500`-PSO cold stutter (`dxcompiler` `-O3` 1T + bloated CFG + missing first-bind draws) | Canonical DXIL dedup, `-O1` Single-Latch CFG, 8T pool + `ID3D12PipelineLibrary`, Hybrid Ubershader | **`52.56×` cold** / **`146.22×` warm**, **`29.53×`** CS (`32/32`), **`28.1% → 0.0%`** dropped | [`pso_stress.rs`](src/pso_stress.rs) |
 
 ---
 

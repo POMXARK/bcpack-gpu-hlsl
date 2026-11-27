@@ -109,6 +109,8 @@ pub struct AaaDemoConfig {
     pub pursuit_stress: bool,
     pub uma_stress: bool,
     pub uma_opt_mask: u8,
+    pub pso_stress: bool,
+    pub pso_opt_mask: u8,
 }
 
 impl Default for AaaDemoConfig {
@@ -149,6 +151,8 @@ impl Default for AaaDemoConfig {
             pursuit_stress: false,
             uma_stress: false,
             uma_opt_mask: 15,
+            pso_stress: false,
+            pso_opt_mask: 15,
         }
     }
 }
@@ -206,6 +210,8 @@ struct WindowState {
     pursuit_enabled: bool,
     uma_enabled: bool,
     uma_opt_mask: u8,
+    pso_enabled: bool,
+    pso_opt_mask: u8,
     cam_mode: u32, // 0=Showroom 3/4 Orbit, 1=Chase Drive, 2=Free Cam
     fps_cap: u32,  // 0 = MAX/VSync, 15..=300 = capped FPS
     sim_speed: f32,
@@ -490,11 +496,30 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             x if x == b'R' as u32 => st.rt_enabled = !st.rt_enabled,
             x if x == b'G' as u32 => st.rtgi_enabled = !st.rtgi_enabled,
             x if x == b'B' as u32 => st.pursuit_enabled = !st.pursuit_enabled,
-            x if x == b'U' as u32 => st.uma_enabled = !st.uma_enabled,
-            x if x == b'1' as u32 => st.uma_opt_mask ^= 1,
-            x if x == b'2' as u32 => st.uma_opt_mask ^= 2,
-            x if x == b'3' as u32 => st.uma_opt_mask ^= 4,
-            x if x == b'4' as u32 => st.uma_opt_mask ^= 8,
+            x if x == b'U' as u32 => {
+                st.uma_enabled = !st.uma_enabled;
+                if st.uma_enabled {
+                    st.pso_enabled = false;
+                }
+            }
+            x if x == b'O' as u32 => {
+                st.pso_enabled = !st.pso_enabled;
+                if st.pso_enabled {
+                    st.uma_enabled = false;
+                }
+            }
+            x if x == b'1' as u32 => {
+                if st.pso_enabled { st.pso_opt_mask ^= 1; } else { st.uma_opt_mask ^= 1; }
+            }
+            x if x == b'2' as u32 => {
+                if st.pso_enabled { st.pso_opt_mask ^= 2; } else { st.uma_opt_mask ^= 2; }
+            }
+            x if x == b'3' as u32 => {
+                if st.pso_enabled { st.pso_opt_mask ^= 4; } else { st.uma_opt_mask ^= 4; }
+            }
+            x if x == b'4' as u32 => {
+                if st.pso_enabled { st.pso_opt_mask ^= 8; } else { st.uma_opt_mask ^= 8; }
+            }
             x if x == b'K' as u32 && st.vrs_supported => st.vrs_enabled = !st.vrs_enabled,
             x if x == b'C' as u32 => st.cam_mode = (st.cam_mode + 1) % 3,
             x if x == b'H' as u32 => st.hud_visible = !st.hud_visible,
@@ -2355,8 +2380,10 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             vrs_enabled: eff_vrs,
             vrs_supported: ctx.vrs_tier2,
             pursuit_enabled: cfg.pursuit_stress,
-            uma_enabled: cfg.uma_stress,
+            uma_enabled: cfg.uma_stress && !cfg.pso_stress,
             uma_opt_mask: cfg.uma_opt_mask & 15,
+            pso_enabled: cfg.pso_stress,
+            pso_opt_mask: cfg.pso_opt_mask & 15,
             cam_mode: 0,
             fps_cap: cfg.fps_cap,
             sim_speed: cfg.sim_speed.clamp(0.0, 4.0),
@@ -3015,12 +3042,18 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let budget_bytes = eff_budget_mb * 1024 * 1024;
         let mut residency = SfsResidencyManager::new(&pack.textures, budget_bytes);
         let mut pursuit = crate::pursuit_streamer::PursuitStreamer::new(&mut ctx);
-        let mut uma_engine: Option<crate::uma_stress::UmaStressEngine> = if cfg.uma_stress {
+        let mut uma_engine: Option<crate::uma_stress::UmaStressEngine> = if cfg.uma_stress && !cfg.pso_stress {
             Some(crate::uma_stress::UmaStressEngine::new(&mut ctx))
         } else {
             None
         };
         let mut uma_metrics = crate::uma_stress::UmaMetrics::default();
+        let mut pso_engine: Option<crate::pso_stress::PsoStressEngine> = if cfg.pso_stress {
+            Some(crate::pso_stress::PsoStressEngine::new(&mut ctx))
+        } else {
+            None
+        };
+        let mut pso_metrics = crate::pso_stress::PsoMetrics::default();
         // Kickstart initial Mip-0 stream with hero car paint & 4K road asphalt before first frame SFS feedback arrives
         for seed_idx in [
             pack.asphalt_tex[0] as usize,
@@ -3285,6 +3318,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             } else {
                 uma_metrics.enabled = false;
                 uma_metrics.opt_mask = wstate.uma_opt_mask;
+            }
+            if wstate.pso_enabled {
+                let eng = pso_engine.get_or_insert_with(|| crate::pso_stress::PsoStressEngine::new(&mut ctx));
+                pso_metrics = eng.tick_live_frame(&mut ctx, wstate.pso_opt_mask);
+            } else {
+                pso_metrics.enabled = false;
+                pso_metrics.opt_mask = wstate.pso_opt_mask;
             }
 
             let speed = if (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 { 24.0 } else { 8.0 };
@@ -3706,12 +3746,20 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             };
 
             // Hero Car + 6 parked cars + 5 animated CarConcept traffic cars
-            draw_car(&hero_model, &hero_model);
-            for (pm, _) in &parked_car_mats {
-                draw_car(pm, pm);
+            let pso_drop_active =
+                pso_metrics.enabled && (pso_metrics.opt_mask & 8) == 0 && pso_metrics.dropped_pct > 1.0;
+            if !pso_drop_active || (frame_count % 3) == 0 {
+                draw_car(&hero_model, &hero_model);
+            }
+            for (p_idx, (pm, _)) in parked_car_mats.iter().enumerate() {
+                if !pso_drop_active || ((p_idx + frame_count as usize) % 5) == 0 {
+                    draw_car(pm, pm);
+                }
             }
             for (idx, (tm, _)) in traffic_mats.iter().enumerate() {
-                draw_car(tm, &prev_t_xfs[idx]);
+                if !pso_drop_active || ((idx + frame_count as usize) % 4) == 0 {
+                    draw_car(tm, &prev_t_xfs[idx]);
+                }
             }
 
             // Wet 4-lane Asphalt Road
@@ -3833,18 +3881,23 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
 
             // Stage 3: 500 GPU-Skinned Pedestrians walking along coastal promenades
             if let Some(ref crowd) = crowd_renderer {
-                crowd.draw(
-                    cmd,
-                    slot,
-                    &vp_jit.0,
-                    &vp_unjit.0,
-                    &prev_vp.0,
-                    cam_pos,
-                    flags_bits,
-                    sun_dir,
-                    t_sec,
-                    table_gpu,
-                );
+                let drop_crowd = pso_metrics.enabled
+                    && (pso_metrics.opt_mask & 8) == 0
+                    && pso_metrics.dropped_pct > 1.0;
+                if !drop_crowd {
+                    crowd.draw(
+                        cmd,
+                        slot,
+                        &vp_jit.0,
+                        &vp_unjit.0,
+                        &prev_vp.0,
+                        cam_pos,
+                        flags_bits,
+                        sun_dir,
+                        t_sec,
+                        table_gpu,
+                    );
+                }
             }
 
             // Build 6-Mip Conservative Hi-Z Depth Pyramid for next frame's Mesh-Shader occlusion culling
@@ -3895,14 +3948,20 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 pt.fps_1pct_low,
                 pt.whip_pan_pulse,
                 6.0f32,
-                if uma_metrics.enabled { 1.0f32 } else { 0.0f32 },
-                uma_metrics.opt_mask as f32,
-                uma_metrics.sub1_ms,
-                uma_metrics.sub2_ms,
-                uma_metrics.sub3_ms,
-                uma_metrics.sub4_ms,
-                uma_metrics.total_ms,
-                uma_metrics.verified_meshes as f32,
+                if pso_metrics.enabled {
+                    2.0f32
+                } else if uma_metrics.enabled {
+                    1.0f32
+                } else {
+                    0.0f32
+                },
+                if pso_metrics.enabled { pso_metrics.opt_mask as f32 } else { uma_metrics.opt_mask as f32 },
+                if pso_metrics.enabled { pso_metrics.sub1_ms } else { uma_metrics.sub1_ms },
+                if pso_metrics.enabled { pso_metrics.sub2_ms } else { uma_metrics.sub2_ms },
+                if pso_metrics.enabled { pso_metrics.sub3_ms } else { uma_metrics.sub3_ms },
+                if pso_metrics.enabled { pso_metrics.sub4_ms } else { uma_metrics.sub4_ms },
+                if pso_metrics.enabled { pso_metrics.total_ms } else { uma_metrics.total_ms },
+                if pso_metrics.enabled { pso_metrics.dropped_pct } else { uma_metrics.verified_meshes as f32 },
             ];
             post.run_post_and_composite(
                 cmd,
@@ -4141,7 +4200,21 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 } else {
                     String::new()
                 };
-                let uma_str = if wstate.uma_enabled {
+                let uma_str = if wstate.pso_enabled {
+                    format!(
+                        " | PSO[O]:1({}):{:.1}ms 2({}):{:.1}ms 3({}):{:.1}ms 4({}):{:.1}ms TOT:{:.1}ms DRP:{:.0}%",
+                        if (pso_metrics.opt_mask & 1) != 0 { "OPT" } else { "NAIV" },
+                        pso_metrics.sub1_ms,
+                        if (pso_metrics.opt_mask & 2) != 0 { "OPT" } else { "NAIV" },
+                        pso_metrics.sub2_ms,
+                        if (pso_metrics.opt_mask & 4) != 0 { "OPT" } else { "NAIV" },
+                        pso_metrics.sub3_ms,
+                        if (pso_metrics.opt_mask & 8) != 0 { "OPT" } else { "NAIV" },
+                        pso_metrics.sub4_ms,
+                        pso_metrics.total_ms,
+                        pso_metrics.dropped_pct,
+                    )
+                } else if wstate.uma_enabled {
                     format!(
                         " | UMA[U]:1({}):{:.1}ms 2({}):{:.1}ms 3({}):{:.1}ms 4({}):{:.1}ms TOT:{:.1}ms {}/64",
                         if (uma_metrics.opt_mask & 1) != 0 { "OPT" } else { "NAIV" },

@@ -100,6 +100,11 @@ fn main() {
                 cfg.uma_opt_mask = args[i + 1].parse::<u8>().unwrap_or(15) & 15;
                 i += 1;
             }
+            "--pso-stress" => cfg.pso_stress = true,
+            "--pso-opt" if i + 1 < args.len() => {
+                cfg.pso_opt_mask = args[i + 1].parse::<u8>().unwrap_or(15) & 15;
+                i += 1;
+            }
             other => {
                 eprintln!("Unknown flag '{other}'");
                 std::process::exit(2);
