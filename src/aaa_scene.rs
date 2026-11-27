@@ -107,6 +107,8 @@ pub struct AaaDemoConfig {
     pub no_rtgi_explicit: bool,
     pub vram_budget_explicit: bool,
     pub pursuit_stress: bool,
+    pub uma_stress: bool,
+    pub uma_opt_mask: u8,
 }
 
 impl Default for AaaDemoConfig {
@@ -145,6 +147,8 @@ impl Default for AaaDemoConfig {
             no_rtgi_explicit: false,
             vram_budget_explicit: false,
             pursuit_stress: false,
+            uma_stress: false,
+            uma_opt_mask: 15,
         }
     }
 }
@@ -200,6 +204,8 @@ struct WindowState {
     vrs_enabled: bool,
     vrs_supported: bool,
     pursuit_enabled: bool,
+    uma_enabled: bool,
+    uma_opt_mask: u8,
     cam_mode: u32, // 0=Showroom 3/4 Orbit, 1=Chase Drive, 2=Free Cam
     fps_cap: u32,  // 0 = MAX/VSync, 15..=300 = capped FPS
     sim_speed: f32,
@@ -484,6 +490,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             x if x == b'R' as u32 => st.rt_enabled = !st.rt_enabled,
             x if x == b'G' as u32 => st.rtgi_enabled = !st.rtgi_enabled,
             x if x == b'B' as u32 => st.pursuit_enabled = !st.pursuit_enabled,
+            x if x == b'U' as u32 => st.uma_enabled = !st.uma_enabled,
+            x if x == b'1' as u32 => st.uma_opt_mask ^= 1,
+            x if x == b'2' as u32 => st.uma_opt_mask ^= 2,
+            x if x == b'3' as u32 => st.uma_opt_mask ^= 4,
+            x if x == b'4' as u32 => st.uma_opt_mask ^= 8,
             x if x == b'K' as u32 && st.vrs_supported => st.vrs_enabled = !st.vrs_enabled,
             x if x == b'C' as u32 => st.cam_mode = (st.cam_mode + 1) % 3,
             x if x == b'H' as u32 => st.hud_visible = !st.hud_visible,
@@ -1732,7 +1743,7 @@ impl AaaPostPipeline {
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 20 },
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 28 },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
@@ -1868,7 +1879,7 @@ impl AaaPostPipeline {
         sun_screen_dir: [f32; 2],
         jitter_ndc: [f32; 2],
         time: f32,
-        hud: [f32; 16],
+        hud: [f32; 24],
     ) {
         let srv_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let gpu_base = main_srv_heap.GetGPUDescriptorHandleForHeapStart();
@@ -2153,8 +2164,10 @@ impl AaaPostPipeline {
             hud[4], hud[5], hud[6], hud[7],
             hud[8], hud[9], hud[10], hud[11],
             hud[12], hud[13], hud[14], hud[15],
+            hud[16], hud[17], hud[18], hud[19],
+            hud[20], hud[21], hud[22], hud[23],
         ];
-        cmd.SetGraphicsRoot32BitConstants(0, 20, comp_cb.as_ptr() as *const c_void, 0);
+        cmd.SetGraphicsRoot32BitConstants(0, 28, comp_cb.as_ptr() as *const c_void, 0);
         cmd.SetGraphicsRootDescriptorTable(1, gpu_at(101 + cur * 3));
         cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmd.DrawInstanced(3, 1, 0, 0);
@@ -2342,6 +2355,8 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
             vrs_enabled: eff_vrs,
             vrs_supported: ctx.vrs_tier2,
             pursuit_enabled: cfg.pursuit_stress,
+            uma_enabled: cfg.uma_stress,
+            uma_opt_mask: cfg.uma_opt_mask & 15,
             cam_mode: 0,
             fps_cap: cfg.fps_cap,
             sim_speed: cfg.sim_speed.clamp(0.0, 4.0),
@@ -3000,6 +3015,12 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
         let budget_bytes = eff_budget_mb * 1024 * 1024;
         let mut residency = SfsResidencyManager::new(&pack.textures, budget_bytes);
         let mut pursuit = crate::pursuit_streamer::PursuitStreamer::new(&mut ctx);
+        let mut uma_engine: Option<crate::uma_stress::UmaStressEngine> = if cfg.uma_stress {
+            Some(crate::uma_stress::UmaStressEngine::new(&mut ctx))
+        } else {
+            None
+        };
+        let mut uma_metrics = crate::uma_stress::UmaMetrics::default();
         // Kickstart initial Mip-0 stream with hero car paint & 4K road asphalt before first frame SFS feedback arrives
         for seed_idx in [
             pack.asphalt_tex[0] as usize,
@@ -3258,6 +3279,13 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 whip_pan_pulse,
                 wstate.pursuit_enabled,
             );
+            if wstate.uma_enabled {
+                let eng = uma_engine.get_or_insert_with(|| crate::uma_stress::UmaStressEngine::new(&mut ctx));
+                uma_metrics = eng.tick_live_frame(&mut ctx, wstate.uma_opt_mask);
+            } else {
+                uma_metrics.enabled = false;
+                uma_metrics.opt_mask = wstate.uma_opt_mask;
+            }
 
             let speed = if (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 { 24.0 } else { 8.0 };
             if wstate.cam_mode == 2 {
@@ -3867,6 +3895,14 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 pt.fps_1pct_low,
                 pt.whip_pan_pulse,
                 6.0f32,
+                if uma_metrics.enabled { 1.0f32 } else { 0.0f32 },
+                uma_metrics.opt_mask as f32,
+                uma_metrics.sub1_ms,
+                uma_metrics.sub2_ms,
+                uma_metrics.sub3_ms,
+                uma_metrics.sub4_ms,
+                uma_metrics.total_ms,
+                uma_metrics.verified_meshes as f32,
             ];
             post.run_post_and_composite(
                 cmd,
@@ -4105,13 +4141,31 @@ pub fn run_aaa_demo(cfg: AaaDemoConfig) {
                 } else {
                     String::new()
                 };
+                let uma_str = if wstate.uma_enabled {
+                    format!(
+                        " | UMA[U]:1({}):{:.1}ms 2({}):{:.1}ms 3({}):{:.1}ms 4({}):{:.1}ms TOT:{:.1}ms {}/64",
+                        if (uma_metrics.opt_mask & 1) != 0 { "OPT" } else { "NAIV" },
+                        uma_metrics.sub1_ms,
+                        if (uma_metrics.opt_mask & 2) != 0 { "OPT" } else { "NAIV" },
+                        uma_metrics.sub2_ms,
+                        if (uma_metrics.opt_mask & 4) != 0 { "OPT" } else { "NAIV" },
+                        uma_metrics.sub3_ms,
+                        if (uma_metrics.opt_mask & 8) != 0 { "OPT" } else { "NAIV" },
+                        uma_metrics.sub4_ms,
+                        uma_metrics.total_ms,
+                        uma_metrics.verified_meshes,
+                    )
+                } else {
+                    String::new()
+                };
                 let title = format!(
-                    "BCPack AAA v0.15.3 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x){} | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
+                    "BCPack AAA v0.15.4 | {} | {:.1} FPS (Cap:{} Sim:{:.2}x){}{} | {}x{}->{}x{} VRS:{} | {}NPC:{} | SFS[F]:{} {:.0}/{:.0}MiB (-{:.0}MiB) | dec {:.2}ms ({:.1}MiB) | DXR:{} RTGI:{} XRay:{} | {}",
                     mode_str,
                     fps_val,
                     cap_str,
                     wstate.sim_speed,
                     pursuit_str,
+                    uma_str,
                     render_w,
                     render_h,
                     out_w,

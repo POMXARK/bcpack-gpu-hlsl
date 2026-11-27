@@ -1349,6 +1349,7 @@ fn main() {
     let do_verify = args.iter().any(|a| a == "--verify");
     let do_bench = args.iter().any(|a| a == "--bench");
     let do_bottleneck_suite = args.iter().any(|a| a == "--bottleneck-suite");
+    let do_uma_bench = args.iter().any(|a| a == "--uma-emulation-bench");
     let do_demo = args.iter().any(|a| a == "--demo");
     let do_jet_flight = args.iter().any(|a| a == "--jet-flight" || a == "--rage-stress");
     let regen_assets = args.iter().any(|a| a == "--regen-assets");
@@ -1403,8 +1404,8 @@ fn main() {
         }
     }
 
-    if !do_verify && !do_bench && !do_bottleneck_suite && !do_demo && !do_jet_flight {
-        println!("Usage: bcpack-gpu-demo [--verify] [--bench] [--bottleneck-suite] [--report-json <out.json>] [--jet-flight] [--demo] [--chunks N] [--world-stream] [--vram-cap-mb N] [--measure-frames N] [--assets-dir <dir>] [--screenshot <out.png> --frames <N>] [--record-dir <dir> --record-frames <N>] [--regen-assets]");
+    if !do_verify && !do_bench && !do_bottleneck_suite && !do_uma_bench && !do_demo && !do_jet_flight {
+        println!("Usage: bcpack-gpu-demo [--verify] [--bench] [--bottleneck-suite] [--uma-emulation-bench] [--debug] [--report-json <out.json>] [--jet-flight] [--demo] [--chunks N] [--world-stream] [--vram-cap-mb N] [--measure-frames N] [--assets-dir <dir>] [--screenshot <out.png> --frames <N>] [--record-dir <dir> --record-frames <N>] [--regen-assets]");
         return;
     }
 
@@ -1415,6 +1416,13 @@ fn main() {
         let default_json = PathBuf::from("bottleneck_report.json");
         bcpack_demo::bottleneck_suite::run_bottleneck_suite(
             &assets_dir,
+            Some(report_json.as_deref().unwrap_or(default_json.as_path())),
+        );
+    }
+    if do_uma_bench {
+        let default_json = PathBuf::from("uma_emulation_report.json");
+        bcpack_demo::uma_stress::run_uma_emulation_bench(
+            enable_debug,
             Some(report_json.as_deref().unwrap_or(default_json.as_path())),
         );
     }

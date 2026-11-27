@@ -95,6 +95,11 @@ fn main() {
             "--show-hud" => cfg.show_hud = Some(true),
             "--no-hud" => cfg.show_hud = Some(false),
             "--pursuit-stress" => cfg.pursuit_stress = true,
+            "--uma-stress" => cfg.uma_stress = true,
+            "--uma-opt" if i + 1 < args.len() => {
+                cfg.uma_opt_mask = args[i + 1].parse::<u8>().unwrap_or(15) & 15;
+                i += 1;
+            }
             other => {
                 eprintln!("Unknown flag '{other}'");
                 std::process::exit(2);

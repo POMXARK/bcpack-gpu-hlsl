@@ -43,4 +43,10 @@ echo Using DXC for showcase shaders: "%DXC%"
 "%DXC%" -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo "%~dp0aaa_meshlet_ps.dxil" "%~dp0aaa_meshlet_ps.hlsl" || exit /b 1
 "%DXC%" -T vs_6_0 -E VSMain -O3 -Fo "%~dp0aaa_crowd_vs.dxil" "%~dp0aaa_crowd.hlsl" || exit /b 1
 "%DXC%" -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo "%~dp0aaa_crowd_ps.dxil" "%~dp0aaa_crowd.hlsl" || exit /b 1
+"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0uma_scatter_patch.dxil" "%~dp0uma_scatter_patch.hlsl" || exit /b 1
+"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0uma_gfx10_detile.dxil" "%~dp0uma_gfx10_detile.hlsl" || exit /b 1
+"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0uma_skin_cs.dxil" "%~dp0uma_skin_cs.hlsl" || exit /b 1
+"%DXC%" -T vs_6_6 -E VSMain -HV 2021 -O3 -Fo "%~dp0uma_skin_vs.dxil" "%~dp0uma_skin_draw.hlsl" || exit /b 1
+"%DXC%" -T ps_6_6 -E PSMain -HV 2021 -O3 -Fo "%~dp0uma_skin_ps.dxil" "%~dp0uma_skin_draw.hlsl" || exit /b 1
+"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0uma_workingset.dxil" "%~dp0uma_workingset.hlsl" || exit /b 1
 echo Demo shaders compiled successfully.

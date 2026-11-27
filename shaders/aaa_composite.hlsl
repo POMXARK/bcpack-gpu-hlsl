@@ -21,6 +21,15 @@ cbuffer AaaCompCB : register(b0) {
     float g_Fps1PctLow;      // Rolling 1% Low FPS
     float g_WhipPanPulse;    // 0..1 peak during 180-deg whip-pan bursts
     float g_FormatCount;     // Active BCPack format count (6)
+    // UMA Emulation Stress & Optimization HUD (top-left panel)
+    float g_UmaOn;           // > 0.5 draws top-left UMA HUD panel
+    float g_UmaMask;         // bitmask 0..15: [1]=Detile, [2]=Patch, [3]=8T+Hazard, [4]=VRAM
+    float g_UmaSub1Ms;
+    float g_UmaSub2Ms;
+    float g_UmaSub3Ms;
+    float g_UmaSub4Ms;
+    float g_UmaTotalMs;
+    float g_UmaOkMeshes;
 };
 
 Texture2D<float4>       g_TaaHDR      : register(t0);
@@ -452,6 +461,131 @@ float3 composite_pursuit_hud(float3 bg, float2 uv) {
     return col;
 }
 
+float draw_fixed3_1dp(float2 uv, float2 org, float adv, float val_ms) {
+    uint tt = (uint)round(clamp(val_ms, 0.0, 999.9) * 10.0);
+    uint whole = tt / 10u;
+    uint frac = tt % 10u;
+    uint h = (whole / 100u) % 10u;
+    uint t = (whole / 10u) % 10u;
+    uint o = whole % 10u;
+    float m = 0.0;
+    if (h > 0u) {
+        m = max(m, sample_hud_char(uv, org + float2(adv * 0.0, 0.0), h));
+    }
+    if (h > 0u || t > 0u) {
+        m = max(m, sample_hud_char(uv, org + float2(adv * 1.0, 0.0), t));
+    }
+    m = max(m, sample_hud_char(uv, org + float2(adv * 2.0, 0.0), o));
+    m = max(m, sample_hud_char(uv, org + float2(adv * 2.9, 0.0), 12u)); // '.'
+    m = max(m, sample_hud_char(uv, org + float2(adv * 3.75, 0.0), frac));
+    m = max(m, sample_hud_char(uv, org + float2(adv * 5.0, 0.0), 18u)); // 'M'
+    m = max(m, sample_hud_char(uv, org + float2(adv * 6.0, 0.0), 15u)); // 'S'
+    return m;
+}
+
+float draw_uma_row(float2 uv, float2 org, float adv, uint num_ch, uint c0, uint c1, uint c2, uint c3, uint c4, uint c5, bool is_opt, float val_ms) {
+    float m = 0.0;
+    m = max(m, sample_hud_char(uv, org + float2(adv * 0.0, 0.0), num_ch));
+    m = max(m, sample_hud_char(uv, org + float2(adv * 1.0, 0.0), 11u)); // ':'
+    m = max(m, sample_hud_char(uv, org + float2(adv * 2.0, 0.0), c0));
+    m = max(m, sample_hud_char(uv, org + float2(adv * 3.0, 0.0), c1));
+    m = max(m, sample_hud_char(uv, org + float2(adv * 4.0, 0.0), c2));
+    m = max(m, sample_hud_char(uv, org + float2(adv * 5.0, 0.0), c3));
+    m = max(m, sample_hud_char(uv, org + float2(adv * 6.0, 0.0), c4));
+    m = max(m, sample_hud_char(uv, org + float2(adv * 7.0, 0.0), c5));
+    if (is_opt) {
+        m = max(m, sample_hud_char(uv, org + float2(adv * 9.0, 0.0), 32u));  // O
+        m = max(m, sample_hud_char(uv, org + float2(adv * 10.0, 0.0), 14u)); // P
+        m = max(m, sample_hud_char(uv, org + float2(adv * 11.0, 0.0), 34u)); // T
+    } else {
+        m = max(m, sample_hud_char(uv, org + float2(adv * 9.0, 0.0), 22u));  // N
+        m = max(m, sample_hud_char(uv, org + float2(adv * 10.0, 0.0), 17u)); // A
+        m = max(m, sample_hud_char(uv, org + float2(adv * 11.0, 0.0), 24u)); // I
+        m = max(m, sample_hud_char(uv, org + float2(adv * 12.0, 0.0), 20u)); // V
+    }
+    m = max(m, draw_fixed3_1dp(uv, org + float2(adv * 14.5, 0.0), adv, val_ms));
+    return m;
+}
+
+float3 composite_uma_hud(float3 bg, float2 uv) {
+    // Top-left frosted HUD panel: x in [0.018, 0.300], y in [0.025, 0.255]
+    static const float2 P_CENTER = float2(0.159, 0.140);
+    static const float2 P_HALF   = float2(0.141, 0.115);
+    float2 aspect = float2(1.7777778, 1.0);
+    float sd_panel = sd_round_box((uv - P_CENTER) * aspect, P_HALF * aspect, 0.014);
+    if (sd_panel > 0.004) {
+        return bg;
+    }
+
+    uint mask = (uint)round(clamp(g_UmaMask, 0.0, 15.0));
+    bool opt1 = (mask & 1u) != 0u;
+    bool opt2 = (mask & 2u) != 0u;
+    bool opt3 = (mask & 4u) != 0u;
+    bool opt4 = (mask & 8u) != 0u;
+    bool all_opt = (mask == 15u);
+
+    float panel_alpha = smoothstep(0.002, -0.002, sd_panel);
+    float border_mask = smoothstep(0.004, 0.001, abs(sd_panel));
+    float3 col = lerp(bg, bg * 0.20 + float3(0.032, 0.045, 0.072), 0.86 * panel_alpha);
+    float3 bcol = all_opt ? float3(0.22, 0.88, 0.62) : float3(0.96, 0.56, 0.22);
+    col = lerp(col, bcol, 0.58 * border_mask);
+
+    static const float ADV = 0.0068;
+    static const float X0  = 0.032;
+
+    // Header: "UMA STRESS   U:ON"
+    float t_hdr = 0.0;
+    float2 rh = float2(X0, 0.042);
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 0.0, 0.0), 27u)); // U
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 1.0, 0.0), 18u)); // M
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 2.0, 0.0), 17u)); // A
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 4.0, 0.0), 15u)); // S
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 5.0, 0.0), 34u)); // T
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 6.0, 0.0), 33u)); // R
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 7.0, 0.0), 25u)); // E
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 8.0, 0.0), 15u)); // S
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 9.0, 0.0), 15u)); // S
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 16.0, 0.0), 27u)); // U
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 17.0, 0.0), 11u)); // :
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 18.0, 0.0), 32u)); // O
+    t_hdr = max(t_hdr, sample_hud_char(uv, rh + float2(ADV * 19.0, 0.0), 22u)); // N
+
+    // Row 1: "1:DETILE OPT/NAIV NNN.N MS"
+    float t1 = draw_uma_row(uv, float2(X0, 0.076), ADV, 1u, 26u, 25u, 34u, 24u, 23u, 25u, opt1, g_UmaSub1Ms);
+    // Row 2: "2:PATCH  OPT/NAIV NNN.N MS"
+    float t2 = draw_uma_row(uv, float2(X0, 0.106), ADV, 2u, 14u, 17u, 34u, 16u, 28u, 10u, opt2, g_UmaSub2Ms);
+    // Row 3: "3:CMDHZD OPT/NAIV NNN.N MS"
+    float t3 = draw_uma_row(uv, float2(X0, 0.136), ADV, 3u, 16u, 18u, 26u, 28u, 36u, 26u, opt3, g_UmaSub3Ms);
+    // Row 4: "4:VRAMWS OPT/NAIV NNN.N MS"
+    float t4 = draw_uma_row(uv, float2(X0, 0.166), ADV, 4u, 20u, 33u, 17u, 18u, 35u, 15u, opt4, g_UmaSub4Ms);
+
+    // Summary Row: "TOT: NNN.N MS   OK:64/64"
+    float t_sum = 0.0;
+    float2 rs = float2(X0, 0.206);
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 0.0, 0.0), 34u)); // T
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 1.0, 0.0), 32u)); // O
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 2.0, 0.0), 34u)); // T
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 3.0, 0.0), 11u)); // :
+    t_sum = max(t_sum, draw_fixed3_1dp(uv, rs + float2(ADV * 4.5, 0.0), ADV, g_UmaTotalMs));
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 13.0, 0.0), 32u)); // O
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 14.0, 0.0), 31u)); // K
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 15.0, 0.0), 11u)); // :
+    t_sum = max(t_sum, draw_uint3(uv, rs + float2(ADV * 16.0, 0.0), ADV, (uint)round(clamp(g_UmaOkMeshes, 0.0, 99.0))));
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 18.2, 0.0), 37u)); // /
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 19.2, 0.0), 6u));  // 6
+    t_sum = max(t_sum, sample_hud_char(uv, rs + float2(ADV * 20.2, 0.0), 4u));  // 4
+
+    float3 opt_c = float3(0.32, 0.96, 0.68);
+    float3 naiv_c = float3(1.0, 0.56, 0.28);
+    col = lerp(col, float3(0.86, 0.96, 1.0), t_hdr);
+    col = lerp(col, opt1 ? opt_c : naiv_c, t1);
+    col = lerp(col, opt2 ? opt_c : naiv_c, t2);
+    col = lerp(col, opt3 ? opt_c : naiv_c, t3);
+    col = lerp(col, opt4 ? opt_c : naiv_c, t4);
+    col = lerp(col, all_opt ? float3(0.45, 0.98, 0.82) : float3(1.0, 0.84, 0.36), t_sum);
+    return col;
+}
+
 float3 eval_tonemapped(float2 uv, float autoExp) {
     float3 taa = g_TaaHDR.SampleLevel(g_LinClamp, uv, 0.0).rgb;
     float3 bloom = g_BloomTex.SampleLevel(g_LinClamp, uv, 0.0).rgb * g_BloomStrength;
@@ -491,6 +625,9 @@ float4 PSMain(CompPSIn input) : SV_Target {
         sharpened = composite_hud(sharpened, input.uv);
         if (g_PursuitOn > 0.5) {
             sharpened = composite_pursuit_hud(sharpened, input.uv);
+        }
+        if (g_UmaOn > 0.5) {
+            sharpened = composite_uma_hud(sharpened, input.uv);
         }
     }
 

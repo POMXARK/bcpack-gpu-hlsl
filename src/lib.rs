@@ -10,6 +10,7 @@ pub mod meshes;
 pub mod pursuit_streamer;
 pub mod raytracing;
 pub mod rtgi;
+pub mod uma_stress;
 pub mod world_streaming;
 
 pub use bcpack_gpu::{crowd_skinning, descriptor_paging, ffi, gpu_decoder};
